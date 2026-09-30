@@ -95,7 +95,7 @@ export function AssistantPage() {
                 maxLength={2000}
                 placeholder="Ask a question about an approved policy or procedure…"
                 onChange={(event) => { setQuestion(event.target.value); setWordless(false); }}
-                onKeyDown={(event) => { if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) submit(event); }}
+                onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) submit(event); }}
                 aria-label="Question for AI Assistant"
               />
               <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
@@ -120,7 +120,7 @@ export function AssistantPage() {
                 </div>
                 {wordless
                   ? <span className="text-xs text-warn-600" role="alert">Type your question in words, e.g. the policy or topic and what you want to know.</span>
-                  : <span className="text-xs text-muted">{question.length}/2000 · ⌘/Ctrl + Enter to ask</span>}
+                  : <span className="text-xs text-muted">{question.length}/2000 · Enter to ask, Shift + Enter for a new line</span>}
                 <div className="flex gap-2">
                   {turns.length > 0 && <Button type="button" variant="secondary" size="sm" onClick={() => dispatch(clearConversation())}><RotateCcw className="size-3.5" />Clear</Button>}
                   <Button type="submit" loading={pending} disabled={!question.trim()}><Send className="size-4" />Ask</Button>
@@ -185,7 +185,12 @@ function Streaming({ turn }: { turn: Turn }) {
 function Answered({ answer }: { answer: Answer }) {
   // Spec §31/§55: when the version in force did not answer it, the older version
   // used must be named explicitly rather than blended into the answer.
-  const older = answer.sources.filter((source) => source.previous_version);
+  const older = [...new Set(answer.sources.filter((source) => source.previous_version)
+    .map((source) => `${source.policy_name ?? source.document_title} v${source.version_label}`))];
+  // The banner already says this; the matching backend warning would repeat it.
+  const warnings = older.length
+    ? answer.warnings.filter((warning) => !warning.startsWith("The version currently in force does not cover this"))
+    : answer.warnings;
   return (
     <div className="p-5">
       <p className="text-sm font-medium text-ai-600">Grounded answer</p>
@@ -194,14 +199,14 @@ function Answered({ answer }: { answer: Answer }) {
           <History className="mt-0.5 size-4 shrink-0" />
           <span>
             Part of this answer comes from an earlier version, because the version currently in force did not cover it:{" "}
-            <span className="font-medium">{older.map((source) => `${source.policy_name ?? source.document_title} v${source.version_label}`).join(", ")}</span>.
+            <span className="font-medium">{older.join(", ")}</span>.
           </span>
         </div>
       )}
       <div className="mt-2 space-y-3 text-sm leading-6 text-ink">
         {answer.claims.map((claim, index) => <p key={`${claim.text}-${index}`}>{claim.text} {claim.citations.map((citation) => <a key={citation} href={`#source-${citation}`} className="ml-0.5 text-xs font-semibold text-brand-700 hover:underline">[{citation}]</a>)}</p>)}
       </div>
-      {!!answer.warnings.length && <div className="mt-4 rounded-md border border-warn-600/20 bg-warn-50 p-3 text-xs text-warn-600">{answer.warnings.map((warning) => <p key={warning}>{warning}</p>)}</div>}
+      {!!warnings.length && <div className="mt-4 rounded-md border border-warn-600/20 bg-warn-50 p-3 text-xs text-warn-600">{warnings.map((warning) => <p key={warning}>{warning}</p>)}</div>}
       {!!answer.conflicts.length && <div className="mt-4 rounded-md border border-warn-600/30 bg-warn-50 p-3"><p className="flex items-center gap-1.5 text-sm font-medium text-warn-600"><FileWarning className="size-4" />Potential source conflict</p>{answer.conflicts.map((conflict, index) => <p key={index} className="mt-1 text-xs text-ink-soft">{conflict.description} {conflict.citations?.map((citation) => <a key={citation} href={`#source-${citation}`} className="font-medium text-brand-700">[{citation}]</a>)}</p>)}</div>}
       <details className="mt-4 text-xs text-muted"><summary className="cursor-pointer">Answer details</summary><div className="mt-2 flex flex-wrap gap-x-4 gap-y-1"><span>{answer.plan.explanation}</span><span>Evidence score: {Math.round(answer.evidence_score * 100)}%</span>{answer.plan.as_of && <span>As of {formatDate(answer.plan.as_of)}</span>}{answer.cache_hit && <span>Cached result</span>}</div></details>
       <div className="mt-5 border-t border-line pt-4"><p className="mb-3 text-xs font-semibold uppercase tracking-wide text-muted">Verified sources</p><div className="space-y-3">{answer.sources.map((source) => <div key={source.evidence_id} id={`source-${source.number}`} className="scroll-mt-4"><SourceCard source={source} /></div>)}</div></div>

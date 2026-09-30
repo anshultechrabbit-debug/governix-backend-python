@@ -10,7 +10,8 @@ Latest version first: a question about the current policy is answered from the
 version in force. Only when that yields no supported answer are earlier
 versions searched, one step back at a time (the previous version, then the one
 before), and an answer found there says so. Policies with no version in force
-(expired) are never used this way.
+(expired) are never used this way. A question that names an uploaded file
+("policy_document.pdf") is answered from that file alone, whatever its version.
 
 Retrieve first, verify evidence, generate second. The LLM never searches and
 never decides permissions; its output is discarded unless it validates.
@@ -45,7 +46,7 @@ from app.modules.rag.query_rewrite import standalone_question
 from app.modules.rag.schema import AnswerResponse, AskRequest, Claim, NoAnswer, Source
 from app.modules.rag.validation import EvidenceText, validate_claims
 from app.modules.search.model import Chunk
-from app.modules.search.retrieval import HybridRetriever, SearchFilters, VersionScope
+from app.modules.search.retrieval import HybridRetriever, NamedDocument, SearchFilters, VersionScope
 from app.modules.search.schema import Provenance
 from app.modules.search.service import cache_scope, provenance, retrieve_with_variants
 from app.modules.versions.timeline import compare_versions, effective_on
@@ -60,7 +61,7 @@ SUGGESTIONS = [
 NO_ANSWER_MESSAGE = "I couldn't find sufficient supporting information in the available documents."
 # Bump when the answer-generation or validation contract changes so cached
 # answers (including cached no-answers) are recomputed under the new contract.
-ANSWER_CACHE_VERSION = "v11"
+ANSWER_CACHE_VERSION = "v12"
 # No supported answer in the version in force: worth looking one version back.
 FALLBACK_REASONS = frozenset({
     "NO_RELEVANT_DOCUMENTS", "LOW_RELEVANCE", "KEY_TERMS_NOT_FOUND", "INSUFFICIENT_EVIDENCE",
@@ -106,6 +107,12 @@ def _evidence_texts(evidence: EvidenceSet) -> dict[str, EvidenceText]:
     if evidence.comparison:
         texts["D1"] = EvidenceText("D1", comparison_text(evidence.comparison))
     return texts
+
+
+def _without_file_names(question: str, named: list[NamedDocument]) -> str:
+    for filename in sorted({d.filename for d in named}, key=len, reverse=True):
+        question = re.sub(rf"(?<![\w.-]){re.escape(filename)}(?![\w-])", "the document", question, flags=re.I)
+    return question
 
 
 def acronym_in_question(question: str) -> str | None:
@@ -194,6 +201,11 @@ class RAGService:
         # would pass the key-term check vacuously, so it is refused before any search or model call.
         words = has_words(request.question)
         request, rewrite = self._standalone(request, timings) if words else (request, None)
+        named = self.retriever.referenced_documents(principal, request.question) if words else []
+        if named:
+            # The file name is not document text: left in, it fails the key-term check and
+            # its tokens ("v2" in "policy_v2.pdf") would be read as a version reference.
+            request = request.model_copy(update={"question": _without_file_names(request.question, named)})
         plan = plan_query(
             request.question,
             ui_mode=None if request.mode == "auto" else request.mode,
@@ -208,11 +220,11 @@ class RAGService:
             if not rewrite.resolvable:
                 raise _NoAnswer("NEEDS_CONTEXT")
             referenced = request.policy_ids or self.retriever.referenced_policies(principal, request.question)
-            filters = self._filters(principal, plan, request, referenced)
+            filters = self._filters(principal, plan, request, referenced, named)
             try:
                 response = yield from self._attempt(principal, request, plan, filters, attempt, timings, deadline, started)
             except _NoAnswer as no_answer:
-                if not self._may_fall_back(request, plan, no_answer, attempt):
+                if named or not self._may_fall_back(request, plan, no_answer, attempt):
                     raise
                 response = yield from self._previous_versions(
                     principal, request, plan, no_answer, attempt, timings, deadline, started,
@@ -394,7 +406,16 @@ class RAGService:
             request = request.model_copy(update={"question": rewrite.question})
         return request, rewrite
 
-    def _filters(self, principal: Principal, plan: QueryPlan, request: AskRequest, referenced: list[uuid.UUID]) -> SearchFilters:
+    def _filters(
+        self, principal: Principal, plan: QueryPlan, request: AskRequest, referenced: list[uuid.UUID],
+        named: list[NamedDocument],
+    ) -> SearchFilters:
+        named_versions = list(dict.fromkeys(d.version_id for d in named if d.version_id))
+        if named_versions and request.mode == "auto" and plan.query_class is QueryClass.CURRENT:
+            # Naming a file asks about that file, even when a newer version has replaced it.
+            files = ", ".join(dict.fromkeys(d.filename for d in named))
+            plan.query_class, plan.mode, plan.as_of = QueryClass.SPECIFIC_VERSION, "versions", None
+            plan.version_ids, plan.explanation = named_versions, f"Question names the file {files}"
         if plan.mode == "versions":
             if not plan.version_ids:
                 plan.version_ids = self._resolve_labels(principal, plan, referenced)
@@ -409,6 +430,7 @@ class RAGService:
             version_scope=scope,
             policy_ids=list(request.policy_ids),
             category_ids=list(request.category_ids),
+            document_ids=[d.document_id for d in named],
         )
 
     def _resolve_labels(self, principal: Principal, plan: QueryPlan, referenced: list[uuid.UUID]) -> list[uuid.UUID]:

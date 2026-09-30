@@ -8,11 +8,11 @@ from app.tests.pdfs import PolicySpec, Section, build_policy_pdf
 from app.tests.pipeline import drain
 
 
-def process(client, app, user, pdf: bytes, **form):
+def process(client, app, user, pdf: bytes, filename: str | None = None, **form):
     session = login(client, user)
     response = session.post(
         "/documents",
-        files={"file": (f"{uuid.uuid4().hex}.pdf", io.BytesIO(pdf), "application/pdf")},
+        files={"file": (filename or f"{uuid.uuid4().hex}.pdf", io.BytesIO(pdf), "application/pdf")},
         data={k: str(v) for k, v in form.items()},
     )
     assert response.status_code == 201, response.text

@@ -78,6 +78,8 @@ _PAGE = re.compile(
     r"\b(?:pages?|pg\.?|p\.)\s*(?:no\.?\s*|number\s*|#\s*)?(\d{1,6})(?:\s*(?:-|–|to)\s*(\d{1,6}))?\b", re.I
 )
 MAX_PAGE_SPAN = 5
+# A question that names an uploaded file ("what does policy_document.pdf cover?").
+_FILE_EXTENSION = re.compile(r"\.(?:pdf|docx?|txt|rtf)\b", re.I)
 EXACT_PER_PAGE = 12
 EXACT_PER_CODE = 20
 # IDF statistics: document frequencies are counted per organisation, capped, and
@@ -155,6 +157,13 @@ class SearchFilters:
     document_ids: list[uuid.UUID] = field(default_factory=list)
     branch_id: uuid.UUID | None = None
     department_id: uuid.UUID | None = None
+
+
+@dataclass
+class NamedDocument:
+    document_id: uuid.UUID
+    version_id: uuid.UUID | None
+    filename: str
 
 
 @dataclass
@@ -619,6 +628,17 @@ class HybridRetriever:
         ).limit(10)
         return [row[0] for row in self._read(statement)]
 
+    def referenced_documents(self, principal: Principal, query: str) -> list[NamedDocument]:
+        """Documents the question names by their uploaded file name."""
+        if not _FILE_EXTENSION.search(query):
+            return []
+        statement = select(Document.id, Document.policy_version_id, Document.original_filename).where(
+            visible_clause(principal, Document.organization_id, Document.branch_id, Document.department_id, Document.policy_id),
+            Document.status == DocumentStatus.READY,
+            func.strpos(func.lower(query), func.lower(Document.original_filename)) > 0,
+        ).limit(20)
+        return [NamedDocument(*row) for row in self._read(statement) if names_file(query, row[2])]
+
     def retrieve(
         self,
         principal: Principal,
@@ -714,6 +734,11 @@ def _or_of(terms: list[str]):
     for term in terms[1:]:
         query = query.op("||")(term_tsquery(term))
     return query
+
+
+def names_file(query: str, filename: str) -> bool:
+    """The whole file name, not the tail of a longer one ("a.pdf" inside "data.pdf")."""
+    return re.search(rf"(?<![\w.-]){re.escape(filename)}(?![\w-])", query, re.I) is not None
 
 
 def requested_pages(query: str) -> list[int]:

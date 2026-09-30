@@ -62,7 +62,8 @@ QUESTION_TERMS = frozenset(
 _DOCUMENT_QUESTION = re.compile(
     r"\bthis\s+(?:document|plan|policy|report|circular|manual|guideline|notification|publication)\b"
     r"|\b(?:title|name)\s+of\b|\bpublish(?:ed|er|ing)?\b|\bpublication\b|\bissu(?:ed|ing)\s+(?:by|authority)\b"
-    r"|\blegal\s+basis\b|\bunder\s+which\s+(?:act|law|section)\b|\bwhich\s+section\s+of\b",
+    r"|\blegal\s+basis\b|\bunder\s+which\s+(?:act|law|section)\b|\bwhich\s+section\s+of\b"
+    r"|\b(?:type|kind|sort)\s+of\s+(?:document|policy|circular|report)\b|\bwhat\s+is\s+(?:this|the)\s+document\s+about\b",
     re.I,
 )
 AMENDING = {"AMENDS", "SUPERSEDES", "REPLACES", "CLARIFIES"}

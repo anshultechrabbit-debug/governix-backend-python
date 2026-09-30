@@ -25,9 +25,11 @@ def admin(client, tenant):
 @pytest.fixture
 def home_loan(client, app, tenant, admin):
     """v1 (2024) covers prepayment charges; v2 (2025, in force) dropped that section."""
-    v1_doc, analysis = process(client, app, tenant.admin, build(home_loan_spec("1", "01/01/2024", extra_sections=[PREPAYMENT])))
+    v1_doc, analysis = process(client, app, tenant.admin, build(home_loan_spec("1", "01/01/2024", extra_sections=[PREPAYMENT])),
+                               filename="home_loan_2024.pdf")
     policy_id = confirm_new_policy(admin, v1_doc, analysis).json()["data"]["policy_id"]
-    v2_doc, analysis = process(client, app, tenant.admin, build(home_loan_spec("2", "01/06/2025", ltv="70%")))
+    v2_doc, analysis = process(client, app, tenant.admin, build(home_loan_spec("2", "01/06/2025", ltv="70%")),
+                               filename="home_loan_2025.pdf")
     assert confirm_new_version(admin, v2_doc, analysis, policy_id).status_code == 200
     drain(app)
     return policy_id
@@ -76,3 +78,18 @@ def test_fallback_can_be_switched_off(app, admin, home_loan):
     finally:
         app.state.settings.RAG_PREVIOUS_VERSION_FALLBACK = True
     assert answer["status"] == "no_answer"
+
+
+def test_a_named_file_is_not_answered_from_another_version(admin, home_loan):
+    answer = ask(admin, "What prepayment charges apply to floating rate home loans in home_loan_2025.pdf?")
+    assert answer["status"] == "no_answer"
+    assert "fallback" not in answer["plan"]
+    assert answer["plan"]["version_ids"] and "home_loan_2025.pdf" in answer["plan"]["explanation"]
+
+
+def test_a_named_superseded_file_answers_from_that_file(admin, home_loan):
+    answer = ask(admin, "What prepayment charges apply to floating rate home loans in home_loan_2024.pdf?")
+    assert answer["status"] == "answered", answer
+    assert {s["version_label"] for s in answer["sources"]} == {"1"}
+    assert not any(s["previous_version"] for s in answer["sources"])
+    assert "fallback" not in answer["plan"]
