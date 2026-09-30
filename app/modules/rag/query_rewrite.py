@@ -22,6 +22,27 @@ HISTORY_TURNS = 4
 HISTORY_ANSWER_CHARS = 600
 NON_LATIN_SHARE = 0.3
 
+# Sentence-ending punctuation for boundary truncation.
+_SENTENCE_END = re.compile(r"[.!?]\s+")
+
+
+def _truncate_at_sentence(text: str, limit: int) -> str:
+    """Truncate `text` to `limit` characters at the last sentence boundary.
+
+    Cuts at a raw byte offset only when no sentence boundary is found, which
+    prevents broken sentences from reaching the rewrite LLM and being misread.
+    """
+    if len(text) <= limit:
+        return text
+    segment = text[:limit]
+    # Find the last sentence-end boundary within the allowed segment.
+    last_end = -1
+    for match in _SENTENCE_END.finditer(segment):
+        last_end = match.start() + 1  # include the punctuation mark itself
+    if last_end > 0:
+        return segment[:last_end].rstrip()
+    return segment.rstrip()  # no boundary found: fall back to raw truncation
+
 _REFERENT = (
     r"discussion|answer|question|point|one|ones|figure|figures|number|numbers|scheme|schemes|comment|comments|"
     r"response|topic|case|table|list|amount|value|policy|document|section|clause|version|chapter|rule|"
@@ -89,7 +110,7 @@ def standalone_question(llm: LLMProvider | None, question: str, history: list) -
         return Rewrite(question, reason, resolvable=not follow_up)
     turns = history[-HISTORY_TURNS:]
     conversation = "\n".join(
-        f"Q{i}: {turn.question}\nA{i}: {(turn.answer or '(no answer)')[:HISTORY_ANSWER_CHARS]}"
+        f"Q{i}: {turn.question}\nA{i}: {_truncate_at_sentence(turn.answer or '(no answer)', HISTORY_ANSWER_CHARS)}"
         for i, turn in enumerate(turns, start=1)
     ) or "(none)"
     try:

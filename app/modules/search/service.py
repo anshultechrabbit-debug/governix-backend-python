@@ -104,15 +104,45 @@ def retrieve_with_variants(principal, retriever, embedder, cache, query, filters
 
 
 def provenance(session: Session, candidates: list[Candidate]) -> dict[uuid.UUID, Provenance]:
-    """Document/policy/version details for candidates (all already ACL-filtered)."""
+    """Document/policy/version details for candidates (all already ACL-filtered).
+
+    Loads only the columns needed for Provenance, not full ORM objects, to
+    reduce per-request memory and serialisation overhead.
+    """
     if not candidates:
         return {}
-    documents = {d.id: d for d in session.scalars(select(Document).where(Document.id.in_({c.document_id for c in candidates})))}
-    policies = {p.id: p for p in session.scalars(select(Policy).where(Policy.id.in_({c.policy_id for c in candidates if c.policy_id})))}
-    versions = {v.id: v for v in session.scalars(select(PolicyVersion).where(PolicyVersion.id.in_({c.version_id for c in candidates if c.version_id})))}
+    doc_ids = {c.document_id for c in candidates}
+    policy_ids = {c.policy_id for c in candidates if c.policy_id}
+    version_ids = {c.version_id for c in candidates if c.version_id}
+
+    # Scalar column selects: 3 round trips, loading only the columns we actually use.
+    doc_rows = session.execute(
+        select(Document.id, Document.title, Document.category_id)
+        .where(Document.id.in_(doc_ids))
+    ).all()
+    docs = {row.id: row for row in doc_rows}
+
+    pol_rows = session.execute(
+        select(Policy.id, Policy.name)
+        .where(Policy.id.in_(policy_ids))
+    ).all() if policy_ids else []
+    policies = {row.id: row for row in pol_rows}
+
+    ver_rows = session.execute(
+        select(
+            PolicyVersion.id, PolicyVersion.version_label,
+            PolicyVersion.effective_from, PolicyVersion.effective_to,
+            PolicyVersion.effective_date_source,
+        )
+        .where(PolicyVersion.id.in_(version_ids))
+    ).all() if version_ids else []
+    versions = {row.id: row for row in ver_rows}
+
     result = {}
     for c in candidates:
-        document, policy, version = documents[c.document_id], policies.get(c.policy_id), versions.get(c.version_id)
+        document = docs[c.document_id]
+        policy = policies.get(c.policy_id)
+        version = versions.get(c.version_id)
         result[c.chunk_id] = Provenance(
             document_id=c.document_id,
             document_title=document.title,
@@ -134,10 +164,16 @@ def provenance(session: Session, candidates: list[Candidate]) -> dict[uuid.UUID,
 
 
 class SearchService:
-    def __init__(self, session: Session, session_factory: sessionmaker[Session], embedder, cache: Cache) -> None:
+    def __init__(
+        self,
+        session: Session,
+        session_factory: sessionmaker[Session],
+        embedder: EmbeddingProvider | None,
+        cache: Cache,
+    ) -> None:
         self.session = session
         self.cache = cache
-        self.embedder = embedder
+        self.embedder: EmbeddingProvider | None = embedder
         self.retriever = HybridRetriever(session_factory, embedder)
 
     def search(self, principal: Principal, request: SearchRequest) -> SearchResponse:
@@ -192,7 +228,10 @@ class SearchService:
             details={"query": request.query, "mode": request.mode, "results": results, "cache_hit": cache_hit,
                      "permission_scope": principal.permission_scope},
         )
-        self.session.commit()
+        # flush() only: the outer transaction (FastAPI dependency) commits at
+        # request end. A direct commit here would end the dependency's transaction
+        # early and risk committing the audit row while other writes roll back.
+        self.session.flush()
 
 
 def _real_date(version) -> bool:

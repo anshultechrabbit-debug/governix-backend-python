@@ -119,8 +119,17 @@ def my_queries(
     page: Annotated[PageParams, Depends(page_params)],
 ):
     """The caller's own recent AI questions (from the audit trail)."""
-    base = select(AuditEvent).where(AuditEvent.action == "ai.query", AuditEvent.actor_user_id == principal.user_id)
-    events = db.scalars(base.order_by(AuditEvent.created_at.desc()).limit(page.limit).offset(page.offset)).all()
+    # Filter base: the caller's own queries only, across their organisation.
+    base = select(AuditEvent).where(
+        AuditEvent.action == "ai.query",
+        AuditEvent.actor_user_id == principal.user_id,
+    )
+    # COUNT on the base query, not on the paginated subquery: a count of
+    # limit(N).offset(M) always returns at most N, not the true total.
+    total = db.scalar(select(func.count()).select_from(base.subquery())) or 0
+    events = db.scalars(
+        base.order_by(AuditEvent.created_at.desc()).limit(page.limit).offset(page.offset)
+    ).all()
     items = [
         QueryHistoryItem(
             id=e.id, question=e.details.get("question", ""), status=e.details.get("status"),
@@ -129,5 +138,4 @@ def my_queries(
         )
         for e in events
     ]
-    total = db.scalar(select(func.count()).select_from(base.subquery())) or 0
     return ok(Page(items=items, total=total, **page.model_dump()))

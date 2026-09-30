@@ -249,8 +249,18 @@ def _categories(session: Session, ids) -> dict[uuid.UUID, Category]:
     return {c.id: c for c in session.scalars(select(Category).where(Category.id.in_(ids)))}
 
 
+# Maximum number of amending documents to retrieve passages from.
+# Each one costs a full 4-lane retrieval; without a cap the cost is O(amendments).
+MAX_AMENDMENT_DOCS = 4
+
+
 def _amendment_candidates(session, principal, question, selected, retriever: HybridRetriever, filters) -> list[Candidate]:
-    """Pull in the best passage of any in-force document that amends a selected policy."""
+    """Pull in the best passage of any in-force document that amends a selected policy.
+
+    Capped at MAX_AMENDMENT_DOCS: each amending document triggers a full 4-lane
+    hybrid retrieval, so without a bound the cost is linear in the number of
+    confirmed amendments — which can be large for long-lived policies.
+    """
     policy_ids = {c.policy_id for c in selected if c.policy_id}
     if not policy_ids:
         return []
@@ -268,6 +278,8 @@ def _amendment_candidates(session, principal, question, selected, retriever: Hyb
     missing = [d for d in dict.fromkeys(sources) if d not in present]
     if not missing:
         return []
+    # Cap before firing any retrieval: cost = MAX_AMENDMENT_DOCS × 4 lane queries max.
+    missing = missing[:MAX_AMENDMENT_DOCS]
     # Same ACL + version scope as the main retrieval; only the document set is
     # narrowed. This runs the full 4-lane retriever, so it is the single most
     # expensive step in evidence building: at most one extra passage per amending
@@ -319,13 +331,29 @@ def _attach_amendments(session: Session, principal: Principal, items: list[Evide
 
 
 def detect_conflicts(items: list[EvidenceItem]) -> list[dict]:
-    """Deterministic conflicts: amended clauses, and differing figures for the same subject."""
+    """Deterministic conflicts: amended clauses, and differing figures for the same subject.
+
+    The inner fact-pair loop is O(items² × facts²). With RAG_EVIDENCE_LIMIT=14 items
+    this is bounded, but we exit as soon as the 10-conflict cap is reached so that
+    raising the limit in the future does not silently create a hot path.
+    """
+    MAX_CONFLICTS = 10
     conflicts: list[dict] = []
+    seen: set[tuple] = set()
+
+    def _add(conflict: dict) -> bool:
+        """Add if unseen; return True when the cap is reached."""
+        key = (conflict["type"], tuple(sorted(conflict["evidence_ids"])))
+        if key not in seen:
+            seen.add(key)
+            conflicts.append(conflict)
+        return len(conflicts) >= MAX_CONFLICTS
+
     by_document = {i.source.document_id: i for i in items}
     for item in items:
         for amendment in item.amended_by:
             amending = by_document.get(uuid.UUID(amendment["document_id"]))
-            conflicts.append({
+            capped = _add({
                 "type": "AMENDED",
                 "description": (
                     f"{item.source.policy_name} section {item.source.section_number or ''} is "
@@ -335,6 +363,8 @@ def detect_conflicts(items: list[EvidenceItem]) -> list[dict]:
                 "evidence_ids": [item.id] + ([amending.id] if amending else []),
                 "resolution_hint": "The later, more specific amendment governs the amended clause.",
             })
+            if capped:
+                return conflicts
 
     facts = {
         i.id: [(f, sentence_at(i.candidate.text, f.start, f.end)) for f in extract_numeric_facts(i.candidate.text)
@@ -352,7 +382,7 @@ def detect_conflicts(items: list[EvidenceItem]) -> list[dict]:
                     shared = _subject_words(sentence_a) & _subject_words(sentence_b)
                     if len(shared) >= 3:
                         higher = max((a, b), key=lambda i: (i.authority_rank, i.source.effective_from or date.min))
-                        conflicts.append({
+                        capped = _add({
                             "type": "NUMERIC_DISAGREEMENT",
                             "description": (
                                 f"'{a.source.policy_name}' states {fact_a.raw} while "
@@ -370,13 +400,9 @@ def detect_conflicts(items: list[EvidenceItem]) -> list[dict]:
                                 "Both are shown; confirm which applies to your case."
                             ),
                         })
-    unique, seen = [], set()
-    for conflict in conflicts:
-        key = (conflict["type"], tuple(sorted(conflict["evidence_ids"])))
-        if key not in seen:
-            seen.add(key)
-            unique.append(conflict)
-    return unique[:10]
+                        if capped:
+                            return conflicts
+    return conflicts
 
 
 def _subject_words(sentence: str) -> set[str]:

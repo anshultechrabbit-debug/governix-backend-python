@@ -89,7 +89,18 @@ EXACT_PER_CODE = 20
 # weight is then only an upper bound, which still ranks it below rare terms.
 DF_CAP = 20_000
 DF_TTL_SECONDS = 600
-_DF_CACHE: dict[tuple, tuple[float, int]] = {}
+# Bounded TTL cache: auto-evicts expired entries and caps total size to prevent
+# unbounded memory growth under high multi-tenant load. A plain dict with a TTL
+# checked only on read never evicts stale entries and grows without limit.
+_DF_CACHE_MAX = 100_000
+try:
+    from cachetools import TTLCache as _TTLCache
+    _DF_CACHE: _TTLCache | dict = _TTLCache(maxsize=_DF_CACHE_MAX, ttl=DF_TTL_SECONDS)
+    _DF_CACHE_IS_TTL = True
+except ImportError:  # cachetools not installed — fall back to plain dict (dev/test only)
+    _DF_CACHE: dict = {}
+    _DF_CACHE_IS_TTL = False
+    logger.warning("cachetools not installed; _DF_CACHE is unbounded. Install cachetools for production.")
 _DF_LOCK = threading.Lock()
 # Keep the acronym anchored to a line start so a word merely *ending* in the
 # letters (e.g. "CATHV" inside a longer token) cannot match a glossary row.
@@ -347,30 +358,72 @@ class HybridRetriever:
         }
 
     def _visible_frequencies(self, principal: Principal, terms: list[str]) -> dict[str, int]:
-        ready = (
-            select(Chunk.id)
-            .join(Document, Document.id == Chunk.document_id)
-            .where(
-                visible_clause(principal, Chunk.organization_id, Chunk.branch_id, Chunk.department_id, Chunk.policy_id),
-                Document.status == DocumentStatus.READY,
-            )
+        """One UNION ALL statement for all terms, same pattern as _document_frequencies.
+
+        The previous implementation issued one SQL round trip per term (N serial
+        queries). This collapses them into a single batched statement so the
+        salient-coverage gate does not add N×RTT to the critical path.
+
+        Stop words (terms the FTS index never stores) are pre-checked with a
+        single `numnode` call per term on a shared connection so they are still
+        tagged as NOT_INDEXED without firing a count query for them.
+        """
+        parts: list[str] = []
+        params: dict[str, object] = {}
+        # Collect the ACL-filtered chunk ids once; every term counts against the same base.
+        acl_clause = visible_clause(
+            principal, Chunk.organization_id, Chunk.branch_id, Chunk.department_id, Chunk.policy_id
         )
-        counts: dict[str, int] = {}
         try:
             with self._session() as session:
+                # Pre-screen stop words: plainto_tsquery("english", <stop word>) has numnode=0.
+                stop: set[str] = set()
+                content_terms: list[str] = []
                 for term in terms:
                     if term == "__total__":
-                        query, cap = ready, DF_CAP * 50
+                        content_terms.append(term)
+                        continue
+                    if not session.scalar(select(func.numnode(func.plainto_tsquery("english", term)))):
+                        stop.add(term)
                     else:
-                        tsquery = func.plainto_tsquery("english", term)
-                        if not session.scalar(select(func.numnode(tsquery))):
-                            counts[term] = NOT_INDEXED  # a stop word ("did"): absent everywhere by construction
-                            continue
-                        query, cap = ready.where(Chunk.tsv.op("@@")(tsquery)), DF_CAP
-                    counts[term] = session.scalar(select(func.count()).select_from(query.limit(cap).subquery())) or 0
+                        content_terms.append(term)
+
+                if not content_terms:
+                    return {t: NOT_INDEXED for t in stop}
+
+                for index, term in enumerate(content_terms):
+                    if term == "__total__":
+                        parts.append(
+                            "select '__total__' as term, "
+                            "(select count(*) from (select 1 from chunks "
+                            "join documents on documents.id = chunks.document_id "
+                            "where chunks.organization_id = :org "
+                            "and documents.status = 'ready' "
+                            "limit :cap_total) s) as n"
+                        )
+                        params["org"] = principal.organization_id
+                        params["cap_total"] = DF_CAP * 50
+                    else:
+                        params[f"t{index}"] = term
+                        parts.append(
+                            f"select :t{index} as term, "
+                            f"(select count(*) from ("
+                            f"select 1 from chunks "
+                            f"join documents on documents.id = chunks.document_id "
+                            f"where chunks.organization_id = :org "
+                            f"and documents.status = 'ready' "
+                            f"and chunks.tsv @@ plainto_tsquery('english', :t{index}) "
+                            f"limit :cap) s) as n"
+                        )
+                        params.setdefault("org", principal.organization_id)
+                        params["cap"] = DF_CAP
+
+                rows = session.execute(text(" union all ".join(parts)), params).all()
         except OperationalError:
             logger.warning("Visible term statistics failed; the salient-term gate is skipped", exc_info=True)
             return {}
+        counts: dict[str, int] = {t: NOT_INDEXED for t in stop}
+        counts.update({term: int(n) for term, n in rows})
         return counts
 
     def _document_frequencies(self, organization_id: uuid.UUID, terms: list[str]) -> dict[str, int]:

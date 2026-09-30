@@ -51,8 +51,11 @@ class Settings(BaseSettings):
     LOG_JSON: bool = False
 
     DATABASE_URL: str
-    DB_POOL_SIZE: int = 10
-    DB_MAX_OVERFLOW: int = 20
+    DB_POOL_SIZE: int = 12
+    # Overflow connections are opened on demand and closed when idle; they cover
+    # burst concurrency without permanently holding connections open. Set to at
+    # least half of DB_POOL_SIZE so that a brief traffic spike never starves.
+    DB_MAX_OVERFLOW: int = 8
     DB_ECHO: bool = False
 
     STORAGE_BACKEND: StorageBackend = StorageBackend.LOCAL
@@ -201,13 +204,25 @@ class Settings(BaseSettings):
         if self.APP_ENV is AppEnv.PRODUCTION and self.RAG_DEADLINE_SECONDS <= 0:
             raise ValueError("RAG_DEADLINE_SECONDS must be positive in production.")
         if self.RAG_DEADLINE_SECONDS >= self.LLM_TIMEOUT_SECONDS:
-            # The deadline is checked before the call, so a deadline at or above
-            # the provider timeout would never fire. Setting it higher pretends
-            # to bound latency that is in fact bounded by the provider.
             raise ValueError(
                 f"RAG_DEADLINE_SECONDS ({self.RAG_DEADLINE_SECONDS}) must be below "
                 f"LLM_TIMEOUT_SECONDS ({self.LLM_TIMEOUT_SECONDS}): the deadline is only "
                 "checked before the model is called, so it cannot bound the call itself."
+            )
+        # DB pool sizing: the hybrid retrieval opens up to LANE_POOL_SIZE (8) connections
+        # in parallel. With 4 Uvicorn workers each handling 2 concurrent RAG requests,
+        # peak demand is 4 × 2 × 4 lanes = 32 connections. Warn (not error) so that
+        # under-provisioned deployments fail visibly at startup rather than under load.
+        from app.modules.search.retrieval import LANE_POOL_SIZE
+        min_pool = LANE_POOL_SIZE + 4  # conservative: 1 worker, 1 concurrent request
+        if self.DB_POOL_SIZE + self.DB_MAX_OVERFLOW < min_pool:
+            warnings.warn(
+                f"DB_POOL_SIZE ({self.DB_POOL_SIZE}) + DB_MAX_OVERFLOW ({self.DB_MAX_OVERFLOW}) = "
+                f"{self.DB_POOL_SIZE + self.DB_MAX_OVERFLOW} may be too small: the hybrid retrieval "
+                f"opens up to {LANE_POOL_SIZE} parallel connections per request. "
+                f"Set DB_POOL_SIZE >= {min_pool} to avoid pool starvation.",
+                RuntimeWarning,
+                stacklevel=2,
             )
         missing: list[str] = []
         if self.STORAGE_BACKEND is StorageBackend.S3:

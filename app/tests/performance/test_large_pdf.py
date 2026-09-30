@@ -1,7 +1,9 @@
 """Opt-in: pytest -m performance app/tests/performance -s"""
 
-import io
-import resource
+try:
+    import resource
+except ImportError:
+    resource = None
 import time
 
 import pymupdf
@@ -42,11 +44,11 @@ def test_large_pdf_extraction_throughput(client, db, app):
     )
     document_id = response.json()["data"]["id"]
 
-    rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss if resource else 0
     started = time.perf_counter()
     drain(app, max_jobs=100)
     elapsed = time.perf_counter() - started
-    rss_growth_mb = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - rss_before) / (1024 * 1024)
+    rss_growth_mb = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - rss_before) / (1024 * 1024) if resource else 0.0
 
     pages = db.scalar(select(func.count()).select_from(DocumentPage).where(DocumentPage.document_id == document_id))
     sections = db.scalar(select(func.count()).select_from(DocumentSection).where(DocumentSection.document_id == document_id))

@@ -13,3 +13,4 @@ email-validator==2.3.0
 pymupdf==1.28.2
 openai==3.19.2
 httpx2==2.13.1
+cachetools==5.5.2

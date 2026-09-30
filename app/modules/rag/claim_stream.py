@@ -63,6 +63,13 @@ class ClaimStream:
                         claim = None
                     if isinstance(claim, dict):
                         finished.append(claim)
+                    # _object_start is reset here; _depth is already 0 by definition
+                    # (we only enter this branch when depth reaches exactly 0).
+                    # Do NOT reset _depth: it is already 0, and resetting it would
+                    # be both redundant and a signal to future maintainers that a
+                    # manual reset is needed — it is not. The invariant is structural:
+                    # every { increments and every } decrements, so depth=0 always
+                    # means we are outside all open objects.
                     self._object_start = -1
             elif char == "]" and self._depth == 0:
                 self._done = True

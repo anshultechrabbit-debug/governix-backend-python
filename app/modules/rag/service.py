@@ -21,7 +21,7 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import Generator, Iterator
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import Any
@@ -30,7 +30,9 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import Settings
+from app.infrastructure.ai.embeddings.base import EmbeddingProvider
 from app.infrastructure.ai.llm.base import LLMProvider, LLMResult, LLMUnavailableError
+from app.infrastructure.ai.reranker.base import RerankerProvider
 from app.infrastructure.cache.base import Cache, build_cache_key
 from app.modules.audit.service import record_event
 from app.modules.auth.acl import visible_clause
@@ -64,7 +66,20 @@ SUGGESTIONS = [
 NO_ANSWER_MESSAGE = "I couldn't find sufficient supporting information in the available documents."
 # Bump when the answer-generation or validation contract changes so cached
 # answers (including cached no-answers) are recomputed under the new contract.
-ANSWER_CACHE_VERSION = "v14"
+#
+# Changelog:
+#   v1-v5  initial pipeline iterations
+#   v6     evidence header (metadata echo) filtering added
+#   v7     salient-coverage gate added
+#   v8     polarity-flip validation added
+#   v9     number-binding validation added
+#   v10    subject-validation (named terms) check added
+#   v11    version-fallback path added; fallback flagged in response plan
+#   v12    comparison deterministic diff (D1) evidence type added
+#   v13    acronym fast-path answer added
+#   v14    cache key changed: raw history excluded; keyed on rewritten question
+#   v15    summary check merged into claim validation (no second LLM call)
+ANSWER_CACHE_VERSION = "v15"
 # No supported answer in the version in force: worth looking one version back.
 FALLBACK_REASONS = frozenset({
     "NO_RELEVANT_DOCUMENTS", "LOW_RELEVANCE", "KEY_TERMS_NOT_FOUND", "INSUFFICIENT_EVIDENCE",
@@ -158,16 +173,16 @@ class RAGService:
         session_factory: sessionmaker[Session],
         settings: Settings,
         cache: Cache,
-        embedder,
-        reranker,
-        llm_factory,
+        embedder: EmbeddingProvider | None,
+        reranker: RerankerProvider | None,
+        llm_factory: Callable[[], LLMProvider],
     ) -> None:
         self.session = session
         self.settings = settings
         self.cache = cache
-        self.embedder = embedder
-        self.reranker = reranker
-        self._llm_factory = llm_factory
+        self.embedder: EmbeddingProvider | None = embedder
+        self.reranker: RerankerProvider | None = reranker
+        self._llm_factory: Callable[[], LLMProvider] = llm_factory
         self.retriever = HybridRetriever(session_factory, embedder)
 
     # --- public -----------------------------------------------------------------
@@ -190,36 +205,77 @@ class RAGService:
         confirms what was already shown.
         """
         started = time.perf_counter()
-        scope = cache_scope(self.session, principal)
-        key = build_cache_key("rag", scope, ANSWER_CACHE_VERSION, " ".join(request.question.lower().split()),
-                              request.model_dump(mode="json", exclude={"question"}))
+        key = self._answer_cache_key(principal, request)
         if (cached := self.cache.get(key)) is not None:
             response = AnswerResponse.model_validate(cached)
             response.cache_hit = True
+            response.question = request.question
             response.query_id = self._audit(principal, request, response, retrieved=[], cache_hit=True)
             yield "done", response
             return
 
         timings: dict[str, float] = {}
         deadline = started + self.settings.RAG_DEADLINE_SECONDS
-        original = request
         yield "stage", {"stage": "searching"}
-        # Emoji or punctuation alone ("😂😂😂", "???") has nothing to search for: every document
-        # would pass the key-term check vacuously, so it is refused before any search or model call.
+
+        prepared_request, rewrite, named, plan = self._prepare_request(principal, request, timings)
+        response, retrieved = yield from self._run_pipeline(
+            principal, prepared_request, plan, rewrite, named, timings, deadline, started
+        )
+        response = self._decorate_and_persist(
+            principal, request, prepared_request, response, plan, rewrite, retrieved, timings, started, key
+        )
+        yield "done", response
+
+    def _answer_cache_key(self, principal: Principal, request: AskRequest) -> str:
+        """Key on the (normalised) rewritten question plus the explicit filter parameters.
+
+        Raw history is excluded: once resolved into a standalone question, two turns
+        with identical rewrites but different history must share the same cache entry.
+        """
+        scope = cache_scope(self.session, principal)
+        return build_cache_key(
+            "rag", scope, ANSWER_CACHE_VERSION,
+            " ".join(request.question.lower().split()),
+            request.mode,
+            request.as_of.isoformat() if request.as_of else None,
+            sorted(str(v) for v in request.version_ids),
+            sorted(str(p) for p in request.policy_ids),
+            sorted(str(c) for c in request.category_ids),
+        )
+
+    def _prepare_request(
+        self, principal: Principal, request: AskRequest, timings: dict[str, float]
+    ) -> tuple[AskRequest, Any, list[NamedDocument], QueryPlan]:
+        """Normalize question, resolve context/rewrite, strip named filenames, and plan query."""
         words = has_words(request.question)
-        request, rewrite = self._standalone(request, timings) if words else (request, None)
-        named = self.retriever.referenced_documents(principal, request.question) if words else []
+        prepared, rewrite = self._standalone(request, timings) if words else (request, None)
+        named = self.retriever.referenced_documents(principal, prepared.question) if words else []
         if named:
             # The file name is not document text: left in, it fails the key-term check and
             # its tokens ("v2" in "policy_v2.pdf") would be read as a version reference.
-            request = request.model_copy(update={"question": _without_file_names(request.question, named)})
+            prepared = prepared.model_copy(update={"question": _without_file_names(prepared.question, named)})
         plan = plan_query(
-            request.question,
-            ui_mode=None if request.mode == "auto" else request.mode,
-            as_of=request.as_of,
-            version_ids=request.version_ids,
+            prepared.question,
+            ui_mode=None if prepared.mode == "auto" else prepared.mode,
+            as_of=prepared.as_of,
+            version_ids=prepared.version_ids,
             date_order=self.settings.DATE_ORDER,
         )
+        return prepared, rewrite, named, plan
+
+    def _run_pipeline(
+        self,
+        principal: Principal,
+        request: AskRequest,
+        plan: QueryPlan,
+        rewrite: Any,
+        named: list[NamedDocument],
+        timings: dict[str, float],
+        deadline: float,
+        started: float,
+    ) -> Generator[tuple[str, Any], None, tuple[AnswerResponse, list[int]]]:
+        """Execute retrieval, gating, generation and version fallback while streaming stage/claim events."""
         attempt = _Attempt()
         try:
             if rewrite is None:
@@ -238,23 +294,37 @@ class RAGService:
                 )
         except _NoAnswer as no_answer:
             response = self._no_answer(request, plan, attempt.evidence, no_answer, attempt.llm_result)
-        retrieved = attempt.retrieved
+        return response, attempt.retrieved
 
+    def _decorate_and_persist(
+        self,
+        principal: Principal,
+        original: AskRequest,
+        prepared: AskRequest,
+        response: AnswerResponse,
+        plan: QueryPlan,
+        rewrite: Any,
+        retrieved: list[int],
+        timings: dict[str, float],
+        started: float,
+        key: str,
+    ) -> AnswerResponse:
+        """Decorate response with warnings, timings, audit trail, and persist into answer cache."""
         response.question = original.question
         if response.status == "answered" and plan.as_of and plan.as_of > datetime.now(UTC).date():
             response.warnings.append(
                 f"{plan.as_of.isoformat()} is in the future. This is the version in force today; it may change before then."
             )
         if rewrite and rewrite.reason:
-            response.plan["rewritten_question"] = request.question
+            response.plan["rewritten_question"] = prepared.question
             response.plan["rewrite_reason"] = rewrite.reason
             if rewrite.reason == "translation" and response.status == "answered":
-                response.warnings.insert(0, f'Answered in English. The question was searched as: "{request.question}"')
+                response.warnings.insert(0, f'Answered in English. The question was searched as: "{prepared.question}"')
         timings["total"] = round((time.perf_counter() - started) * 1000, 1)
         response.timings_ms = timings
         response.query_id = self._audit(principal, original, response, retrieved=retrieved, cache_hit=False)
         self.cache.set(key, response.model_dump(mode="json"), ttl_seconds=self.settings.RAG_CACHE_TTL_SECONDS)
-        yield "done", response
+        return response
 
     # --- one pass: retrieve, gate, generate --------------------------------------------
 
@@ -323,6 +393,13 @@ class RAGService:
         timings: dict[str, float], deadline: float, started: float,
     ) -> Generator[tuple[str, Any], None, AnswerResponse]:
         for depth, version_ids in enumerate(self._previous_version_sets(principal, request, plan.as_of), start=1):
+            # Refuse to start another full pipeline pass if the deadline is already
+            # exhausted: the LLM call would immediately time out anyway, and the
+            # _check_deadline inside _attempt fires *before* the call, not after.
+            # Raising here lets the outer handler emit a clean DEADLINE_EXCEEDED
+            # no-answer rather than a timed-out fallback attempt.
+            if time.perf_counter() >= deadline:
+                raise _NoAnswer("DEADLINE_EXCEEDED")
             yield "stage", {"stage": "searching_previous_versions", "depth": depth}
             filters = SearchFilters(
                 version_scope=VersionScope("versions", version_ids=version_ids),
@@ -409,6 +486,7 @@ class RAGService:
         try:
             llm = self._llm_factory()
         except LLMUnavailableError:
+            logger.warning("LLM unavailable for query rewrite; proceeding with the raw question")
             llm = None
         rewrite = standalone_question(llm, request.question, request.history)
         if rewrite.reason:
@@ -475,7 +553,10 @@ class RAGService:
         return list(rows)
 
     def _comparison(self, principal: Principal, plan: QueryPlan) -> dict | None:
-        versions = [self.session.get(PolicyVersion, v) for v in plan.version_ids]
+        # Fetch both versions in a single query instead of two serial session.get() calls.
+        versions = list(self.session.scalars(
+            select(PolicyVersion).where(PolicyVersion.id.in_(plan.version_ids))
+        ).all())
         versions = [v for v in versions if v is not None]
         if len(versions) != 2 or versions[0].policy_id != versions[1].policy_id:
             raise _NoAnswer("COMPARISON_TARGET_UNCLEAR")
@@ -827,8 +908,13 @@ class RAGService:
                 "asked_at": datetime.now(UTC).isoformat(),
             },
         )
+        # flush() stages the INSERT in the current transaction without committing it.
+        # The outer transaction (owned by the FastAPI dependency or the streaming
+        # session context) is committed exactly once at the end of the request,
+        # so a mid-stream crash cannot commit the audit row while leaving other
+        # writes uncommitted. The streaming path owns its own session and still
+        # exits cleanly via the `with session_factory() as session` context.
         self.session.flush()
-        self.session.commit()
         return event.id
 
 

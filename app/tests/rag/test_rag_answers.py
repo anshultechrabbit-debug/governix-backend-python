@@ -26,8 +26,15 @@ class ScriptedLLM(LLMProvider):
         self.calls += 1
         if self.fail:
             raise LLMUnavailableError("down")
-        return LLMResult(content={"claims": self.claims, "insufficient_evidence": False, "conflicts": []},
-                         model=self.model_id, input_tokens=100, output_tokens=20)
+        return LLMResult(
+            content={
+                "claims": self.claims,
+                "summary": "",  # v15: _summary() reads this field; empty = no summary produced
+                "insufficient_evidence": False,
+                "conflicts": [],
+            },
+            model=self.model_id, input_tokens=100, output_tokens=20,
+        )
 
 
 @pytest.fixture
