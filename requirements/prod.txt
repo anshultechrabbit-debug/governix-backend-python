@@ -1,0 +1,5 @@
+# Production-only infrastructure (Phase 10). Never required for local development.
+-r base.txt
+boto3
+celery
+redis

@@ -1,0 +1,201 @@
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+
+from sqlalchemy import func, or_, select
+from sqlalchemy.orm import Session, sessionmaker
+
+from app.infrastructure.ai.embeddings.base import EmbeddingProvider
+from app.infrastructure.cache.base import Cache, CacheScope, build_cache_key
+from app.modules.audit.service import record_event
+from app.modules.auth.acl import visible_clause
+from app.modules.auth.permissions import Principal
+from app.modules.auth.scope import tenant_id
+from app.modules.documents.model import Document
+from app.modules.organizations.model import Organization
+from app.modules.policies.model import Policy, PolicyStatus, PolicyVersion
+from app.modules.search.retrieval import (
+    Candidate,
+    HybridRetriever,
+    SearchFilters,
+    VersionScope,
+    query_terms,
+)
+from app.modules.search.query_intelligence import query_variants
+from app.modules.search.schema import Passage, PolicyHit, Provenance, SearchRequest, SearchResponse
+
+QUERY_VECTOR_TTL = 24 * 3600
+# Upper bound on concurrent lexical variants. Each variant drives 4 lanes, so
+# this caps a single question at VARIANT_POOL_SIZE x 4 in-flight statements.
+VARIANT_POOL_SIZE = 3
+
+
+def cache_scope(session: Session, principal: Principal) -> CacheScope:
+    organization = session.get(Organization, tenant_id(principal))
+    return CacheScope(
+        organization_id=principal.organization_id,
+        branch_id=principal.branch_id,
+        department_id=principal.department_id,
+        permission_scope=principal.permission_scope,
+        knowledge_version=str(organization.knowledge_version),
+    )
+
+
+def embed_query_cached(embedder: EmbeddingProvider | None, cache: Cache, query: str) -> list[float] | None:
+    """Query vectors depend only on (model, text): safe to share across tenants."""
+    if embedder is None:
+        return None
+    key = build_cache_key("qvec", CacheScope.system(), embedder.model_id, " ".join(query.lower().split()))
+    if (vector := cache.get(key)) is not None:
+        return vector
+    vector = embedder.query_vector(query)
+    if vector is not None:  # a stand-in (the model is unavailable) is neither used nor cached
+        cache.set(key, vector, ttl_seconds=QUERY_VECTOR_TTL)
+    return vector
+
+
+def build_filters(request) -> SearchFilters:
+    return SearchFilters(
+        version_scope=VersionScope(request.mode, request.as_of, list(request.version_ids)),
+        category_ids=list(request.category_ids),
+        policy_ids=list(request.policy_ids),
+        document_ids=list(request.document_ids),
+        branch_id=request.branch_id,
+        department_id=request.department_id,
+    )
+
+
+def retrieve_with_variants(principal, retriever, embedder, cache, query, filters, *, limit: int):
+    """Fuse independently retrieved lexical variants with RRF.
+
+    Every individual retrieval retains its SQL ACL/version predicate; fusion
+    only combines already-authorised candidates.
+    """
+    variants = query_variants(query)
+    if len(variants) == 1:
+        return retriever.retrieve(
+            principal, variants[0], filters, limit=limit,
+            query_vector=embed_query_cached(embedder, cache, variants[0]),
+        )
+    # Variants run concurrently on the shared lane pool. Running them in series
+    # tripled wall-clock latency for a recall gain that does not need it.
+    with ThreadPoolExecutor(max_workers=min(len(variants), VARIANT_POOL_SIZE)) as pool:
+        futures = [
+            pool.submit(
+                retriever.retrieve, principal, variant, filters,
+                limit=limit, query_vector=embed_query_cached(embedder, cache, variant),
+            )
+            for variant in variants
+        ]
+        results = [future.result() for future in futures]
+    if len(results) == 1:
+        return results[0]
+    fused = {}
+    for variant_index, result in enumerate(results):
+        for rank, candidate in enumerate(result.candidates, start=1):
+            existing = fused.setdefault(candidate.chunk_id, candidate)
+            existing.ranks[f"query_{variant_index + 1}"] = rank
+            existing.fused += 1 / (60 + rank)
+    merged = sorted(fused.values(), key=lambda c: c.fused, reverse=True)[:limit]
+    base = results[0]
+    base.candidates = merged
+    base.timings_ms["query_variants"] = len(variants)
+    base.lane_counts["query_variants"] = len(variants)
+    return base
+
+
+def provenance(session: Session, candidates: list[Candidate]) -> dict[uuid.UUID, Provenance]:
+    """Document/policy/version details for candidates (all already ACL-filtered)."""
+    if not candidates:
+        return {}
+    documents = {d.id: d for d in session.scalars(select(Document).where(Document.id.in_({c.document_id for c in candidates})))}
+    policies = {p.id: p for p in session.scalars(select(Policy).where(Policy.id.in_({c.policy_id for c in candidates if c.policy_id})))}
+    versions = {v.id: v for v in session.scalars(select(PolicyVersion).where(PolicyVersion.id.in_({c.version_id for c in candidates if c.version_id})))}
+    result = {}
+    for c in candidates:
+        document, policy, version = documents[c.document_id], policies.get(c.policy_id), versions.get(c.version_id)
+        result[c.chunk_id] = Provenance(
+            document_id=c.document_id,
+            document_title=document.title,
+            policy_id=c.policy_id,
+            policy_name=policy.name if policy else None,
+            category_id=document.category_id,
+            version_id=c.version_id,
+            version_label=version.version_label if version else None,
+            # A placeholder date (no effective date was stated) is not shown or given
+            # to the model as if it were a business date.
+            effective_from=version.effective_from if version and _real_date(version) else None,
+            effective_to=version.effective_to if version and _real_date(version) else None,
+            section_number=c.section_number,
+            section_path=c.section_path,
+            page_start=c.page_start,
+            page_end=c.page_end,
+        )
+    return result
+
+
+class SearchService:
+    def __init__(self, session: Session, session_factory: sessionmaker[Session], embedder, cache: Cache) -> None:
+        self.session = session
+        self.cache = cache
+        self.embedder = embedder
+        self.retriever = HybridRetriever(session_factory, embedder)
+
+    def search(self, principal: Principal, request: SearchRequest) -> SearchResponse:
+        scope = cache_scope(self.session, principal)
+        key = build_cache_key("search", scope, request.model_dump(mode="json"))
+        if (cached := self.cache.get(key)) is not None:
+            response = SearchResponse.model_validate(cached)
+            response.cache_hit = True
+            self._audit(principal, request, len(response.passages), cache_hit=True)
+            return response
+
+        filters = build_filters(request)
+        result = retrieve_with_variants(
+            principal, self.retriever, self.embedder, self.cache, request.query, filters, limit=request.limit,
+        )
+        sources = provenance(self.session, result.candidates)
+        response = SearchResponse(
+            query=request.query,
+            mode=request.mode,
+            as_of=filters.version_scope.effective_date(),
+            passages=[
+                Passage(chunk_id=c.chunk_id, text=c.text, score=round(c.fused, 5), lanes=c.ranks, source=sources[c.chunk_id])
+                for c in result.candidates
+            ],
+            policies=self._policy_hits(principal, request.query),
+            terms=query_terms(request.query),
+            timings_ms=result.timings_ms,
+        )
+        self.cache.set(key, response.model_dump(mode="json"))
+        self._audit(principal, request, len(response.passages), cache_hit=False)
+        return response
+
+    def _policy_hits(self, principal: Principal, query: str) -> list[PolicyHit]:
+        normalized = " ".join(query_terms(query))
+        if not normalized:
+            return []
+        rows = self.session.scalars(
+            select(Policy).where(
+                visible_clause(principal, Policy.organization_id, Policy.branch_id, Policy.department_id, Policy.id),
+                Policy.status == PolicyStatus.ACTIVE,
+                or_(
+                    func.word_similarity(normalized, Policy.normalized_name) >= 0.5,
+                    func.upper(Policy.policy_number) == query.strip().upper(),
+                ),
+            ).order_by(func.word_similarity(normalized, Policy.normalized_name).desc()).limit(5)
+        )
+        return [PolicyHit(id=p.id, name=p.name, policy_number=p.policy_number, category_id=p.category_id) for p in rows]
+
+    def _audit(self, principal: Principal, request: SearchRequest, results: int, *, cache_hit: bool) -> None:
+        record_event(
+            self.session, "search.query", actor=principal, resource_type="search",
+            details={"query": request.query, "mode": request.mode, "results": results, "cache_hit": cache_hit,
+                     "permission_scope": principal.permission_scope},
+        )
+        self.session.commit()
+
+
+def _real_date(version) -> bool:
+    from app.modules.policies.model import AUTO_DATE_SOURCES
+
+    return version.effective_date_source not in AUTO_DATE_SOURCES

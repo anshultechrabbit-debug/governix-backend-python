@@ -1,0 +1,16 @@
+[project]
+name = "governix"
+version = "1.0.0"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["app/tests"]
+addopts = "-ra -m 'not performance'"
+filterwarnings = [
+    # PyMuPDF's SWIG bindings; not actionable here.
+    "ignore:builtin type .* has no __module__ attribute:DeprecationWarning",
+]
+markers = [
+    "integration: requires PostgreSQL (uses a separate <db>_test database)",
+    "performance: slow benchmarks; run explicitly with -m performance",
+]

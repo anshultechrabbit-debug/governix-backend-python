@@ -1,0 +1,135 @@
+!! [1.1  ] FAIL     4.2s -      no_answer ANSWER_FAILED_VALIDATION What is the name of this document?
+          -> (no answer)
+!! [1.2  ] FAIL    10.6s -      no_answer INSUFFICIENT_EVIDENCE  Who published the National Electricity Plan Volume II Transmis
+          -> (no answer)
+!! [1.3  ] FAIL     6.0s -      no_answer ANSWER_FAILED_VALIDATION When was this plan published?
+          -> (no answer)
+OK [1.4  ] PASS     3.9s p44    answered                         Under which Act was the plan prepared?
+!! [1.5  ] FAIL     6.1s -      no_answer INSUFFICIENT_EVIDENCE  Which section of the Electricity Act is mentioned?
+          -> (no answer)
+!! [1.6  ] FAIL    14.6s -      no_answer INSUFFICIENT_EVIDENCE  What periods does the plan cover?
+          -> (no answer)
+!! [1.7  ] FAIL     5.9s p4     answered                         What is Chapter 3 about?
+          -> Chapter 3 includes "3.3 Consideration of Energy Storage Systems in Transmission Planning". [1] Chapter 3 includes "3.4 Technological Options". [1]
+!! [1.8  ] FAIL     7.2s p4     answered                         What is Chapter 4 about?
+          -> Chapter 4 > Security includes 4.1 New Technology Options for Substations; 4.2 New Technology Options for Transmission Lines; 4.3 New Technology Options for Communication Equipment in Transmission System; 4.4 Surveying Technologies; 4.5 Cyber Security; 4.6 Skill Development. [1]
+!! [1.9  ] FAIL    13.4s p5     answered                         What is Chapter 5 about?
+          -> The evidence shows 'Chapter : Contents' for Chapter 5. [1]
+!! [1.10 ] FAIL     9.9s p6     answered                         What is Chapter 8 about?
+          -> Chapter 8 contains 8.2 Assessment of Electricity Demand; 8.3 Assessment of Installed Generation Capacity; 8.4 Load-Generation Scenarios and Transmission Capacity requirement for 2027-32; 8.5 Transmission system planned during 2027-32; 8.6 Reactive Compensation; 8.7 Estimated cost of Transmission System during the period 2027-32; and 8.8 Conclusions. [1] Chapter 8 appears in the National Electricit
+OK [2.1  ] PASS     0.7s p10    answered                         What does BESS stand for?
+OK [2.2  ] PASS     0.4s p10    answered                         What does HVDC stand for?
+OK [2.3  ] PASS     0.4s p10    answered                         What does HVAC stand for?
+OK [2.4  ] PASS    10.8s p69    answered                         What does STATCOM stand for?
+OK [2.5  ] PASS     6.9s p69    answered                         What does SVC stand for?
+OK [2.6  ] PASS     1.2s p10    answered                         What does FACTS stand for?
+OK [2.7  ] PASS     1.0s p10    answered                         What does ISTS stand for?
+OK [2.8  ] PASS     0.4s p10    answered                         What does CTU stand for?
+!! [2.9  ] FAIL     4.5s -      no_answer INSUFFICIENT_EVIDENCE  What does STU stand for?
+          -> (no answer)
+!! [2.10 ] FAIL     0.6s p457   answered                         What does TBCB stand for?
+          -> TBCB stands for Under Bidding 2028-29 Uttar Pradesh. [1]
+OK [2.11 ] PASS     6.1s p153   answered                         What does OSOWOG stand for?
+!! [2.12 ] FAIL     3.5s -      no_answer INSUFFICIENT_EVIDENCE  What does REZ stand for?
+          -> (no answer)
+OK [2.13 ] PASS     1.0s p10    answered                         What does DLR stand for?
+OK [2.14 ] PASS     3.6s p82    answered                         What does PMU stand for?
+OK [2.15 ] PASS     0.4s p10    answered                         What does GEC stand for?
+!! [3.1  ] FAIL     0.4s -      no_answer KEY_TERMS_NOT_FOUND    What was the estimated cost of the 170 transmission schemes me
+          -> (no answer)
+!! [3.2  ] FAIL     7.3s -      no_answer INSUFFICIENT_EVIDENCE  How many transmission schemes were mentioned in that discussio
+          -> (no answer)
+!! [3.3  ] FAIL    13.2s -      no_answer INSUFFICIENT_EVIDENCE  What renewable-energy capacity does the transmission system ai
+          -> (no answer)
+!! [3.4  ] FAIL     5.2s -      no_answer INSUFFICIENT_EVIDENCE  What is the planned non-fossil electricity generation capacity
+          -> (no answer)
+!! [3.5  ] FAIL     5.8s -      no_answer ANSWER_FAILED_VALIDATION What is the planned rooftop solar capacity for 2032?
+          -> (no answer)
+OK [4.1  ] PASS    12.6s p13    answered                         Why does the plan say transmission infrastructure is needed fo
+!! [4.2  ] FAIL    12.1s -      no_answer INSUFFICIENT_EVIDENCE  Why can't Kerala and Goa meet their entire electricity demand 
+          -> (no answer)
+!! [4.3  ] FAIL    13.0s -      no_answer INSUFFICIENT_EVIDENCE  What does the plan say about transmission lines passing throug
+          -> (no answer)
+OK [4.4  ] PASS    11.8s p19    answered                         Why are both BESS and pumped-storage plants considered?
+!! [5.1  ] FAIL    12.2s -      no_answer INSUFFICIENT_EVIDENCE  What renewable-energy integration challenges does the plan ide
+          -> (no answer)
+OK [5.2  ] PASS     6.8s p114   answered                         What scenarios were considered for the 2026-27 transmission st
+!! [5.3  ] FAIL    14.7s -      no_answer INSUFFICIENT_EVIDENCE  Why are planning margins used in transmission planning?
+          -> (no answer)
+OK [6.1  ] PASS    10.8s p14    answered                         Did the document agree that rooftop solar alone could provide 
+!! [7.1  ] FAIL    14.2s -      no_answer INSUFFICIENT_EVIDENCE  Who suggested that rooftop solar could contribute more than 70
+          -> (no answer)
+!! [7.2  ] FAIL     6.5s -      no_answer INSUFFICIENT_EVIDENCE  Who suggested changing the voltage margin from +5% to +10%?
+          -> (no answer)
+!! [7.3  ] FAIL     9.2s p17    answered                         Who suggested extending the transmission-planning horizon from
+          -> KPTCL requested to revise the time horizon of transmission planning from 3-5 years to 5-10 years on rolling basis every year. [1]
+OK [7.4  ] PASS     5.7s p22    answered                         Who suggested consideration of additional scenarios involving 
+OK [8.1  ] PASS     2.8s -      no_answer INSUFFICIENT_EVIDENCE  What is India's electricity demand in 2050?
+!! [9.1  ] FAIL     0.4s -      no_answer KEY_TERMS_NOT_FOUND    What is the exact title, issuing authority, publication date, 
+          -> (no answer)
+
+====================================================================================================
+PASSED 19/44  (43%)
+
+by section:
+  !! basic        1/10
+  !! acronym      12/15
+  !! number       0/5
+  !! reasoning    2/4
+  !! multihop     1/3
+  OK grounding    1/1
+  !! attribution  1/4
+  OK refusal      1/1
+  !! metadata     0/1
+
+failures:
+  [1.1] basic: What is the name of this document?
+        FAIL status_reason=ANSWER_FAILED_VALIDATION
+  [1.2] basic: Who published the National Electricity Plan Volume II Transmission?
+        FAIL status_reason=INSUFFICIENT_EVIDENCE
+  [1.3] basic: When was this plan published?
+        FAIL status_reason=ANSWER_FAILED_VALIDATION
+  [1.5] basic: Which section of the Electricity Act is mentioned?
+        FAIL status_reason=INSUFFICIENT_EVIDENCE
+  [1.6] basic: What periods does the plan cover?
+        FAIL status_reason=INSUFFICIENT_EVIDENCE
+  [1.7] basic: What is Chapter 3 about?
+        FAIL status_reason=
+  [1.8] basic: What is Chapter 4 about?
+        FAIL status_reason=
+  [1.9] basic: What is Chapter 5 about?
+        FAIL status_reason=
+  [1.10] basic: What is Chapter 8 about?
+        FAIL status_reason=
+  [2.9] acronym: What does STU stand for?
+        FAIL status_reason=INSUFFICIENT_EVIDENCE
+  [2.10] acronym: What does TBCB stand for?
+        FAIL status_reason=
+  [2.12] acronym: What does REZ stand for?
+        FAIL status_reason=INSUFFICIENT_EVIDENCE
+  [3.1] number: What was the estimated cost of the 170 transmission schemes mentioned in the comments section?
+        FAIL status_reason=KEY_TERMS_NOT_FOUND
+  [3.2] number: How many transmission schemes were mentioned in that discussion?
+        FAIL status_reason=INSUFFICIENT_EVIDENCE
+  [3.3] number: What renewable-energy capacity does the transmission system aim to integrate?
+        FAIL status_reason=INSUFFICIENT_EVIDENCE
+  [3.4] number: What is the planned non-fossil electricity generation capacity for 2030?
+        FAIL status_reason=INSUFFICIENT_EVIDENCE
+  [3.5] number: What is the planned rooftop solar capacity for 2032?
+        FAIL status_reason=ANSWER_FAILED_VALIDATION
+  [4.2] reasoning: Why can't Kerala and Goa meet their entire electricity demand using only their own renewable resources?
+        FAIL status_reason=INSUFFICIENT_EVIDENCE
+  [4.3] reasoning: What does the plan say about transmission lines passing through forests?
+        FAIL status_reason=INSUFFICIENT_EVIDENCE
+  [5.1] multihop: What renewable-energy integration challenges does the plan identify, and which technologies address them?
+        FAIL status_reason=INSUFFICIENT_EVIDENCE
+  [5.3] multihop: Why are planning margins used in transmission planning?
+        FAIL status_reason=INSUFFICIENT_EVIDENCE
+  [7.1] attribution: Who suggested that rooftop solar could contribute more than 70-80% of annual electrical energy?
+        FAIL status_reason=INSUFFICIENT_EVIDENCE
+  [7.2] attribution: Who suggested changing the voltage margin from +5% to +10%?
+        FAIL status_reason=INSUFFICIENT_EVIDENCE
+  [7.3] attribution: Who suggested extending the transmission-planning horizon from 3-5 years to 5-10 years?
+        FAIL status_reason=
+  [9.1] metadata: What is the exact title, issuing authority, publication date, planning horizon and legal basis of this document?
+        FAIL status_reason=KEY_TERMS_NOT_FOUND
