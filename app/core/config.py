@@ -118,7 +118,7 @@ class Settings(BaseSettings):
     # AI providers. "openai" is the configured default; "local" providers are
     # deterministic stand-ins for development/tests without an API key.
     LLM_PROVIDER: str = "openai"
-    LLM_MODEL: str = "gpt-5-mini"
+    LLM_MODEL: str = "gpt-4o-mini"
     # Per-call bound on the model. A request thread blocked in a synchronous
     # provider call cannot be interrupted from outside, so this -- not the RAG
     # deadline -- is what actually caps latency.
