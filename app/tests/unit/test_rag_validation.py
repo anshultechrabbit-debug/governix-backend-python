@@ -70,3 +70,59 @@ def test_metadata_echo_is_recognised_only_in_the_header_format():
     assert _METADATA_ECHO.search("Version 1 of the Plan is effective 2024-10-01 to present.")
     assert not _METADATA_ECHO.search("The plan covers the period 2022-27 and 2027-32.")
     assert not _METADATA_ECHO.search("The circular is effective from 1 April 2025.")
+
+
+RETENTION = {"E1": EvidenceText("E1", (
+    "Sl. No.: 60 | TITLE OF THE RECORD: IRC User Control Register | PLACE OF STORAGE: GMU-K | "
+    "PROPOSED RETENTION PERIOD: 5 Years | REMARKS: No Change\n\n"
+    "Sl. No.: 61 | TITLE OF THE RECORD: L TO Backup Register | PLACE OF STORAGE: GMU-K | "
+    "PROPOSED RETENTION PERIOD: 10 Years | REMARKS: No Change\n\n"
+    "Sl. No.: 65 | TITLE OF THE RECORD: MAP /SIR Reports | PLACE OF STORAGE: GMU-K | "
+    "PROPOSED RETENTION PERIOD: 5 Years | REMARKS: No Change"
+))}
+SUBJECTS = ["proposed", "retention", "period", "map/sir", "reports"]
+
+
+def retention(text):
+    [result] = validate_claims([{"text": text, "evidence_ids": ["E1"]}], RETENTION, SUBJECTS)
+    return result
+
+
+def test_a_figure_stated_beside_its_subject_passes():
+    assert retention("The proposed retention period for MAP/SIR Reports is 5 Years.").valid
+
+
+def test_a_figure_from_another_row_is_rejected():
+    result = retention("The proposed retention period for MAP/SIR Reports is 10 Years.")
+    assert not result.valid
+    assert any("not stated for" in p for p in result.problems)
+
+
+def test_a_subject_the_cited_evidence_never_names_is_rejected():
+    evidence = {"E1": EvidenceText("E1", "PROPOSED RETENTION PERIOD: 10 Years for the L TO Backup Register.")}
+    [result] = validate_claims(
+        [{"text": "The retention period for MAP/SIR Reports is 10 Years.", "evidence_ids": ["E1"]}], evidence, SUBJECTS,
+    )
+    assert not result.valid and "does not mention map/sir" in result.problems[0]
+
+
+def test_a_dropped_negation_is_rejected():
+    evidence = {"E1": EvidenceText("E1", "No prepayment charges apply to floating rate home loans.")}
+    [result] = validate_claims(
+        [{"text": "Prepayment charges apply to floating rate home loans.", "evidence_ids": ["E1"]}], evidence,
+    )
+    assert not result.valid and "reverses the negation" in result.problems[-1]
+
+
+def test_a_short_answer_after_the_question_keeps_its_negation():
+    evidence = {"E1": EvidenceText("E1", "Q 6. Can expected income from an asset financed by a microfinance loan "
+                                         "be included for estimation of household income? Ans. No.")}
+    [result] = validate_claims([{
+        "text": "No, expected income from an asset financed by a microfinance loan cannot be included for estimation of household income.",
+        "evidence_ids": ["E1"],
+    }], evidence)
+    assert result.valid, result.problems
+
+
+def test_a_paraphrase_is_not_judged_on_negation():
+    assert check("Loans above Rs. 75 lakh have a maximum LTV of 70%.", ["E1"]).valid

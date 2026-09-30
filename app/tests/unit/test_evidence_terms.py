@@ -1,7 +1,7 @@
 """Which question words the evidence must contain before an answer is attempted."""
 import pytest
 
-from app.modules.rag.evidence import is_document_question, key_terms
+from app.modules.rag.evidence import coverage_of, is_document_question, key_terms
 
 
 def test_question_framing_words_are_not_required_but_numbers_are():
@@ -43,3 +43,9 @@ def test_repeated_passages_keep_only_the_best_ranked_copy():
     ranked = [cand("Review and Audit: retain evidence.", 5), cand("review and audit — retain evidence", 9),
               cand("Different clause.", 2)]
     assert [c.page_start for c in distinct_passages(ranked)] == [5, 2]
+
+
+def test_a_hyphenated_term_matches_its_parts_even_when_the_line_broke_at_the_hyphen():
+    coverage, missing = coverage_of("How is delay in reporting to FIU-IND treated?",
+                                    ["Delay in reporting to the Director, FIU- IND is treated as a separate violation."])
+    assert "fiu-ind" not in missing

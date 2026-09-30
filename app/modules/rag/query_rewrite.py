@@ -35,6 +35,10 @@ _FOLLOW_UP = re.compile(
     r"|^\s*what\s+changed\s*[.?!]?\s*$",
     re.I,
 )
+# A pronoun that may point back ("What is its place of storage?"). Common in
+# standalone questions too, so it only triggers a rewrite when there is an
+# earlier turn to resolve it against; the rewrite returns a standalone question unchanged.
+_PRONOUN = re.compile(r"\b(?:its|their|it|they|them|he|she|his|her)\b", re.I)
 
 SYSTEM_PROMPT = """You rewrite a user's latest message into ONE standalone question in English, for searching documents.
 
@@ -74,7 +78,7 @@ def is_non_english(question: str) -> bool:
 
 def standalone_question(llm: LLMProvider | None, question: str, history: list) -> Rewrite:
     """The question to search with. Raises nothing: an unavailable model leaves it unchanged."""
-    follow_up = refers_to_earlier_turn(question)
+    follow_up = refers_to_earlier_turn(question) or bool(history and _PRONOUN.search(question))
     foreign = is_non_english(question)
     if not follow_up and not foreign:
         return Rewrite(question)
@@ -98,4 +102,8 @@ def standalone_question(llm: LLMProvider | None, question: str, history: list) -
     rewritten = " ".join(str(content.get("standalone_question") or "").split())
     if not rewritten:  # a provider without rewrite support (the local stand-in)
         return Rewrite(question, reason, resolvable=not follow_up)
-    return Rewrite(rewritten[:2000], reason, resolvable=bool(content.get("resolvable", True)))
+    # A translation always has something to search for; only an unresolved reference does not.
+    resolvable = bool(content.get("resolvable", True)) or not follow_up
+    if rewritten == question and reason == "follow_up":
+        reason = None  # already standalone: nothing was rewritten
+    return Rewrite(rewritten[:2000], reason, resolvable=resolvable)

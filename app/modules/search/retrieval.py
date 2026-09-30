@@ -317,10 +317,11 @@ class HybridRetriever:
     def visible_term_weights(self, principal: Principal, terms: list[str]) -> dict[str, float]:
         """IDF of each term over the searchable chunks the caller can see.
 
-        Terms that occur nowhere the caller can see are left out: they say nothing
-        about whether the chosen evidence is the right part of the corpus, and
-        counting them would let the no-answer gate reveal content outside the
-        caller's scope.
+        A term that occurs nowhere the caller can see gets the highest weight: it
+        names something the caller's documents do not cover ("FIU-IND" asked of a
+        bank with no KYC policy), which is the strongest sign that no answer
+        exists. Only the caller's own visible chunks are counted, so this reveals
+        nothing about documents outside their scope.
         """
         if not terms or principal.organization_id is None:
             return {}
@@ -339,7 +340,7 @@ class HybridRetriever:
         return {
             term: math.log(1 + (total - df + 0.5) / (df + 0.5))
             for term in dict.fromkeys(terms)
-            if (df := min(cached.get(term, 0), total)) > 0
+            for df in (min(cached.get(term, 0), total),)
         }
 
     def _visible_frequencies(self, principal: Principal, terms: list[str]) -> dict[str, int]:

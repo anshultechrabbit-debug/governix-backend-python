@@ -77,3 +77,32 @@ def test_unavailable_model_keeps_the_question_and_blocks_only_follow_ups():
     down = FakeLLM(error=True)
     assert standalone_question(down, "बीईएसएस क्या है?", []).resolvable
     assert not standalone_question(down, "What about that scheme?", HISTORY).resolvable
+
+
+class _Rewriter:
+    def __init__(self, question, resolvable):
+        self.content = {"standalone_question": question, "resolvable": resolvable}
+
+    def generate_json(self, *_args, **_kwargs):
+        from app.infrastructure.ai.llm.base import LLMResult
+        return LLMResult(content=self.content, model="test")
+
+
+def test_a_pronoun_is_resolved_against_the_earlier_turn():
+
+
+    history = [ConversationTurn(question="What is the retention period for MAP/SIR Reports?", answer="5 Years.")]
+    rewrite = standalone_question(_Rewriter("What is the place of storage of MAP/SIR Reports?", True),
+                                  "What is its place of storage?", history)
+    assert rewrite.question == "What is the place of storage of MAP/SIR Reports?" and rewrite.reason == "follow_up"
+
+
+def test_a_pronoun_without_an_earlier_turn_is_searched_as_asked():
+    rewrite = standalone_question(None, "What is the loan scheme and its tenure?", [])
+    assert rewrite.question == "What is the loan scheme and its tenure?" and rewrite.resolvable
+
+
+def test_a_translation_is_never_unresolvable():
+    rewrite = standalone_question(_Rewriter("How is the interest rate on microfinance loans decided?", False),
+                                  "माइक्रोफाइनेंस ऋण की ब्याज दर कैसे तय की जाती है?", [])
+    assert rewrite.resolvable and rewrite.reason == "translation"

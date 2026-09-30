@@ -15,12 +15,12 @@ from datetime import date
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.stemming import stem
 from app.infrastructure.ai.reranker.base import RerankerProvider
 from app.modules.auth.acl import can_see
 from app.modules.auth.permissions import Principal
 from app.modules.categories.model import Category
 from app.modules.citations.numerics import extract_numeric_facts, sentence_at
+from app.modules.rag.validation import TermIndex
 from app.modules.documents.model import Document, DocumentStatus
 from app.modules.policies.model import DocumentRelationship, PolicyVersion, RelationStatus, VersionStatus
 from app.modules.search.retrieval import (
@@ -40,9 +40,6 @@ MAX_PER_DOCUMENT = 3
 # 0.5 matched or beat 0.7 on every metric (R@1 0.46 -> 0.52, MRR 0.60 -> 0.63);
 # 1.0 (reranker only) was clearly worse (R@1 0.37).
 RERANK_WEIGHT = 0.5
-# Shared-prefix length used as a last-resort coverage match, so that
-# "requirement" and "require" are recognised as the same subject.
-COVERAGE_PREFIX = 5
 GENERIC_TERMS = frozenset(
     "current currently latest policy policies bank banks rule rules document documents version "
     "details detail say says tell explain applicable".split()
@@ -124,27 +121,14 @@ def coverage_of(question: str, texts: list[str]) -> tuple[float, list[str]]:
     A shared 5-character prefix also counts, which covers derivational pairs a
     suffix stemmer cannot join ("generate"/"generation", "require"/"requirement").
     Without it the gate rejected questions whose evidence used the noun form of a
-    verb the question phrased as a verb.
+    verb the question phrased as a verb. A hyphenated term ("FIU-IND") counts when
+    each of its parts is present, as the text is indexed word by word.
     """
     terms = key_terms(question)
     if not terms:
         return 1.0, []  # nothing specific to look for; relevance is judged by score
-    haystack = {
-        stem(w)
-        for text in texts
-        for w in re.findall(r"[a-z0-9]+(?:\.[0-9]+)?", text.lower())
-    }
-    prefixes = {w[:COVERAGE_PREFIX] for w in haystack if len(w) >= COVERAGE_PREFIX}
-
-    def present(term: str) -> bool:
-        if term in haystack:
-            return True
-        reduced = stem(term)
-        if reduced in haystack or term in haystack:
-            return True
-        return reduced[:COVERAGE_PREFIX] in prefixes
-
-    missing = [t for t in terms if not present(t)]
+    index = TermIndex("\n".join(texts))
+    missing = [t for t in terms if not index.mentions(t)]
     return 1 - len(missing) / len(terms), missing
 
 

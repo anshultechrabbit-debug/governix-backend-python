@@ -52,9 +52,11 @@ class OpenAILLM(LLMProvider):
         return LocalLLM().generate_json(system, user, schema, context=context)
 
     def _options(self) -> dict[str, Any]:
-        if self.reasoning_effort and _REASONING_MODEL.match(self.model):
-            return {"reasoning_effort": self.reasoning_effort}
-        return {}
+        if _REASONING_MODEL.match(self.model):
+            return {"reasoning_effort": self.reasoning_effort} if self.reasoning_effort else {}
+        # Grounded answers want the most likely wording, the same on every run.
+        # Reasoning models reject a temperature; others default to 1.0.
+        return {"temperature": 0}
 
     def generate_json(self, system: str, user: str, schema: dict[str, Any], *, context=None) -> LLMResult:
         return self._complete(system, user, schema, budget=self.max_output_tokens, retries=self.truncation_retries, context=context)
@@ -156,8 +158,13 @@ class OpenAILLM(LLMProvider):
                     if choice.finish_reason:
                         finish_reason = choice.finish_reason
         except OpenAIError as exc:
-            logger.warning("OpenAI LLM stream failed (%s: %s). Falling back to LocalLLM.", type(exc).__name__, exc)
             self._credit.failed(exc)
+            if parts:
+                # Part of the model's answer was already passed on; appending a
+                # different answer to it would splice two answers together.
+                logger.warning("OpenAI LLM stream failed midway (%s: %s)", type(exc).__name__, exc)
+                raise LLMUnavailableError("The answer stream was interrupted.") from None
+            logger.warning("OpenAI LLM stream failed (%s: %s). Falling back to LocalLLM.", type(exc).__name__, exc)
             res = self._local(system, user, schema, context)
             yield json.dumps(res.content)
             yield res

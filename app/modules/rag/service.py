@@ -40,7 +40,10 @@ from app.modules.documents.model import Document, DocumentStatus
 from app.modules.policies.model import Policy, PolicyVersion, VersionStatus
 from app.modules.rag.claim_stream import ClaimStream
 from app.modules.rag.evidence import EvidenceItem, EvidenceSet, build_evidence, is_document_question, key_terms
-from app.modules.rag.prompts import OUTPUT_SCHEMA, SYSTEM_PROMPT, build_user_prompt, comparison_text
+from app.infrastructure.ai.llm.local import LocalLLM
+from app.modules.rag.prompts import (
+    OUTPUT_SCHEMA, SUMMARY_CHECK_PROMPT, SUMMARY_CHECK_SCHEMA, SYSTEM_PROMPT, build_user_prompt, comparison_text,
+)
 from app.modules.rag.query_plan import QueryClass, QueryPlan, plan_query
 from app.modules.rag.query_rewrite import standalone_question
 from app.modules.rag.schema import AnswerResponse, AskRequest, Claim, NoAnswer, Source
@@ -61,7 +64,7 @@ SUGGESTIONS = [
 NO_ANSWER_MESSAGE = "I couldn't find sufficient supporting information in the available documents."
 # Bump when the answer-generation or validation contract changes so cached
 # answers (including cached no-answers) are recomputed under the new contract.
-ANSWER_CACHE_VERSION = "v13"
+ANSWER_CACHE_VERSION = "v14"
 # No supported answer in the version in force: worth looking one version back.
 FALLBACK_REASONS = frozenset({
     "NO_RELEVANT_DOCUMENTS", "LOW_RELEVANCE", "KEY_TERMS_NOT_FOUND", "INSUFFICIENT_EVIDENCE",
@@ -234,6 +237,10 @@ class RAGService:
         retrieved = attempt.retrieved
 
         response.question = original.question
+        if response.status == "answered" and plan.as_of and plan.as_of > datetime.now(UTC).date():
+            response.warnings.append(
+                f"{plan.as_of.isoformat()} is in the future. This is the version in force today; it may change before then."
+            )
         if rewrite and rewrite.reason:
             response.plan["rewritten_question"] = request.question
             response.plan["rewrite_reason"] = rewrite.reason
@@ -550,7 +557,7 @@ class RAGService:
 
     def _streamed_claim(self, principal, request, plan, evidence, raw, texts, items, numbering) -> dict | None:
         """One claim checked exactly as the final answer checks it, or None if it fails."""
-        results = validate_claims([raw], texts)
+        results = validate_claims([raw], texts, key_terms(request.question))
         if not results:
             return None
         _drop_metadata_echo(results, request.question, plan)
@@ -623,7 +630,7 @@ class RAGService:
         items = evidence.by_id()
         texts = _evidence_texts(evidence)
         content = llm_result.content if llm_result else {}
-        results = validate_claims(content.get("claims", []), texts)
+        results = validate_claims(content.get("claims", []), texts, key_terms(request.question))
         _drop_metadata_echo(results, request.question, plan)
         warnings = [f"Removed an unsupported statement: {', '.join(r.problems)}" for r in results if not r.valid]
         warnings += [f"Ignored {p}" for r in results if r.valid for p in r.problems]
@@ -652,7 +659,9 @@ class RAGService:
             conflict["citations"] = [numbering[e] for e in conflict["evidence_ids"] if e in numbering]
 
         answer = " ".join(f"{c.text} [{', '.join(map(str, c.citations))}]" for c in claims)
-        summary = self._summary(content.get("summary"), valid, texts)
+        summary = self._summary(request.question, content.get("summary"), valid, texts, claims)
+        if llm_result and llm_result.model == LocalLLM.model_id and self.settings.LLM_PROVIDER != "local":
+            warnings.insert(0, "The AI service was unavailable, so this answer quotes the documents directly.")
         if any(c["citations"] for c in conflicts):
             warnings.insert(0, "Sources disagree on part of this answer; see conflicts.")
         return AnswerResponse(
@@ -663,15 +672,35 @@ class RAGService:
             timings_ms={},
         )
 
-    @staticmethod
-    def _summary(text, valid: list, texts: dict[str, EvidenceText]) -> str | None:
-        """The plain-words answer, held to the same number and support checks as a claim,
-        against the evidence the surviving claims cite. It is dropped, not repaired, if it fails."""
+    def _summary(self, question: str, text, valid: list, texts: dict[str, EvidenceText], claims: list[Claim]) -> str | None:
+        """The plain-words answer, or None. It is dropped, never repaired, when it fails.
+
+        It must pass the claim checks against the evidence its claims cite, and then
+        a second model call must find every statement in it supported by those
+        verified claims. Word overlap alone cannot tell a faithful paraphrase from
+        one that adds background knowledge or an opinion ("which may benefit
+        customers"); the second check can.
+        """
         if not isinstance(text, str) or not text.strip():
             return None
         cited = list(dict.fromkeys(e for r in valid for e in r.evidence_ids))
-        [result] = validate_claims([{"text": text, "evidence_ids": cited}], texts)
-        return result.text if result.valid else None
+        [result] = validate_claims([{"text": text, "evidence_ids": cited}], texts, key_terms(question))
+        if not result.valid:
+            return None
+        statements = "\n".join(f"- {claim.text}" for claim in claims)
+        try:
+            check = self._llm_factory().generate_json(
+                SUMMARY_CHECK_PROMPT,
+                f"Question: {question}\n\nVerified statements:\n{statements}\n\nShort answer: {result.text}",
+                SUMMARY_CHECK_SCHEMA,
+            )
+        except LLMUnavailableError:
+            return None
+        content = check.content or {}
+        if content.get("supported") is not True or content.get("unsupported"):
+            logger.info("Dropped an unsupported summary: %s", content.get("unsupported"))
+            return None
+        return result.text
 
     def _verify_citations(self, principal: Principal, evidence_ids: set[str], items) -> set[str]:
         """Re-check in the database that every cited chunk exists, is READY and visible."""
