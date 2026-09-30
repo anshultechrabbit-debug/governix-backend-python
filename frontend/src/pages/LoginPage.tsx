@@ -1,7 +1,7 @@
 import { ShieldCheck } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import { ApiError } from "../api/client";
-import { Button, Field, Input } from "../components/ui";
+import { Button, Field, Input, PasswordInput } from "../components/ui";
 import { useAuth } from "../store/hooks";
 
 export function LoginPage() {
@@ -40,7 +40,7 @@ export function LoginPage() {
             <Input id="email" type="email" autoComplete="username" required value={email} onChange={(e) => setEmail(e.target.value)} />
           </Field>
           <Field label="Password" htmlFor="password">
-            <Input id="password" type="password" autoComplete="current-password" required value={password} onChange={(e) => setPassword(e.target.value)} />
+            <PasswordInput id="password" autoComplete="current-password" required value={password} onChange={(e) => setPassword(e.target.value)} />
           </Field>
           {error && <p className="rounded-md bg-bad-50 px-3 py-2 text-sm text-bad-600" role="alert">{error}</p>}
           <Button type="submit" className="w-full" loading={busy}>Sign in</Button>

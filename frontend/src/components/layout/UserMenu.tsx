@@ -1,7 +1,7 @@
 import { KeyRound, LogOut, ShieldCheck, UserRound } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { api, ApiError } from "../../api/client";
-import { Button, Field, Input, KeyValue } from "../ui";
+import { Button, Field, KeyValue, PasswordInput } from "../ui";
 import { humanize } from "../../lib/format";
 import { useAuth, useToast } from "../../store/hooks";
 
@@ -122,8 +122,8 @@ function ChangePasswordDialog({ onClose }: { onClose: () => void }) {
             <h2 className="text-base font-semibold">Change password</h2>
             <p className="text-sm text-muted">Signs you out of every device.</p>
           </div>
-          <Field label="Current password"><Input type="password" autoComplete="current-password" required value={current} onChange={(event) => setCurrent(event.target.value)} /></Field>
-          <Field label="New password" hint="At least 12 characters"><Input type="password" autoComplete="new-password" required minLength={12} value={next} onChange={(event) => setNext(event.target.value)} /></Field>
+          <Field label="Current password"><PasswordInput autoComplete="current-password" required value={current} onChange={(event) => setCurrent(event.target.value)} /></Field>
+          <Field label="New password" hint="At least 12 characters"><PasswordInput autoComplete="new-password" required minLength={12} value={next} onChange={(event) => setNext(event.target.value)} /></Field>
           {error && <p className="rounded-md bg-bad-50 px-3 py-2 text-sm text-bad-600" role="alert">{error}</p>}
           <div className="flex justify-end gap-2">
             <Button type="button" variant="secondary" onClick={onClose}>Cancel</Button>

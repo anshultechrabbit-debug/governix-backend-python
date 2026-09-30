@@ -1,4 +1,4 @@
-import { AlertTriangle, Inbox, Loader2, MoreHorizontal, X } from "lucide-react";
+import { AlertTriangle, Eye, EyeOff, Inbox, Loader2, MoreHorizontal, X } from "lucide-react";
 import {
   useEffect,
   useRef,
@@ -45,6 +45,26 @@ const control =
 
 export function Input({ className, ...props }: ComponentProps<"input">) {
   return <input className={cn(control, "h-9", className)} {...props} />;
+}
+
+/** A password field with an eye button to show or hide what was typed. */
+export function PasswordInput({ className, ...props }: Omit<ComponentProps<"input">, "type">) {
+  const [visible, setVisible] = useState(false);
+  return (
+    <div className="relative">
+      <Input {...props} type={visible ? "text" : "password"} className={cn("pr-9", className)} />
+      <button
+        type="button"
+        onClick={() => setVisible((shown) => !shown)}
+        className="absolute inset-y-0 right-0 flex w-9 items-center justify-center rounded-r-md text-muted hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-100"
+        aria-label={visible ? "Hide password" : "Show password"}
+        aria-pressed={visible}
+        title={visible ? "Hide password" : "Show password"}
+      >
+        {visible ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+      </button>
+    </div>
+  );
 }
 
 export function Textarea({ className, ...props }: TextareaHTMLAttributes<HTMLTextAreaElement>) {

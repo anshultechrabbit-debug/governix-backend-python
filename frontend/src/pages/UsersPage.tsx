@@ -13,6 +13,7 @@ import {
   Input,
   Modal,
   PageHeader,
+  PasswordInput,
   Select,
   SkeletonRows,
   StatusBadge,
@@ -283,8 +284,7 @@ export function UsersPage() {
             />
           </Field>
           <Field label="Temporary password" hint="Minimum 12 characters">
-            <Input
-              type="password"
+            <PasswordInput
               required
               minLength={12}
               placeholder="••••••••••••"
@@ -366,8 +366,7 @@ export function UsersPage() {
       >
         <form id="reset-password-form" onSubmit={handleResetPassword} className="space-y-4">
           <Field label="New password" hint="Minimum 12 characters. Revokes all current sessions.">
-            <Input
-              type="password"
+            <PasswordInput
               required
               minLength={12}
               placeholder="••••••••••••"

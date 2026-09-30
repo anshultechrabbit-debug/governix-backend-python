@@ -4,7 +4,8 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { api, ApiError, qs } from "../api/client";
 import type { Organization, Page } from "../api/types";
 import {
-  Button, Card, EmptyState, ErrorState, Field, Input, Modal, PageHeader, SkeletonRows, StatusBadge, Table, Textarea,
+  Button, Card, EmptyState, ErrorState, Field, Input, Modal, PageHeader, PasswordInput, SkeletonRows, StatusBadge, Table,
+  Textarea,
 } from "../components/ui";
 import { formatDateTime } from "../lib/format";
 import { useToast } from "../store/hooks";
@@ -222,7 +223,7 @@ function CreateOrganizationModal({ open, onClose }: { open: boolean; onClose: ()
                 : "At least 12 characters. Share it securely; the admin can change it after signing in."
             }
           >
-            <Input type="password" value={admin.password} onChange={(e) => setAdmin({ ...admin, password: e.target.value })} autoComplete="new-password" />
+            <PasswordInput value={admin.password} onChange={(e) => setAdmin({ ...admin, password: e.target.value })} autoComplete="new-password" />
           </Field>
         </section>
         {error && <p className="rounded-md bg-bad-50 px-3 py-2 text-sm text-bad-600" role="alert">{error}</p>}
