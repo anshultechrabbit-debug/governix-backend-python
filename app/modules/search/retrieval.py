@@ -65,6 +65,8 @@ _CLAUSE = re.compile(r"\b(?:clause|section|para(?:graph)?|point)\s+(\d{1,2}(?:\.
 # "Chapter 5", "Annexure II": a named division, found by its heading or contents row.
 _DIVISION = re.compile(r"\b(chapter|annexure|annex|appendix|schedule|part)\s+(\d{1,3}|[ivxlcdm]{1,6})\b", re.I)
 FRONT_MATTER_CHUNKS = 3
+# Document frequency of a term the full-text index drops as a stop word.
+NOT_INDEXED = -1
 # Chunks kept per clause/division in the batched exact lane: enough to cover a
 # short section without letting one clause monopolise the lane's budget.
 EXACT_PER_CLAUSE = 10
@@ -321,7 +323,8 @@ class HybridRetriever:
         names something the caller's documents do not cover ("FIU-IND" asked of a
         bank with no KYC policy), which is the strongest sign that no answer
         exists. Only the caller's own visible chunks are counted, so this reveals
-        nothing about documents outside their scope.
+        nothing about documents outside their scope. Words the index never stores
+        ("did", "under") say nothing either way and are left out.
         """
         if not terms or principal.organization_id is None:
             return {}
@@ -340,7 +343,7 @@ class HybridRetriever:
         return {
             term: math.log(1 + (total - df + 0.5) / (df + 0.5))
             for term in dict.fromkeys(terms)
-            for df in (min(cached.get(term, 0), total),)
+            if (df := min(cached.get(term, 0), total)) != NOT_INDEXED
         }
 
     def _visible_frequencies(self, principal: Principal, terms: list[str]) -> dict[str, int]:
@@ -359,7 +362,11 @@ class HybridRetriever:
                     if term == "__total__":
                         query, cap = ready, DF_CAP * 50
                     else:
-                        query, cap = ready.where(Chunk.tsv.op("@@")(func.plainto_tsquery("english", term))), DF_CAP
+                        tsquery = func.plainto_tsquery("english", term)
+                        if not session.scalar(select(func.numnode(tsquery))):
+                            counts[term] = NOT_INDEXED  # a stop word ("did"): absent everywhere by construction
+                            continue
+                        query, cap = ready.where(Chunk.tsv.op("@@")(tsquery)), DF_CAP
                     counts[term] = session.scalar(select(func.count()).select_from(query.limit(cap).subquery())) or 0
         except OperationalError:
             logger.warning("Visible term statistics failed; the salient-term gate is skipped", exc_info=True)

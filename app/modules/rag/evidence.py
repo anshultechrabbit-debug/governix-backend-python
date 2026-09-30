@@ -53,7 +53,7 @@ QUESTION_TERMS = frozenset(
     "section sections part mentioned given provide provided provides list listed name named "
     "suggest suggested suggests suggestion propose proposed identify identifies identified "
     "consider considered considers main key important overall summary summarise summarize "
-    "agree agreed disagree".split()
+    "agree agreed disagree did does stand stands mean means meant".split()
 )
 # Questions about the document itself: its title, publisher, date, legal basis.
 _DOCUMENT_QUESTION = re.compile(

@@ -58,7 +58,9 @@ NUMBER_WINDOW = 200
 RESTATEMENT_OVERLAP = 0.7
 _TERM_WORD = re.compile(r"[a-z0-9]+(?:\.[0-9]+)?")
 _NEGATION = re.compile(r"\b(?:not|no|never|cannot|nor|neither|none|without)\b|n[\u2019']t\b", re.I)
-_SENTENCE_END = re.compile(r"(?<=[.?!;])\s+|\n+|\s\|\s")
+# "Sl. No.: 65", "No. of accounts", "No Change": the word "no" that negates nothing.
+_NOT_NEGATION = re.compile(r"\b(?:sl|s)\.?\s*no\b\.?|\bno\.?\s*[:#]?\s*\d|\bno\.\s*of\b|\bno\s+change\b", re.I)
+_SENTENCE_END = re.compile(r"(?<=[.?!;:])\s+|\n+|\s\|\s|\s*[•▪●]\s*")
 
 
 def term_parts(term: str) -> list[str]:
@@ -140,9 +142,15 @@ def _flips_polarity(claim: str, cited_text: str) -> bool:
             best, best_index = overlap, index
     if best < RESTATEMENT_OVERLAP:
         return False  # a paraphrase ("maximum 70%" for "shall not exceed 70%"): polarity is not comparable
-    # The next sentences carry a short answer to a question-and-answer pair ("... income? Ans. No.").
-    source = " ".join(sentences[best_index:best_index + 3])
-    return bool(_NEGATION.search(claim)) != bool(_NEGATION.search(source))
+    claim_negated, source_negated = _negated(claim), _negated(sentences[best_index])
+    if claim_negated and not source_negated:
+        # The next sentences may carry the short answer of a question-and-answer pair ("... income? Ans. No.").
+        return not _negated(" ".join(sentences[best_index + 1:best_index + 3]))
+    return source_negated and not claim_negated
+
+
+def _negated(text: str) -> bool:
+    return bool(_NEGATION.search(_NOT_NEGATION.sub(" ", text)))
 
 
 def _window(text: str, start: int, end: int) -> str:

@@ -47,7 +47,7 @@ from app.modules.rag.prompts import (
 from app.modules.rag.query_plan import QueryClass, QueryPlan, plan_query
 from app.modules.rag.query_rewrite import standalone_question
 from app.modules.rag.schema import AnswerResponse, AskRequest, Claim, NoAnswer, Source
-from app.modules.rag.validation import EvidenceText, validate_claims
+from app.modules.rag.validation import EvidenceText, TermIndex, validate_claims
 from app.modules.search.model import Chunk
 from app.modules.search.retrieval import HybridRetriever, NamedDocument, SearchFilters, VersionScope
 from app.modules.search.schema import Provenance
@@ -68,7 +68,7 @@ ANSWER_CACHE_VERSION = "v14"
 # No supported answer in the version in force: worth looking one version back.
 FALLBACK_REASONS = frozenset({
     "NO_RELEVANT_DOCUMENTS", "LOW_RELEVANCE", "KEY_TERMS_NOT_FOUND", "INSUFFICIENT_EVIDENCE",
-    "ANSWER_FAILED_VALIDATION",
+    "ANSWER_FAILED_VALIDATION", "ANSWER_OFF_TOPIC",
 })
 _TERM = r"([A-Za-z][A-Za-z0-9-]{1,20})"
 _ACRONYM_QUESTION = re.compile(
@@ -87,6 +87,10 @@ _ACRONYM_MEANING = re.compile(
 
 # The evidence header's period format; document text does not use it.
 _METADATA_ECHO = re.compile(r"\beffective\s+(?:from\s+)?\d{4}-\d{2}-\d{2}\s+(?:to|until)\s+(?:present|\d{4}-\d{2}-\d{2})", re.I)
+_MONTHS = frozenset(
+    "january february march april may june july august september october november december "
+    "jan feb mar apr jun jul aug sep sept oct nov dec".split()
+)
 _VERSION_QUESTION = re.compile(r"\b(?:version|versions|effective|in\s+force|valid|when|date|dated|current|latest|superseded)\b", re.I)
 
 
@@ -516,6 +520,25 @@ class RAGService:
         missing = [t for t in weights if t in set(evidence.missing_terms)]
         return 1 - sum(weights[t] for t in missing) / total, missing
 
+    def _check_on_topic(self, principal: Principal, question: str, claims: list[str]) -> None:
+        """The verified claims, together, must be about what the question asks.
+
+        Each claim is true to its evidence, but true statements about something else
+        ("the maximum rate on microfinance loans" for a question about home loans
+        for women) are not an answer. The same distinguishing-weight measure as the
+        evidence gate is applied to the claims themselves.
+        """
+        # A date in the question chose the version; the answer need not repeat it.
+        terms = [t for t in key_terms(question) if not t.isdigit() and t not in _MONTHS]
+        weights = self.retriever.visible_term_weights(principal, terms)
+        total = sum(weights.values())
+        if total <= 0:
+            return
+        said = TermIndex(" ".join(claims))
+        missing = [t for t in weights if not said.mentions(t)]
+        if 1 - sum(weights[t] for t in missing) / total < self.settings.RAG_MIN_SALIENT_COVERAGE:
+            raise _NoAnswer("ANSWER_OFF_TOPIC", missing)
+
     def _check_deadline(self, deadline: float, evidence: EvidenceSet) -> None:
         """Abandon an answer that has already spent its whole budget.
 
@@ -642,6 +665,8 @@ class RAGService:
             if content.get("insufficient_evidence") or not results:
                 raise _NoAnswer("INSUFFICIENT_EVIDENCE")
             raise _NoAnswer("ANSWER_FAILED_VALIDATION")
+        if evidence.comparison is None and not is_document_question(request.question):
+            self._check_on_topic(principal, request.question, [r.text for r in valid])
 
         numbering: dict[str, int] = {}
         for result in valid:
