@@ -61,7 +61,7 @@ SUGGESTIONS = [
 NO_ANSWER_MESSAGE = "I couldn't find sufficient supporting information in the available documents."
 # Bump when the answer-generation or validation contract changes so cached
 # answers (including cached no-answers) are recomputed under the new contract.
-ANSWER_CACHE_VERSION = "v12"
+ANSWER_CACHE_VERSION = "v13"
 # No supported answer in the version in force: worth looking one version back.
 FALLBACK_REASONS = frozenset({
     "NO_RELEVANT_DOCUMENTS", "LOW_RELEVANCE", "KEY_TERMS_NOT_FOUND", "INSUFFICIENT_EVIDENCE",
@@ -652,15 +652,26 @@ class RAGService:
             conflict["citations"] = [numbering[e] for e in conflict["evidence_ids"] if e in numbering]
 
         answer = " ".join(f"{c.text} [{', '.join(map(str, c.citations))}]" for c in claims)
+        summary = self._summary(content.get("summary"), valid, texts)
         if any(c["citations"] for c in conflicts):
             warnings.insert(0, "Sources disagree on part of this answer; see conflicts.")
         return AnswerResponse(
-            question=request.question, status="answered", answer=answer, claims=claims, sources=sources,
+            question=request.question, status="answered", answer=answer, summary=summary, claims=claims, sources=sources,
             conflicts=conflicts, warnings=warnings, plan=plan.describe(), evidence_score=evidence.top_score,
             model=llm_result.model if llm_result else None,
             usage={"input_tokens": llm_result.input_tokens, "output_tokens": llm_result.output_tokens} if llm_result else {},
             timings_ms={},
         )
+
+    @staticmethod
+    def _summary(text, valid: list, texts: dict[str, EvidenceText]) -> str | None:
+        """The plain-words answer, held to the same number and support checks as a claim,
+        against the evidence the surviving claims cite. It is dropped, not repaired, if it fails."""
+        if not isinstance(text, str) or not text.strip():
+            return None
+        cited = list(dict.fromkeys(e for r in valid for e in r.evidence_ids))
+        [result] = validate_claims([{"text": text, "evidence_ids": cited}], texts)
+        return result.text if result.valid else None
 
     def _verify_citations(self, principal: Principal, evidence_ids: set[str], items) -> set[str]:
         """Re-check in the database that every cited chunk exists, is READY and visible."""

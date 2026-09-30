@@ -50,6 +50,7 @@ class LocalLLM(LLMProvider):
                 break
         content = {
             "claims": claims,
+            "summary": "",  # extractive: no paraphrase to offer
             "insufficient_evidence": not claims,
             "conflicts": [
                 {"description": c["description"], "evidence_ids": c["evidence_ids"]}

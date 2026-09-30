@@ -348,6 +348,8 @@ export interface Answer {
   question: string;
   status: "answered" | "no_answer";
   answer: string | null;
+  /** The direct answer in plain words; absent when it could not be verified. */
+  summary?: string | null;
   claims: { text: string; citations: number[] }[];
   sources: Source[];
   conflicts: { type: string; description: string; evidence_ids: string[]; citations?: number[]; resolution_hint?: string }[];

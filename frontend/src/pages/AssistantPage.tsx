@@ -4,7 +4,7 @@ import { useCategories } from "../components/domain";
 import { Badge, Button, Card, EmptyState, ErrorState, Field, Select, Tabs, Textarea } from "../components/ui";
 import { SourceCard } from "../components/domain";
 import { PassageSearch } from "../components/PassageSearch";
-import { formatDate } from "../lib/format";
+import { cn, formatDate } from "../lib/format";
 import { newId } from "../lib/id";
 import { ask, clearConversation, setOptions, type AnswerMode, type AnswerStage, type Turn } from "../store/assistantSlice";
 import type { Answer } from "../api/types";
@@ -203,7 +203,9 @@ function Answered({ answer }: { answer: Answer }) {
           </span>
         </div>
       )}
-      <div className="mt-2 space-y-3 text-sm leading-6 text-ink">
+      {answer.summary && <p className="mt-2 text-[15px] leading-7 text-ink">{answer.summary}</p>}
+      {answer.summary && <p className="mt-4 text-xs font-semibold uppercase tracking-wide text-muted">What the sources say</p>}
+      <div className={cn("mt-2 space-y-3 text-sm leading-6", answer.summary ? "text-ink-soft" : "text-ink")}>
         {answer.claims.map((claim, index) => <p key={`${claim.text}-${index}`}>{claim.text} {claim.citations.map((citation) => <a key={citation} href={`#source-${citation}`} className="ml-0.5 text-xs font-semibold text-brand-700 hover:underline">[{citation}]</a>)}</p>)}
       </div>
       {!!warnings.length && <div className="mt-4 rounded-md border border-warn-600/20 bg-warn-50 p-3 text-xs text-warn-600">{warnings.map((warning) => <p key={warning}>{warning}</p>)}</div>}

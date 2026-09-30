@@ -65,6 +65,8 @@ class AnswerResponse(BaseModel):
     question: str
     status: Literal["answered", "no_answer"]
     answer: str | None
+    # The direct answer in plain words, checked against the evidence its claims cite.
+    summary: str | None = None
     claims: list[Claim]
     sources: list[Source]
     conflicts: list[dict[str, Any]]
