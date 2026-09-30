@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, ArrowDown, ArrowRight, ArrowUp, CheckCircle2, FileText, Loader2, UploadCloud, X, XCircle } from "lucide-react";
 import { useMemo, useRef, useState, type DragEvent } from "react";
-import { Link } from "react-router";
+import { Link, useLocation, useNavigate } from "react-router";
 import { api } from "../api/client";
 import type { DuplicateResult, PolicySuggestion, UploadLimits } from "../api/types";
 import { cn, formatBytes, formatDate } from "../lib/format";
@@ -438,29 +438,63 @@ function StateIcon({ state }: { state: QueueItem["state"] }) {
   return <Loader2 className="size-4 shrink-0 animate-spin text-info-600" />;
 }
 
-/** The job whose queue is open, shown over any page. */
+/** The job whose queue is open, shown over any page; it opens by itself with a summary when the job finishes. */
 export function UploadJobModal() {
   const dispatch = useAppDispatch();
+  const navigate = useNavigate();
+  const location = useLocation();
   const job = useAppSelector((s) => s.uploads.jobs.find((j) => j.id === s.uploads.openJobId));
   if (!job) return null;
   const { done, total } = jobCounts(job);
+  const finished = job.phase === "finished";
+  const close = () => dispatch(jobOpened(null));
+  const here = `${location.pathname}${location.search}` === job.link || location.pathname === job.link.split("?")[0];
+  const review = job.items.find((i) => i.state === "review" && i.documentId);
   return (
     <Modal
       open
       wide
-      onClose={() => dispatch(jobOpened(null))}
-      title={job.title}
+      onClose={close}
+      title={finished ? "Upload finished" : job.title}
       footer={<>
         <p className="mr-auto self-center text-xs text-muted">
-          {job.phase === "finished" ? `Finished · ${done} of ${total} settled` : "You can close this window; the upload continues in the background."}
+          {finished ? `${done} of ${total} settled` : "You can close this window; the upload continues in the background."}
         </p>
-        {job.batchId && <Link to={`/uploads/${job.batchId}`} onClick={() => dispatch(jobOpened(null))}><Button variant="secondary">Details</Button></Link>}
-        <Link to={job.link} onClick={() => dispatch(jobOpened(null))}><Button variant="secondary">Open</Button></Link>
-        <Button onClick={() => dispatch(jobOpened(null))}>Close</Button>
+        {job.batchId && <Link to={`/uploads/${job.batchId}`} onClick={close}><Button variant="secondary">Details</Button></Link>}
+        {finished && review && (
+          <Button variant="secondary" onClick={() => { close(); navigate(`/documents/${review.documentId}`); }}>Review</Button>
+        )}
+        {finished && !here
+          ? <Button onClick={() => { close(); navigate(job.link); }}>Open</Button>
+          : !finished && <Link to={job.link} onClick={close}><Button variant="secondary">Open</Button></Link>}
+        {(!finished || here) && <Button onClick={close}>{finished ? "Done" : "Close"}</Button>}
       </>}
     >
+      {finished && <UploadSummary job={job} />}
       <UploadQueue job={job} />
     </Modal>
+  );
+}
+
+/** One line on how an upload ended, above its queue. */
+function UploadSummary({ job }: { job: UploadJob }) {
+  const count = (state: QueueItem["state"]) => job.items.filter((i) => i.state === state).length;
+  const [registered, review, failed] = [count("registered"), count("review"), count("failed")];
+  const total = job.items.filter((i) => i.state !== "cancelled").length;
+  const clean = registered === total;
+  return (
+    <div className={cn("mb-4 flex items-start gap-3 rounded-md p-3 text-sm", clean ? "bg-ok-50 text-ok-600" : "bg-warn-50 text-warn-600")}>
+      {clean ? <CheckCircle2 className="mt-0.5 size-5 shrink-0" /> : <AlertTriangle className="mt-0.5 size-5 shrink-0" />}
+      <div>
+        <p className="font-medium">
+          {clean
+            ? `${total === 1 ? "The document is" : `All ${total} documents are`} uploaded and registered.`
+            : [registered && `${registered} registered`, review && `${review} need${review === 1 ? "s" : ""} your review`, failed && `${failed} failed`]
+              .filter(Boolean).join(" · ")}
+        </p>
+        <p className="mt-0.5 text-xs opacity-90">{job.title}</p>
+      </div>
+    </div>
   );
 }
 

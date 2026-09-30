@@ -1,10 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, CheckCircle2, FileText, Layers, Loader2, XCircle } from "lucide-react";
-import { Link, useParams } from "react-router";
+import { useEffect, useRef, useState } from "react";
+import { Link, useNavigate, useParams } from "react-router";
 import { api } from "../api/client";
 import type { UploadBatch, UploadBatchItem, UploadBatchSummary } from "../api/types";
 import { useCategoryName } from "../components/domain";
-import { Badge, Button, Card, EmptyState, ErrorState, PageHeader, ProgressBar, SkeletonRows } from "../components/ui";
+import { Badge, Button, Card, EmptyState, ErrorState, Modal, PageHeader, ProgressBar, SkeletonRows } from "../components/ui";
 import { formatDate, formatDateTime } from "../lib/format";
 
 const BATCH_LABELS: Record<UploadBatch["status"], [string, "info" | "ok" | "warn"]> = {
@@ -42,6 +43,16 @@ export function UploadBatchPage() {
       return status === "completed" || status === "attention" ? false : 2000;
     },
   });
+  // Finishing while the page is open pops up a summary (not when opening an already finished upload).
+  const [finishedNow, setFinishedNow] = useState(false);
+  const previous = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const status = batch?.status;
+    if ((status === "completed" || status === "attention") && (previous.current === "uploading" || previous.current === "processing")) {
+      setFinishedNow(true);
+    }
+    previous.current = status;
+  }, [batch?.status]);
 
   if (error) return <ErrorState error={error} onRetry={refetch} />;
   if (isLoading || !batch) return <SkeletonRows />;
@@ -52,6 +63,7 @@ export function UploadBatchPage() {
 
   return (
     <>
+      <FinishedModal batch={batch} open={finishedNow} onClose={() => setFinishedNow(false)} />
       <PageHeader
         title="Bulk upload"
         subtitle={`Started ${formatDateTime(batch.created_at)}${batch.completed_at ? ` · finished ${formatDateTime(batch.completed_at)}` : ""}`}
@@ -114,6 +126,51 @@ export function UploadBatchPage() {
         ))}
       </div>
     </>
+  );
+}
+
+/** How the upload ended, with the way to its policies (or to what needs review). */
+function FinishedModal({ batch, open, onClose }: { batch: UploadBatch; open: boolean; onClose: () => void }) {
+  const navigate = useNavigate();
+  const go = (to: string) => { onClose(); navigate(to); };
+  const { confirmed = 0, needs_review: review = 0, failed = 0 } = batch.counts;
+  const clean = batch.status === "completed" && !failed;
+  const policies = batch.groups.filter((g) => g.policy_id);
+  const toReview = batch.groups.flatMap((g) => g.items).find((i) => i.status === "needs_review" && i.document_id);
+  const only = policies.length === 1 ? policies[0] : null;
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Upload finished"
+      footer={<>
+        {toReview && <Button variant={clean ? "secondary" : "primary"} onClick={() => go(`/documents/${toReview.document_id}`)}>Review</Button>}
+        {only
+          ? <Button variant={toReview ? "secondary" : "primary"} onClick={() => go(`/policies/${only.policy_id}?tab=versions`)}>Open policy</Button>
+          : <Button variant="secondary" onClick={onClose}>Close</Button>}
+      </>}
+    >
+      <div className={`flex items-start gap-3 rounded-md p-3 text-sm ${clean ? "bg-ok-50 text-ok-600" : "bg-warn-50 text-warn-600"}`}>
+        {clean ? <CheckCircle2 className="mt-0.5 size-5 shrink-0" /> : <AlertTriangle className="mt-0.5 size-5 shrink-0" />}
+        <p className="font-medium">
+          {clean
+            ? `${confirmed === 1 ? "The document is" : `All ${confirmed} documents are`} uploaded and registered.`
+            : [confirmed && `${confirmed} registered`, review && `${review} need${review === 1 ? "s" : ""} your review`, failed && `${failed} failed`]
+              .filter(Boolean).join(" · ")}
+        </p>
+      </div>
+      {policies.length > 1 && (
+        <ul className="mt-4 divide-y divide-line rounded-md border border-line">
+          {policies.map((group) => (
+            <li key={group.id} className="flex items-center gap-3 px-3 py-2 text-sm">
+              <Layers className="size-4 shrink-0 text-brand-600" />
+              <span className="min-w-0 flex-1 truncate">{group.policy_name ?? group.new_policy_name ?? "Policy"}</span>
+              <Button size="sm" variant="secondary" onClick={() => go(`/policies/${group.policy_id}?tab=versions`)}>Open</Button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Modal>
   );
 }
 

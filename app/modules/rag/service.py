@@ -60,7 +60,7 @@ SUGGESTIONS = [
 NO_ANSWER_MESSAGE = "I couldn't find sufficient supporting information in the available documents."
 # Bump when the answer-generation or validation contract changes so cached
 # answers (including cached no-answers) are recomputed under the new contract.
-ANSWER_CACHE_VERSION = "v10"
+ANSWER_CACHE_VERSION = "v11"
 # No supported answer in the version in force: worth looking one version back.
 FALLBACK_REASONS = frozenset({
     "NO_RELEVANT_DOCUMENTS", "LOW_RELEVANCE", "KEY_TERMS_NOT_FOUND", "INSUFFICIENT_EVIDENCE",
@@ -114,6 +114,11 @@ def acronym_in_question(question: str) -> str | None:
     if match := _ACRONYM_MEANING.search(question):
         return next(group for group in match.groups() if group)
     return None
+
+
+def has_words(text: str) -> bool:
+    """Letters or digits in any script: something a search could match."""
+    return any(ch.isalnum() for ch in text)
 
 
 class _NoAnswer(Exception):
@@ -185,7 +190,10 @@ class RAGService:
         deadline = started + self.settings.RAG_DEADLINE_SECONDS
         original = request
         yield "stage", {"stage": "searching"}
-        request, rewrite = self._standalone(request, timings)
+        # Emoji or punctuation alone ("😂😂😂", "???") has nothing to search for: every document
+        # would pass the key-term check vacuously, so it is refused before any search or model call.
+        words = has_words(request.question)
+        request, rewrite = self._standalone(request, timings) if words else (request, None)
         plan = plan_query(
             request.question,
             ui_mode=None if request.mode == "auto" else request.mode,
@@ -195,6 +203,8 @@ class RAGService:
         )
         attempt = _Attempt()
         try:
+            if rewrite is None:
+                raise _NoAnswer("NOT_A_QUESTION")
             if not rewrite.resolvable:
                 raise _NoAnswer("NEEDS_CONTEXT")
             referenced = request.policy_ids or self.retriever.referenced_policies(principal, request.question)
@@ -212,7 +222,7 @@ class RAGService:
         retrieved = attempt.retrieved
 
         response.question = original.question
-        if rewrite.reason:
+        if rewrite and rewrite.reason:
             response.plan["rewritten_question"] = request.question
             response.plan["rewrite_reason"] = rewrite.reason
             if rewrite.reason == "translation" and response.status == "answered":
@@ -674,6 +684,7 @@ class RAGService:
 
     def _no_answer(self, request, plan, evidence, no_answer: _NoAnswer, llm_result) -> AnswerResponse:
         messages = {
+            "NOT_A_QUESTION": "Please type your question in words, for example the policy or topic and what you want to know.",
             "LLM_UNAVAILABLE": "The answering service is currently unavailable. Please try again later.",
             "COMPARISON_TARGET_UNCLEAR": "Please name the policy (and versions) you want to compare.",
             "NEEDS_CONTEXT": (

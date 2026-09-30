@@ -247,3 +247,10 @@ def test_stream_requires_authentication(client, home_loan):
     client.headers.pop("Authorization", None)
     response = client.post("/ai/ask/stream", json={"question": "What is the LTV?"})
     assert response.status_code == 401
+
+
+@pytest.mark.parametrize("question", ["😂😂😂😂😂", "???", "🙏 !!"])
+def test_a_question_without_words_is_refused_not_answered(db, admin, home_loan, question):
+    result = ask(admin, question)
+    assert result["status"] == "no_answer" and result["sources"] == []
+    assert result["no_answer"]["reason"] == "NOT_A_QUESTION"

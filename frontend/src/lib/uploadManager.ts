@@ -13,7 +13,7 @@
 import { api, ApiError, type UploadHandle } from "../api/client";
 import type { PolicySuggestion, Progress, UploadBatch, UploadBatchItem } from "../api/types";
 import { store } from "../store";
-import { itemUpdated, jobAdded, jobUpdated, type QueueItem, type QueueStage, type QueueState } from "../store/uploadsSlice";
+import { itemUpdated, jobAdded, jobOpened, jobUpdated, type QueueItem, type QueueStage, type QueueState } from "../store/uploadsSlice";
 import { queryClient } from "./queryClient";
 import { groupByFamily } from "./versioning";
 
@@ -198,6 +198,7 @@ async function readStages(documentId: string): Promise<QueueStage[] | null> {
 
 async function follow(jobId: string, batchId: string, keys: Map<string, string>) {
   let errors = 0;
+  let last: UploadBatch | null = null;
   for (;;) {
     await new Promise((resolve) => setTimeout(resolve, POLL_MS));
     let batch: UploadBatch;
@@ -223,9 +224,16 @@ async function follow(jobId: string, batchId: string, keys: Map<string, string>)
       }
     }
     await Promise.all(working);
+    last = batch;
     if (batch.status === "completed" || batch.status === "attention") break;
   }
-  store.dispatch(jobUpdated({ id: jobId, patch: { phase: "finished" } }));
+  // Everything went to one policy (e.g. a new one): open that policy rather than the list.
+  const policies = new Set(last?.groups.map((g) => g.policy_id).filter(Boolean));
+  const [policyId] = policies;
+  const link = policies.size === 1 ? `/policies/${policyId}?tab=versions` : undefined;
+  store.dispatch(jobUpdated({ id: jobId, patch: { phase: "finished", ...(link ? { link } : {}) } }));
+  // The summary pops up wherever the person is now.
+  store.dispatch(jobOpened(jobId));
   for (const key of ["category-documents", "category-pending", "category-overview", "category", "policies", "policy", "dashboard"]) {
     void queryClient.invalidateQueries({ queryKey: [key] });
   }

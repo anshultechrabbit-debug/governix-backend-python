@@ -5,17 +5,12 @@ import { Badge, Button, Card, EmptyState, ErrorState, Field, Select, Tabs, Texta
 import { SourceCard } from "../components/domain";
 import { PassageSearch } from "../components/PassageSearch";
 import { formatDate } from "../lib/format";
+import { newId } from "../lib/id";
 import { ask, clearConversation, setOptions, type AnswerMode, type AnswerStage, type Turn } from "../store/assistantSlice";
 import type { Answer } from "../api/types";
 import { useAppDispatch, useAppSelector, useAuth } from "../store/hooks";
 
 type View = "ask" | "search";
-
-const EXAMPLES = [
-  "What is the approval limit for corporate loans?",
-  "What changed between the latest two versions of the KYC policy?",
-  "Which procedure applied on 1 January 2025?",
-];
 
 const MODE_LABELS: Record<AnswerMode, string> = {
   auto: "Automatically choose",
@@ -32,6 +27,7 @@ export function AssistantPage() {
   const categories = useCategories();
   const [view, setView] = useState<View>("ask");
   const [question, setQuestion] = useState("");
+  const [wordless, setWordless] = useState(false);
   const [showOptions, setShowOptions] = useState(false);
   const endRef = useRef<HTMLDivElement>(null);
   const pending = turns.some((turn) => turn.status === "pending");
@@ -45,7 +41,9 @@ export function AssistantPage() {
     event.preventDefault();
     const value = question.trim();
     if (!value || pending) return;
-    dispatch(ask({ id: crypto.randomUUID(), question: value, options }));
+    // Emoji or punctuation alone has nothing to search for.
+    if (!/[\p{L}\p{N}]/u.test(value)) return setWordless(true);
+    dispatch(ask({ id: newId(), question: value, options }));
     setQuestion("");
   }
 
@@ -83,7 +81,6 @@ export function AssistantPage() {
                 icon={<Sparkles className="size-6 text-ai-600" />}
                 title="Ask about your policies and documents"
                 description="Governix searches only the information you are allowed to access, validates the evidence, then cites every supported answer. If nothing supports an answer, it says so instead of guessing."
-                action={<div className="flex max-w-xl flex-wrap justify-center gap-2">{EXAMPLES.map((example) => <Button key={example} variant="secondary" size="sm" onClick={() => setQuestion(example)}>{example}</Button>)}</div>}
               />
             )}
             {turns.map((turn) => <Turn key={turn.id} turn={turn} />)}
@@ -97,7 +94,7 @@ export function AssistantPage() {
                 value={question}
                 maxLength={2000}
                 placeholder="Ask a question about an approved policy or procedure…"
-                onChange={(event) => setQuestion(event.target.value)}
+                onChange={(event) => { setQuestion(event.target.value); setWordless(false); }}
                 onKeyDown={(event) => { if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) submit(event); }}
                 aria-label="Question for AI Assistant"
               />
@@ -121,7 +118,9 @@ export function AssistantPage() {
                     </div>
                   )}
                 </div>
-                <span className="text-xs text-muted">{question.length}/2000 · ⌘/Ctrl + Enter to ask</span>
+                {wordless
+                  ? <span className="text-xs text-warn-600" role="alert">Type your question in words, e.g. the policy or topic and what you want to know.</span>
+                  : <span className="text-xs text-muted">{question.length}/2000 · ⌘/Ctrl + Enter to ask</span>}
                 <div className="flex gap-2">
                   {turns.length > 0 && <Button type="button" variant="secondary" size="sm" onClick={() => dispatch(clearConversation())}><RotateCcw className="size-3.5" />Clear</Button>}
                   <Button type="submit" loading={pending} disabled={!question.trim()}><Send className="size-4" />Ask</Button>
@@ -139,11 +138,11 @@ function Turn({ turn }: { turn: Turn }) {
   const answer = turn.answer;
   return (
     <div className="space-y-3">
-      <div className="ml-auto max-w-3xl rounded-lg bg-brand-600 px-4 py-3 text-sm text-white">{turn.question}</div>
+      <div className="ml-auto w-fit max-w-[80%] whitespace-pre-wrap break-words rounded-lg bg-brand-600 px-4 py-3 text-sm text-white">{turn.question}</div>
       {turn.status === "pending" && <Streaming turn={turn} />}
-      {turn.status === "error" && <div className="max-w-3xl"><ErrorState error={new Error(turn.error)} /></div>}
+      {turn.status === "error" && <ErrorState error={new Error(turn.error)} />}
       {turn.status === "done" && answer && (
-        <Card className="max-w-4xl overflow-hidden">
+        <Card className="overflow-hidden">
           {answer.status === "no_answer" ? <NoAnswer reason={answer.no_answer} /> : <Answered answer={answer} />}
         </Card>
       )}
@@ -165,7 +164,7 @@ function Streaming({ turn }: { turn: Turn }) {
     ? `Reading ${turn.passages} relevant passages…`
     : STAGE_LABELS[turn.stage ?? "searching"];
   return (
-    <Card className="max-w-4xl overflow-hidden">
+    <Card className="overflow-hidden">
       <div className="p-5">
         <p className="inline-flex items-center gap-2 text-sm text-muted" aria-live="polite">
           <Sparkles className="size-4 animate-pulse text-ai-600" />{claims.length ? "Writing a grounded answer…" : label}
