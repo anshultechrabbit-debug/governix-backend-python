@@ -135,3 +135,17 @@ def test_an_unchanged_or_missing_restatement_is_none():
     llm.content = {"questions": []}
     assert restated_questions(llm, "What is the KYC policy?") is None
     assert restated_questions(None, "Tell me about the kyc pokucy") is None
+
+
+def test_a_pronoun_inside_a_standalone_question_never_blocks_it():
+    history = [ConversationTurn(question="What is the maximum tenor for auto loans?", answer="22 months.")]
+    question = "For personal loans, what is the maximum exposure, and what happens if a proposal goes beyond it?"
+    rewrite = standalone_question(_Rewriter(question, False), question, history)
+    assert rewrite.resolvable and rewrite.question == question and rewrite.reason is None
+
+
+def test_an_explicit_reference_that_cannot_be_resolved_still_asks_to_restate():
+    history = [ConversationTurn(question="What is the maximum tenor for auto loans?", answer="22 months.")]
+    rewrite = standalone_question(_Rewriter("How many schemes were in that discussion?", False),
+                                  "How many schemes were in that discussion?", history)
+    assert not rewrite.resolvable

@@ -95,6 +95,9 @@ class Settings(BaseSettings):
     MAX_UPLOAD_SIZE_MB: int = 1024
     # Pages per extraction job; ranges run in parallel on as many workers as exist.
     EXTRACTION_BATCH_PAGES: int = 500
+    # Worker processes for extracting large documents on every core. None: one per core
+    # but one (at most 8); 0 or 1: extract in the worker thread.
+    EXTRACTION_PROCESSES: int | None = None
     # A page with fewer extracted characters than this is routed to OCR.
     OCR_MIN_CHARS: int = 25
     OCR_LANGUAGE: str = "eng"
@@ -141,7 +144,7 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     # Must match the vector column (see app/modules/search/model.py); changing it needs a migration + re-embed.
     EMBEDDING_DIMENSIONS: int = 1536
-    EMBED_BATCH_SIZE: int = 128
+    EMBED_BATCH_SIZE: int = 256  # one OpenAI request per job; chunks stay well under the per-request token limit
     RERANKER_PROVIDER: str = "local"  # local | api | none
     RERANKER_API_URL: str | None = None  # Cohere/Jina-compatible /rerank endpoint
     RERANKER_API_KEY: SecretStr | None = None

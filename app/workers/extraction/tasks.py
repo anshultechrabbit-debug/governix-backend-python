@@ -7,6 +7,7 @@ restarted job resumes from the first page it had not stored yet.
 
 import logging
 import uuid
+from concurrent.futures.process import BrokenProcessPool
 
 import pymupdf
 from sqlalchemy import func, select
@@ -21,14 +22,17 @@ from app.modules.documents.model import (
     ExtractionMethod,
 )
 from app.modules.ingestion import pipeline, progress
-from app.modules.ingestion.extraction import extract_page
+from app.modules.ingestion.extraction import extract_pages
 from app.modules.ingestion.model import IngestionStage, Stage, StageStatus
 from app.workers.common import PipelineError, failure_guard, load_document
+from app.workers.extraction.pool import discard_pool, extraction_pool
 from app.workers.runtime import get_runtime
 
 logger = logging.getLogger(__name__)
 
 PERSIST_EVERY_PAGES = 50
+# A range at least this long is extracted on the process pool (if enabled).
+POOL_MIN_PAGES = 100
 OCR_STAGE_ENGINES = (ExtractionMethod.OCR, ExtractionMethod.OCR_UNAVAILABLE, ExtractionMethod.PENDING_OCR)
 
 
@@ -98,34 +102,15 @@ def extract_range(payload: dict, ctx: JobContext) -> None:
             ))
             session.rollback()
             with rt.storage.local_path(storage_key) as path:
-                pdf = open_pdf(path)
-                try:
-                    rows = []
-                    for number in range(start, end + 1):
-                        if number in done:
-                            continue
-                        extraction = extract_page(
-                            pdf.load_page(number - 1), ocr_min_chars=rt.settings.OCR_MIN_CHARS
-                        )
-                        rows.append({
-                            "document_id": document_id,
-                            "organization_id": organization_id,
-                            "page_number": number,
-                            "text": extraction.text,
-                            "char_count": extraction.char_count,
-                            "method": extraction.method,
-                            "width": extraction.width,
-                            "height": extraction.height,
-                            "lines": extraction.lines,
-                        })
-                        if len(rows) >= PERSIST_EVERY_PAGES:
-                            _persist_pages(session, document_id, rows)
-                            rows = []
-                            pymupdf.TOOLS.store_shrink(100)  # release PyMuPDF caches
-                            ctx.heartbeat()
-                    _persist_pages(session, document_id, rows)
-                finally:
-                    pdf.close()
+                open_pdf(path).close()  # a clear error for a corrupt or protected file
+                pending_pages = [n for n in range(start, end + 1) if n not in done]
+                batches = [pending_pages[i:i + PERSIST_EVERY_PAGES]
+                           for i in range(0, len(pending_pages), PERSIST_EVERY_PAGES)]
+                ocr_min_chars = rt.settings.OCR_MIN_CHARS
+                ids = {"document_id": document_id, "organization_id": organization_id}
+                for rows in _extracted(rt.settings, path, batches, ocr_min_chars):
+                    _persist_pages(session, document_id, [{**ids, **row} for row in rows])
+                    ctx.heartbeat()
 
             pending = session.scalar(
                 select(func.count()).select_from(DocumentPage).where(
@@ -145,6 +130,26 @@ def extract_range(payload: dict, ctx: JobContext) -> None:
                 )
             session.commit()
             check_extraction_complete(session, document)
+
+
+def _extracted(settings, path: str, batches: list[list[int]], ocr_min_chars: int):
+    """Each batch's page rows, in order: on the process pool for a large range, else here."""
+    pool = extraction_pool(settings) if sum(map(len, batches)) >= POOL_MIN_PAGES else None
+    if pool is not None:
+        futures = [pool.submit(extract_pages, path, batch, ocr_min_chars) for batch in batches]
+        try:
+            for index, future in enumerate(futures):
+                yield future.result()
+            return
+        except BrokenProcessPool:
+            logger.warning("An extraction process died; extracting the rest of this range here", exc_info=True)
+            discard_pool()
+            batches = batches[index:]
+        finally:
+            for future in futures:
+                future.cancel()
+    for batch in batches:
+        yield extract_pages(path, batch, ocr_min_chars)
 
 
 def _persist_pages(session: Session, document_id: uuid.UUID, rows: list[dict]) -> None:

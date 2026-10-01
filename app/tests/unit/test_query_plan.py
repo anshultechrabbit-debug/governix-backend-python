@@ -50,3 +50,11 @@ def test_explicit_ui_choice_wins():
     assert historical.query_class is QueryClass.HISTORICAL and historical.as_of == date(2025, 3, 1)
     current = plan_query("What was the LTV in March 2025?", ui_mode="current", today=TODAY)
     assert current.as_of == TODAY
+
+
+def test_a_difference_that_is_the_subject_of_a_rule_is_not_a_version_comparison():
+    question = ("What reading of the unreconciled position difference for Proprietary Trading Limits "
+                "(Tier 5 / North-East Zone) constitutes an early-warning signal?")
+    assert plan_query(question).query_class is QueryClass.CURRENT
+    assert plan_query("What are the KYC requirements on changes in address?").query_class is QueryClass.CURRENT
+    assert plan_query("What is the difference between the current and the previous version?").query_class is QueryClass.COMPARISON

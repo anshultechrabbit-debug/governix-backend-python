@@ -192,3 +192,53 @@ def test_a_percent_sign_answers_a_question_about_a_percentage():
     from app.modules.rag.validation import TermIndex
 
     assert TermIndex("The maximum LTV for gold loans is 75%.").mentions("percentage")
+
+
+def test_a_claim_about_another_variant_than_the_one_asked_is_rejected():
+    evidence = {"E1": EvidenceText("E1", (
+        "Tier 2 / Islands Zone | Single-borrower exposure | Max | INR 180 lakh\n"
+        "Tier 3 / Islands Zone | Single-borrower exposure | Max | INR 229 lakh"
+    ))}
+    question = "For Personal Loan (Tier 2 / Islands Zone), what is the maximum single-borrower exposure?"
+    wrong, right = validate_claims([
+        {"text": "For Tier 3 / Islands Zone the maximum single-borrower exposure is INR 229 lakh.", "evidence_ids": ["E1"]},
+        {"text": "For Tier 2 / Islands Zone the maximum single-borrower exposure is INR 180 lakh.", "evidence_ids": ["E1"]},
+    ], evidence, question=question)
+    assert not wrong.valid and "is about Tier 3, not Tier 2" in wrong.problems
+    assert right.valid, right.problems
+
+
+def test_a_question_comparing_variants_does_not_pin_one():
+    from app.modules.rag.validation import qualifiers
+
+    assert qualifiers("Compare Tier 2 and Tier 3 exposure limits") == {}
+    assert qualifiers("What is the limit for Tier 2 in Grade B?") == {"tier": "2", "grade": "b"}
+
+
+def test_there_is_no_stated_value_is_a_statement_about_the_documents():
+    from app.modules.rag.validation import ABSENCE_PROBLEM
+
+    [result] = validate_claims([{"text": "There is no stated maximum exposure for Tier 2 in the provided evidence.",
+                                 "evidence_ids": ["E1"]}], EVIDENCE)
+    assert result.problems == [ABSENCE_PROBLEM]
+
+
+def test_a_figure_in_a_long_tiered_sentence_belongs_to_its_subject():
+    evidence = {"E1": EvidenceText("E1", (
+        "DS-10.03.036 Approval authority for Premature Withdrawal (Tier 1 / South Zone) in respect of customers with "
+        "more than three years of history is tiered by exposure: up to INR 8 lakh, the Assistant Vice President; above "
+        "INR 8 lakh and up to INR 24 lakh, the Chief Risk Officer; above INR 24 lakh, the Product Approval Committee."
+    ))}
+    [result] = validate_claims([{"text": "Premature Withdrawal (Tier 1 / South Zone) above INR 24 lakh is approved by the Product Approval Committee.",
+                                 "evidence_ids": ["E1"]}], evidence, ["premature", "withdrawal", "tier", "south", "zone"])
+    assert result.valid, result.problems
+
+
+def test_restating_the_other_half_of_a_sentence_with_a_negation_is_not_a_reversal():
+    evidence = {"E1": EvidenceText("E1", (
+        "The Trade Pricing Review shall be submitted to the Credit Risk Committee by working day 6 of each month, "
+        "and must include the advance remittances without evidence of import together with its trend."
+    ))}
+    [result] = validate_claims([{"text": "The Trade Pricing Review shall be submitted to the Credit Risk Committee by working day 6 of each month.",
+                                 "evidence_ids": ["E1"]}], evidence)
+    assert result.valid, result.problems

@@ -26,6 +26,13 @@ _VERSION_REF = re.compile(r"\b(?:v|version\s*)(\d{1,3}(?:\.\d{1,3})?)\b", re.I)
 _COMPARE = re.compile(
     r"\b(compare|comparison|difference|differences|differ|changed|changes|what'?s new|what is new|vs\.?|versus)\b", re.I
 )
+# "Difference", "changes" and "compare" are about versions only when the question says so:
+# "the unreconciled position difference" or "changes in address" are subjects of a rule.
+_VERSION_CONTEXT = re.compile(
+    r"\b(?:versions?|latest|previous|earlier|older|newer|current|revised|revision|amended|amendment|"
+    r"updated|update|last\s+year|over\s+time|edition)\b",
+    re.I,
+)
 _PAST = re.compile(r"\b(was|were|used to|previously|earlier|before|prior to|as of|as on|at that time|back in)\b", re.I)
 _YEAR = re.compile(r"\b(?:in|during|for)\s+((?:19|20)\d{2})\b", re.I)
 # A year range ("during 2022-27", "2017-22", "FY 2022-23") names a period the
@@ -79,7 +86,7 @@ def plan_query(
         return QueryPlan(QueryClass.CURRENT, "as_of", as_of=today, explanation="Current version selected")
 
     labels = list(dict.fromkeys(_VERSION_REF.findall(question)))
-    if _COMPARE.search(question) and (len(labels) >= 2 or not labels):
+    if _COMPARE.search(question) and (len(labels) >= 2 or (not labels and _VERSION_CONTEXT.search(question))):
         return QueryPlan(QueryClass.COMPARISON, "versions", version_labels=labels[:2],
                          explanation="Question asks what changed between versions")
     if labels:

@@ -39,10 +39,42 @@ _ABSENCE = re.compile(
     r"\b(?:document|documents|evidence|policy|policies|text|source|sources|records?)\s+(?:does|do|did)\s*n[o']t\s+"
     r"(?:provide|mention|specify|state|contain|include|cover|say|address|give|list|define)"
     r"|\bnot\s+(?:provided|mentioned|specified|stated|available|covered|included|addressed|defined)\s+in\s+the\b"
-    r"|\bno\s+(?:information|mention|details?)\s+(?:is\s+|are\s+)?(?:provided|given|available)\b",
+    r"|\bno\s+(?:information|mention|details?)\s+(?:is\s+|are\s+)?(?:provided|given|available)\b"
+    r"|\bthere\s+is\s+no\s+(?:stated|specified|explicit|mentioned|defined|documented)\b"
+    r"|\b(?:in|from)\s+the\s+(?:provided|available|cited|given)\s+(?:evidence|documents?|text|sources?)\b",
     re.IGNORECASE,
 )
 ABSENCE_PROBLEM = "says what the documents do not contain"
+# A variant the question pins down ("Tier 2", "Level 3", "Grade B"): rule books repeat the same
+# rule for every variant with a different figure, so a claim about another variant is not an
+# answer. (Section and clause numbers are not variants: "5.2" belongs to "Section 5".)
+_QUALIFIER = re.compile(
+    r"\b(tier|level|grade|band|category|class|phase|stage|slab|bucket)\s+(\d+(?:\.\d+)?|[A-Z](?![a-z]))",
+    re.IGNORECASE,
+)
+
+
+_ZONE = re.compile(r"\b([A-Z][a-z]+(?:-[A-Z][a-z]+)?)\s+Zone\b")
+
+
+def _variants(text: str) -> list[tuple[str, str]]:
+    """("tier", "2"), ("zone", "north-east") ... as the text names them."""
+    found = [(word.lower(), value.lower()) for word, value in _QUALIFIER.findall(text)]
+    return found + [("zone", name.lower()) for name in _ZONE.findall(text)]
+
+
+def _variant_name(word: str, value: str) -> str:
+    if word == "zone":
+        return f"{value.title()} Zone"
+    return f"{word.title()} {value.upper() if value.isalpha() else value}"
+
+
+def qualifiers(question: str) -> dict[str, str]:
+    """The variants the question names, one value each ("Tier 2 / North Zone" -> {"tier": "2", "zone": "north"})."""
+    seen: dict[str, set[str]] = {}
+    for word, value in _variants(question):
+        seen.setdefault(word, set()).add(value)
+    return {word: values.pop() for word, values in seen.items() if len(values) == 1}
 # Evidence ids the model appended as citation marks ("... frozen (E1, E2).", "... frozen. [E3]"):
 # the citation is already in evidence_ids, so the marks are dropped rather than the claim.
 _ID = r"[EGD]\d{1,2}"
@@ -74,6 +106,8 @@ NUMBER_WINDOW = 200
 # A subject term beside at most this share of the evidence's figures identifies a row;
 # one beside more of them is a column heading.
 SPECIFIC_SHARE = 0.5
+# Fewer figures than this: a clause, not a table; there are no rows to mix up.
+MIN_FIGURES_FOR_ROWS = 3
 # A claim this close to one source sentence is a restatement, so its negation must match.
 RESTATEMENT_OVERLAP = 0.7
 _TERM_WORD = re.compile(r"[a-z0-9]+(?:\.[0-9]+)?")
@@ -172,7 +206,21 @@ def _flips_polarity(claim: str, cited_text: str) -> bool:
     if claim_negated and not source_negated:
         # The next sentences may carry the short answer of a question-and-answer pair ("... income? Ans. No.").
         return not _negated(" ".join(sentences[best_index + 1:best_index + 3]))
-    return source_negated and not claim_negated
+    return source_negated and not claim_negated and _restates_negated_part(claim, sentences[best_index])
+
+
+def _restates_negated_part(claim: str, sentence: str) -> bool:
+    """The claim repeats what the sentence negates ("No prepayment charges apply" ->
+    "Prepayment charges apply"), not another part of it ("... shall be submitted by day 6,
+    and must include remittances without evidence of import" -> "shall be submitted by day 6")."""
+    said = _content_words(claim)
+    cleaned = _NOT_NEGATION.sub(" ", sentence)
+    for match in _NEGATION.finditer(cleaned):
+        following = [w for w in _WORD.findall(cleaned[match.end():match.end() + 60].lower())
+                     if w not in _STOP and w not in _FRAMING][:3]
+        if following and sum(w in said for w in following) >= min(2, len(following)):
+            return True
+    return False
 
 
 def _normal(text: str) -> str:
@@ -193,12 +241,21 @@ def _negated(text: str) -> bool:
     return bool(_NEGATION.search(_NOT_NEGATION.sub(" ", text)))
 
 
+_FULL_STOP = re.compile(r"[.!?](?=\s)")
+
+
 def _window(text: str, start: int, end: int) -> str:
-    """The text beside a figure: up to NUMBER_WINDOW characters either side, within its line (a table row)."""
-    left = max(text.rfind("\n", 0, start) + 1, start - NUMBER_WINDOW)
+    """The text beside a figure, within its line (a table row): its whole sentence, and at
+    least NUMBER_WINDOW characters either side. A tiered clause ("Approval authority for X
+    ... up to INR 8 lakh, ...; above INR 24 lakh, the Committee.") is one sentence."""
+    line_start = text.rfind("\n", 0, start) + 1
     newline = text.find("\n", end)
-    right = min(newline if newline != -1 else len(text), end + NUMBER_WINDOW)
-    return text[left:right]
+    line_end = newline if newline != -1 else len(text)
+    stops = [m.end() for m in _FULL_STOP.finditer(text, line_start, start)]
+    sentence_start = stops[-1] if stops else line_start
+    following = _FULL_STOP.search(text, end, line_end)
+    sentence_end = following.end() if following else line_end
+    return text[max(line_start, min(sentence_start, start - NUMBER_WINDOW)):min(line_end, max(sentence_end, end + NUMBER_WINDOW))]
 
 
 def _unbound_numbers(text: str, cited_text: str, subjects: list[str], skip: set[tuple[str, str]]) -> list[str]:
@@ -211,10 +268,11 @@ def _unbound_numbers(text: str, cited_text: str, subjects: list[str], skip: set[
     """
     present = [t for t in subjects if TermIndex(cited_text).mentions(t)]
     figures = [o for o in extract_numeric_facts(cited_text) if o.kind != "number"]
-    if not present or not figures:
-        return []
+    if not present or len(figures) < MIN_FIGURES_FOR_ROWS:
+        return []  # a clause with one or two figures has no rows to confuse
     windows = [TermIndex(_window(cited_text, o.start, o.end)) for o in figures]
-    specific = [t for t in present if sum(w.mentions(t) for w in windows) <= len(windows) * SPECIFIC_SHARE]
+    near = {t: sum(w.mentions(t) for w in windows) for t in present}
+    specific = [t for t in present if 0 < near[t] <= len(windows) * SPECIFIC_SHARE]
     if not specific:
         return []  # every subject term sits beside most figures: nothing to tell rows apart by
     unbound = []
@@ -229,8 +287,11 @@ def _unbound_numbers(text: str, cited_text: str, subjects: list[str], skip: set[
 
 def validate_claims(
     raw_claims: list[dict], evidence: dict[str, EvidenceText], subjects: list[str] | None = None,
+    question: str = "",
 ) -> list[ClaimResult]:
-    """`subjects` are the question's key terms: what the claims must be about."""
+    """`subjects` are the question's key terms: what the claims must be about; `question` is
+    read for the variants it pins down ("Tier 2")."""
+    asked = qualifiers(question)
     results = []
     for raw in raw_claims:
         text = " ".join(_CITATION_MARKS.sub("", str(raw.get("text", ""))).split())
@@ -293,6 +354,12 @@ def validate_claims(
         elif unbound := _unbound_numbers(text, cited_text, named, allowed):
             result.valid = False
             result.problems.append(f"{', '.join(unbound)} is not stated for {', '.join(named)} in the cited evidence")
+        mismatched = [(w, v) for w, v in _variants(text) if w in asked and v != asked[w]]
+        other = [_variant_name(w, v) for w, v in mismatched]
+        if other:
+            result.valid = False
+            wanted = ", ".join(dict.fromkeys(_variant_name(w, asked[w]) for w, _v in mismatched))
+            result.problems.append(f"is about {', '.join(dict.fromkeys(other))}, not {wanted}")
         if _flips_polarity(text, cited_text):
             result.valid = False
             result.problems.append("reverses the negation of the source sentence")

@@ -102,7 +102,11 @@ def is_non_english(question: str) -> bool:
 
 def standalone_question(llm: LLMProvider | None, question: str, history: list) -> Rewrite:
     """The question to search with. Raises nothing: an unavailable model leaves it unchanged."""
-    follow_up = refers_to_earlier_turn(question) or bool(history and _PRONOUN.search(question))
+    explicit = refers_to_earlier_turn(question)
+    # A pronoun ("what happens if a proposal goes beyond it?") usually points inside the
+    # question itself: it is only a possible follow-up, never a reason to refuse.
+    possible = not explicit and bool(history and _PRONOUN.search(question))
+    follow_up = explicit or possible
     foreign = is_non_english(question)
     if not follow_up and not foreign:
         return Rewrite(question)
@@ -110,7 +114,7 @@ def standalone_question(llm: LLMProvider | None, question: str, history: list) -
     if follow_up and not history:
         return Rewrite(question, reason, resolvable=False)
     if llm is None:
-        return Rewrite(question, reason, resolvable=not follow_up)
+        return Rewrite(question, reason, resolvable=not explicit)
     turns = history[-HISTORY_TURNS:]
     conversation = "\n".join(
         f"Q{i}: {turn.question}\nA{i}: {_truncate_at_sentence(turn.answer or '(no answer)', HISTORY_ANSWER_CHARS)}"
@@ -121,13 +125,15 @@ def standalone_question(llm: LLMProvider | None, question: str, history: list) -
             SYSTEM_PROMPT, f"Earlier conversation:\n{conversation}\n\nLatest message: {question}", SCHEMA
         )
     except LLMUnavailableError:
-        return Rewrite(question, reason, resolvable=not follow_up)
+        return Rewrite(question, reason, resolvable=not explicit)
     content = result.content or {}
     rewritten = " ".join(str(content.get("standalone_question") or "").split())
     if not rewritten:  # a provider without rewrite support (the local stand-in)
-        return Rewrite(question, reason, resolvable=not follow_up)
+        return Rewrite(question, reason, resolvable=not explicit)
+    if possible and not content.get("resolvable", True) and not foreign:
+        return Rewrite(question)  # not about the earlier conversation: search it as asked
     # A translation always has something to search for; only an unresolved reference does not.
-    resolvable = bool(content.get("resolvable", True)) or not follow_up
+    resolvable = bool(content.get("resolvable", True)) or not explicit
     if rewritten == question and reason == "follow_up":
         reason = None  # already standalone: nothing was rewritten
     return Rewrite(rewritten[:2000], reason, resolvable=resolvable)

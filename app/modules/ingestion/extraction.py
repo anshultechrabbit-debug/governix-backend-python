@@ -20,6 +20,10 @@ BOLD_FLAG = 1 << 4
 # prose: each row is its own paragraph and is never mistaken for a heading.
 TABLE_BLOCK_BASE = -1
 MIN_TABLE_ROWS = 2
+# A ruled table of two rows and two columns is drawn with at least this many line or
+# rectangle segments. A page with fewer cannot hold one, so its (slow) table search is
+# skipped. On real documents table pages had 58 or more.
+MIN_RULING_SEGMENTS = 4
 HEADER_BOLD_RATIO = 0.5
 # Keep ligatures/whitespace sane and drop invisible text used for tricks.
 TEXT_FLAGS = (
@@ -79,13 +83,28 @@ def render_rows(rows: list[list[str]], header: list[str] | None) -> list[str]:
     return rendered
 
 
+def _ruling_segments(page: pymupdf.Page, enough: int) -> int:
+    """Line and rectangle segments drawn on the page, counted up to `enough`."""
+    count = 0
+    for drawing in page.get_cdrawings():
+        for item in drawing.get("items", ()):
+            if item[0] in ("l", "re", "qu"):
+                count += 1
+                if count >= enough:
+                    return count
+    return count
+
+
 def _table_rows(page: pymupdf.Page, spans) -> list[tuple[pymupdf.Rect, list[tuple[float, str]]]]:
     """Ruled tables on the page as (bbox, [(row y0, row text)]).
 
     Only tables drawn with ruling lines are used ("lines_strict"), so ordinary
-    multi-column prose is never mistaken for a table.
+    multi-column prose is never mistaken for a table. Table search costs about six
+    times the rest of a page's extraction, so a page without ruling lines skips it.
     """
     try:
+        if _ruling_segments(page, MIN_RULING_SEGMENTS) < MIN_RULING_SEGMENTS:
+            return []
         tables = page.find_tables(strategy="lines_strict").tables
     except Exception:  # table detection is an enhancement; never fail extraction on it
         logger.warning("Table detection failed on page %s", page.number + 1, exc_info=True)
@@ -181,3 +200,29 @@ def lines_from_plain_text(text: str) -> list[list]:
             if line.strip():
                 lines.append([block, line.strip(), 0.0, False, 0.0])
     return lines
+
+
+def extract_pages(path: str, numbers: list[int], ocr_min_chars: int) -> list[dict]:
+    """Extract the given pages of the PDF at `path`, as page rows (without document ids).
+
+    Runs in a worker process for large documents: it opens its own handle on the file,
+    so pages of one document are extracted on several CPU cores at once.
+    """
+    pdf = pymupdf.open(path, filetype="pdf")
+    try:
+        rows = []
+        for number in numbers:
+            extraction = extract_page(pdf.load_page(number - 1), ocr_min_chars=ocr_min_chars)
+            rows.append({
+                "page_number": number,
+                "text": extraction.text,
+                "char_count": extraction.char_count,
+                "method": extraction.method,
+                "width": extraction.width,
+                "height": extraction.height,
+                "lines": extraction.lines,
+            })
+        return rows
+    finally:
+        pdf.close()
+        pymupdf.TOOLS.store_shrink(100)

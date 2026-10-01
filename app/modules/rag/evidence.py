@@ -68,7 +68,9 @@ QUESTION_TERMS = frozenset(
     "make makes made automatically basically actually giving given "
     "told tell telling yesterday today tomorrow might maybe perhaps sure much many could would "
     "some so am think thought heard said "
-    "each every list category categories type types kind kinds interval intervals topic topics cover covers covered".split()
+    "each every list category categories type types kind kinds interval intervals topic topics cover covers covered "
+    # Joining words of rule-book questions: "Auto Loan extended to students", "serving exporters".
+    "serving serve serves served extended extending covering segment segments".split()
 )
 # Questions about the document itself: its title, publisher, date, legal basis.
 _DOCUMENT_QUESTION = re.compile(

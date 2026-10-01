@@ -79,7 +79,7 @@ NO_ANSWER_MESSAGE = "None of the documents you can access answer this, so I won'
 #   v13    acronym fast-path answer added
 #   v14    cache key changed: raw history excluded; keyed on rewritten question
 #   v15    summary check merged into claim validation (no second LLM call)
-ANSWER_CACHE_VERSION = "v26"
+ANSWER_CACHE_VERSION = "v30"
 # No supported answer in the version in force: worth looking one version back.
 FALLBACK_REASONS = frozenset({
     "NO_RELEVANT_DOCUMENTS", "LOW_RELEVANCE", "KEY_TERMS_NOT_FOUND", "INSUFFICIENT_EVIDENCE",
@@ -871,7 +871,7 @@ class RAGService:
 
     def _streamed_claim(self, principal, request, plan, evidence, raw, texts, items, numbering) -> dict | None:
         """One claim checked exactly as the final answer checks it, or None if it fails."""
-        results = validate_claims([raw], texts, key_terms(request.question))
+        results = validate_claims([raw], texts, key_terms(request.question), request.question)
         if not results:
             return None
         _drop_metadata_echo(results, request.question, plan)
@@ -944,7 +944,7 @@ class RAGService:
         items = evidence.by_id()
         texts = _evidence_texts(evidence)
         content = llm_result.content if llm_result else {}
-        results = validate_claims(content.get("claims", []), texts, key_terms(request.question))
+        results = validate_claims(content.get("claims", []), texts, key_terms(request.question), request.question)
         _drop_metadata_echo(results, request.question, plan)
         # What the checks removed is for the audit trail and debugging, not the reader:
         # the answer they see is already only what passed.
@@ -1017,7 +1017,7 @@ class RAGService:
         if not isinstance(text, str) or not text.strip():
             return None
         cited = list(dict.fromkeys(e for r in valid for e in r.evidence_ids))
-        [result] = validate_claims([{"text": text, "evidence_ids": cited}], texts, key_terms(question))
+        [result] = validate_claims([{"text": text, "evidence_ids": cited}], texts, key_terms(question), question)
         if not result.valid:
             return None
         statements = "\n".join(f"- {claim.text}" for claim in claims)
@@ -1103,7 +1103,9 @@ class RAGService:
                 reason=no_answer.reason,
                 message=messages.get(no_answer.reason, NO_ANSWER_MESSAGE),
                 suggestions=no_answer.suggestions if no_answer.suggestions is not None else SUGGESTIONS,
-                missing_terms=no_answer.missing_terms,
+                # An off-topic answer leaves out words the documents do contain; listing
+                # them as "not mentioned in your documents" would mislead.
+                missing_terms=[] if no_answer.reason == "ANSWER_OFF_TOPIC" else no_answer.missing_terms,
             ),
             plan=plan.describe(), evidence_score=evidence.top_score,
             model=llm_result.model if llm_result else None,

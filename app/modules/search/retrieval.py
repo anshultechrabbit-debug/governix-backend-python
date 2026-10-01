@@ -112,6 +112,14 @@ VersionMode = Literal["current", "as_of", "versions", "all"]
 # must fail fast instead of holding a worker thread and a pooled connection
 # open indefinitely. A slow lane degrades the answer; it never hangs the API.
 STATEMENT_TIMEOUT_MS = 5_000
+# In a large collection, a word in more than this share of the chunks ("tier", "zone" in a
+# compendium where every rule names one) matches almost everything and ranks nothing:
+# the keyword and section lanes leave it out, which keeps them within their time limit.
+SELECTIVE_MIN_CHUNKS = 2_000
+MAX_TERM_SHARE = 0.2
+MAX_RANKED_TERMS = 10
+# Sections whose chunks the section lane ranks.
+SECTION_CANDIDATES = 200
 # One shared pool for the whole process. Sized for the lanes of a single
 # request, not for the number of requests: lanes are short database calls, so
 # threads are recycled rather than grown.
@@ -327,6 +335,22 @@ class HybridRetriever:
             weights[term] = math.log(1 + (total - df + 0.5) / (df + 0.5))
         return weights
 
+    def selective_terms(self, principal: Principal, terms: list[str]) -> list[str]:
+        """The terms worth matching and ranking on: all of them in a small collection; in a
+        large one, the most distinctive (at most MAX_RANKED_TERMS, each in at most
+        MAX_TERM_SHARE of the chunks), keeping at least the three rarest."""
+        weights = self.term_weights(principal, terms)
+        cached = _DF_CACHE.get((principal.organization_id, "__total__"))
+        if not weights or cached is None or cached[1] < SELECTIVE_MIN_CHUNKS:
+            return terms
+        floor = math.log(1 + (1 - MAX_TERM_SHARE) / MAX_TERM_SHARE)
+        org = principal.organization_id
+        # A word in no chunk at all (a stop word such as "if", or a typo) matches nothing.
+        occurring = [t for t in dict.fromkeys(terms) if (_DF_CACHE.get((org, t)) or (0, 1))[1] > 0]
+        ranked = sorted(occurring, key=lambda t: weights.get(t, 0.0), reverse=True)
+        kept = [t for t in ranked if weights.get(t, 0.0) >= floor][:MAX_RANKED_TERMS]
+        return kept or ranked[:3]
+
     def visible_term_weights(self, principal: Principal, terms: list[str]) -> dict[str, float]:
         """IDF of each term over the searchable chunks the caller can see.
 
@@ -466,6 +490,7 @@ class HybridRetriever:
         terms = search_terms(query)
         if not terms:
             return []
+        terms = self.selective_terms(principal, terms)
         or_query = _or_of(terms)
         rank = self._weighted_rank(Chunk.tsv, terms, self.term_weights(principal, terms), or_query).label("score")
         statement = (
@@ -612,15 +637,25 @@ class HybridRetriever:
         terms = search_terms(query)
         if not terms:
             return []
+        terms = self.selective_terms(principal, terms)
         tsquery = _or_of(terms)
         weights = self.term_weights(principal, terms)
+        # Two steps: the best-matching sections first (their own short text, from the index),
+        # then only their chunks are ranked. Ranking every chunk of every matching section
+        # does not finish in time on a 10,000-page document.
         section_rank = self._weighted_rank(DocumentSection.tsv, terms, weights, tsquery)
+        top = (
+            select(DocumentSection.id.label("id"), section_rank.label("rank"))
+            .where(DocumentSection.organization_id == principal.organization_id, DocumentSection.tsv.op("@@")(tsquery))
+            .order_by(section_rank.desc())
+            .limit(SECTION_CANDIDATES)
+            .subquery()
+        )
         chunk_rank = self._weighted_rank(Chunk.tsv, terms, weights, tsquery)
-        score = (section_rank * 0.6 + chunk_rank * 0.4).label("score")
+        score = (top.c.rank * 0.6 + chunk_rank * 0.4).label("score")
         statement = (
             _base((*CHUNK_COLUMNS, score), principal, filters)
-            .join(DocumentSection, DocumentSection.id == Chunk.section_id)
-            .where(DocumentSection.tsv.op("@@")(tsquery))
+            .join(top, top.c.id == Chunk.section_id)
             .order_by(score.desc())
             .limit(LANE_LIMITS["section"])
         )
