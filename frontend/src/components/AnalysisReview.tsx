@@ -42,13 +42,16 @@ export function AnalysisReview({ document, analysis }: { document: DocumentRead;
   const toast = useToast();
   const queryClient = useQueryClient();
   const matched = analysis.matched_policy && !analysis.matched_policy.restricted ? analysis.matched_policy : null;
-  const suggestsVersion = ["EXISTING_POLICY_NEW_VERSION", "VERSION_CONFLICT", "POSSIBLE_MATCH_REQUIRES_REVIEW"].includes(analysis.decision) && matched;
+  const isDuplicate = ["EXACT_DUPLICATE", "CONTENT_DUPLICATE"].includes(analysis.decision);
+  // A copy of a filed document is most often its reissue: a new version of the same policy.
+  const suggestsVersion = ["EXISTING_POLICY_NEW_VERSION", "VERSION_CONFLICT", "POSSIBLE_MATCH_REQUIRES_REVIEW", "EXACT_DUPLICATE", "CONTENT_DUPLICATE"].includes(analysis.decision) && matched;
 
   const [action, setAction] = useState<Action>(suggestsVersion ? "add_version" : "create_policy");
   const [name, setName] = useState(analysis.suggested_name ?? "");
   const [categoryId, setCategoryId] = useState(analysis.suggested_category_id ?? "");
   const [policyNumber, setPolicyNumber] = useState(analysis.detected.policy_number.value ?? "");
-  const [reason, setReason] = useState("");
+  const uploadReason = (document as DocumentRead & { duplicate_override_reason?: string | null }).duplicate_override_reason ?? "";
+  const [reason, setReason] = useState(uploadReason);
   const [newRevision, setNewRevision] = useState(false);
   const [showMatch, setShowMatch] = useState(false);
   const [showSuggestions, setShowSuggestions] = useState(false);
@@ -109,7 +112,11 @@ export function AnalysisReview({ document, analysis }: { document: DocumentRead;
     if (!categoryId && analysis.suggested_category_id) setCategoryId(analysis.suggested_category_id);
   }, [analysis.suggested_category_id, categoryId]);
 
-  const needsReason = WARNING_DECISIONS.includes(analysis.decision);
+  // A reason is asked once: not again if it was given at upload, and not for the reissue
+  // (a copy added as a new version of its own policy), which the confirmation itself records.
+  const reasonNeededFor = (chosen: Action) =>
+    WARNING_DECISIONS.includes(analysis.decision) && !uploadReason.trim() && !(isDuplicate && chosen === "add_version");
+  const needsReason = reasonNeededFor(action);
   const canConfirm = can("policies:manage");
 
   const confirm = useMutation({
@@ -150,7 +157,9 @@ export function AnalysisReview({ document, analysis }: { document: DocumentRead;
     setError(null);
     if (chosen !== "reject") {
       if (chosen === "create_policy" && (!name.trim() || !categoryId)) return setError("Name and category are required.");
-      if (needsReason && reason.trim().length < 5) return setError("Please record a reason for overriding the warning.");
+      if (reasonNeededFor(chosen) && reason.trim().length < 5) {
+        return setError("Please give a short reason (at least 5 characters) for going ahead despite the warning.");
+      }
     }
     setAction(chosen);
     confirm.mutate(chosen);

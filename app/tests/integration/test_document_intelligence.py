@@ -165,3 +165,37 @@ def test_matches_in_inaccessible_scope_are_redacted(client, db, app, tenant):
     assert "name" not in analysis["matched_policy"]
     assert analysis["signals"] == []
     assert all(c.get("restricted") for c in analysis["candidates"])
+
+
+def test_a_reissued_copy_is_offered_as_a_new_version_and_needs_no_reason(client, app, tenant):
+    # A long policy and its second edition: the same text under another bank's name.
+    clauses = [f"Clause {i}: the branch shall verify income documents and property papers carefully." for i in range(40)]
+    original = v3_spec()
+    original.sections[0].paragraphs = original.sections[0].paragraphs + clauses
+    admin = login(client, tenant.admin)
+    first_id, first = process(client, app, tenant.admin, build_policy_pdf(original))
+    created = admin.post(f"/documents/{first_id}/confirm", json={
+        "action": "create_policy", "version": {},
+        "policy": {"name": "Home Loan Credit Policy", "category_id": first["suggested_category_id"]},
+    })
+    assert created.status_code == 200, created.text
+    policy_id = created.json()["data"]["policy_id"]
+    drain(app)
+
+    reissue_spec = v3_spec()
+    reissue_spec.sections[0].paragraphs = [p.replace("the Bank", "Meridian Bank") for p in reissue_spec.sections[0].paragraphs] + clauses
+    reissue_spec.header_lines = [line.replace("Version: 3", "Version: 4").replace("01/01/2025", "01/04/2026")
+                                 for line in reissue_spec.header_lines]
+    document_id, analysis = process(client, app, tenant.admin, build_policy_pdf(reissue_spec), allow_duplicate=False)
+    assert analysis["decision"] == "CONTENT_DUPLICATE", analysis["decision"]
+    # The copy's own policy is offered, so it can be added as its next version.
+    assert analysis["matched_policy"]["policy_id"] == policy_id
+
+    separate = admin.post(f"/documents/{document_id}/confirm", json={
+        "action": "create_policy", "version": {},
+        "policy": {"name": "Copy of Home Loan Policy", "category_id": analysis["suggested_category_id"]},
+    })
+    assert separate.status_code == 422 and separate.json()["error"]["code"] == "OVERRIDE_REASON_REQUIRED"
+
+    reissue = admin.post(f"/documents/{document_id}/confirm", json={"action": "add_version", "policy_id": policy_id, "version": {}})
+    assert reissue.status_code == 200, reissue.text

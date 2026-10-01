@@ -16,6 +16,10 @@ from app.modules.policies.model import Policy, PolicyVersion, VersionStatus
 RESTRICTED = {"restricted": True, "message": "Matches a document in an area you cannot access."}
 
 
+# Decisions that say the upload copies a document already filed.
+DUPLICATE_DECISIONS = {"EXACT_DUPLICATE", "CONTENT_DUPLICATE"}
+
+
 class AnalysisService:
     def __init__(self, session: Session) -> None:
         self.session = session
@@ -39,6 +43,11 @@ class AnalysisService:
         if analysis.matched_policy_id:
             policy = self._visible_policy(principal, analysis.matched_policy_id)
             matched = self._policy_summary(policy) if policy else RESTRICTED
+        elif analysis.decision in DUPLICATE_DECISIONS and (existing := (analysis.conflict or {}).get("existing_policy_id")):
+            # A (near-)copy of a filed document: the natural choice is a new version of that
+            # document's policy (a reissue), so offer it as the match.
+            policy = self._visible_policy(principal, existing)
+            matched = self._policy_summary(policy) if policy else None
 
         candidates = [
             c if self._visible_policy(principal, c["policy_id"]) else {**RESTRICTED, "score": c["score"]}

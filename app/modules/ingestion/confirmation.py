@@ -98,12 +98,21 @@ class ConfirmationService:
         if analysis.review_status != ReviewStatus.PENDING:
             raise ConflictError("This analysis has already been reviewed.", code="INVALID_STATE")
 
-        reason = (request.reason or "").strip() or None
+        # A reason given when the duplicate was uploaded anyway still stands.
+        reason = (request.reason or "").strip() or (document.duplicate_override_reason or "").strip() or None
         if request.action == "reject":
             return self._reject(principal, document, analysis, reason)
-        if analysis.decision in WARNING_DECISIONS and (not reason or len(reason) < MIN_REASON):
+        if self._reissue(analysis, request):
+            # A new version of the very policy the copy belongs to is what a reissue is:
+            # confirming it is the decision, recorded with the reviewer in the audit log.
+            reason = reason or "New version of the same policy (reissue), confirmed by the reviewer"
+            if not request.conflict_resolution:
+                # Same version label as the original: a reissue is a revision of it.
+                request = request.model_copy(update={"conflict_resolution": "save_as_new_revision"})
+        elif analysis.decision in WARNING_DECISIONS and (not reason or len(reason) < MIN_REASON):
             raise ValidationError(
-                f"The analysis flagged this upload as {analysis.decision}. A reason is required to proceed.",
+                f"The analysis flagged this upload as {analysis.decision}. "
+                f"Give a short reason (at least {MIN_REASON} characters) to proceed.",
                 code="OVERRIDE_REASON_REQUIRED",
             )
 
@@ -172,6 +181,16 @@ class ConfirmationService:
         return document
 
     # --- helpers -----------------------------------------------------------------
+
+    @staticmethod
+    def _reissue(analysis, request) -> bool:
+        """Adding a (near-)copy as a new version of the policy its original belongs to."""
+        existing = (analysis.conflict or {}).get("existing_policy_id")
+        return (
+            analysis.decision in (Decision.EXACT_DUPLICATE, Decision.CONTENT_DUPLICATE)
+            and request.action == "add_version"
+            and existing is not None and str(request.policy_id) == existing
+        )
 
     def _reject(self, principal, document, analysis, reason) -> Document:
         document.status = DocumentStatus.REJECTED
