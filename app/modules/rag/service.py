@@ -49,7 +49,7 @@ from app.modules.rag.prompts import (
 from app.modules.rag.query_plan import QueryClass, QueryPlan, plan_query
 from app.modules.rag.query_rewrite import Rewrite, restated_questions, standalone_question
 from app.modules.rag.schema import AnswerResponse, AskRequest, Claim, NoAnswer, Source
-from app.modules.rag.validation import EvidenceText, TermIndex, validate_claims
+from app.modules.rag.validation import ABSENCE_PROBLEM, EvidenceText, TermIndex, validate_claims
 from app.modules.search.model import Chunk
 from app.modules.search.retrieval import HybridRetriever, NamedDocument, SearchFilters, VersionScope
 from app.modules.search.schema import Provenance
@@ -79,7 +79,7 @@ NO_ANSWER_MESSAGE = "None of the documents you can access answer this, so I won'
 #   v13    acronym fast-path answer added
 #   v14    cache key changed: raw history excluded; keyed on rewritten question
 #   v15    summary check merged into claim validation (no second LLM call)
-ANSWER_CACHE_VERSION = "v23"
+ANSWER_CACHE_VERSION = "v26"
 # No supported answer in the version in force: worth looking one version back.
 FALLBACK_REASONS = frozenset({
     "NO_RELEVANT_DOCUMENTS", "LOW_RELEVANCE", "KEY_TERMS_NOT_FOUND", "INSUFFICIENT_EVIDENCE",
@@ -125,7 +125,10 @@ def _drop_metadata_echo(results, question: str, plan: QueryPlan) -> None:
 
 
 def _evidence_texts(evidence: EvidenceSet) -> dict[str, EvidenceText]:
-    texts = {item.id: EvidenceText(item.id, item.full_text, _provenance_numbers(item)) for item in evidence.items}
+    texts = {
+        item.id: EvidenceText(item.id, item.full_text, _provenance_numbers(item), label=_label(item.source))
+        for item in evidence.items
+    }
     if evidence.comparison:
         texts["D1"] = EvidenceText("D1", comparison_text(evidence.comparison))
     return texts
@@ -143,6 +146,50 @@ _GREETING = re.compile(
     r"how\s+are\s+you|what'?s\s+up|there|governix|sir|madam|dear|all|team)\W*)+$",
     re.IGNORECASE,
 )
+
+
+_WEEKDAYS = frozenset("monday tuesday wednesday thursday friday saturday sunday".split())
+# Capitalised words that are ordinary words at the start of a clause or in titles of address.
+_NOT_NAMES = frozenset(
+    "what who when where which why how is are was were do does did can could should would will may might "
+    "if the a an and or but in on at of for to from by with as please tell explain list give show compare "
+    "i we you they he she it my our your their this that these those there here according under".split()
+)
+
+
+def named_entities(question: str) -> list[str]:
+    """Places, organisations and other names the question asks about ("Kerala", "Goa").
+
+    Capitalised words that are not the first word of a sentence, not common question words,
+    and not part of a policy title the question quotes in title case (those are matched by
+    the evidence checks). Acronyms are left to the term checks.
+    """
+    names = []
+    for sentence in re.split(r"[.?!;:]\s+", question):
+        words = re.findall(r"[A-Za-z][A-Za-z'’-]*", sentence)
+        for index, word in enumerate(words):
+            previous = words[index - 1] if index else ""
+            following = words[index + 1] if index + 1 < len(words) else ""
+            if (index == 0 or not word[0].isupper() or word.isupper() or len(word) < 3
+                    or word.lower() in _NOT_NAMES or word.lower() in _MONTHS or word.lower() in _WEEKDAYS
+                    # Part of a capitalised run ("Code of Ethics", "Gold Loan Policy"): a title.
+                    or (previous[:1].isupper() and previous.lower() not in _NOT_NAMES and index > 1)
+                    or following[:1].isupper()):
+                continue
+            names.append(word.lower())
+    return list(dict.fromkeys(names))
+
+
+_SEVERAL = re.compile(
+    r"\b(?:and|also|as well as|along with)\s+(?:what|who|whom|when|where|which|why|how)\b"
+    r"|\?\s*\S.*\?",
+    re.IGNORECASE,
+)
+
+
+def asks_several(question: str) -> bool:
+    """ "What is X and who issued it?", or two questions in one message."""
+    return bool(_SEVERAL.search(question))
 
 
 def is_greeting(question: str) -> bool:
@@ -286,10 +333,19 @@ class RAGService:
         yield "stage", {"stage": "searching"}
 
         prepared_request, rewrite, named, plan = self._prepare_request(principal, request, timings)
-        response, retrieved = yield from self._run_pipeline(
-            principal, prepared_request, plan, rewrite, named, timings, deadline, started
-        )
-        if self._worth_clarifying(response, deadline) and (restated := self._clarify(prepared_request.question, timings)):
+        # A question that asks several things ("the title and who issued it") is split first:
+        # answered as one, it tends to answer only the first thing.
+        restated = self._clarify(prepared_request.question, timings) if asks_several(prepared_request.question) else None
+        split_first = bool(restated and len(restated) > 1)
+        if split_first:
+            response, retrieved = self._no_answer(prepared_request, plan, EvidenceSet([], 0.0, [], 0.0, []),
+                                                  _NoAnswer("KEY_TERMS_NOT_FOUND"), None), []
+        else:
+            restated = None
+            response, retrieved = yield from self._run_pipeline(
+                principal, prepared_request, plan, rewrite, named, timings, deadline, started
+            )
+        if restated or (self._worth_clarifying(response, deadline) and (restated := self._clarify(prepared_request.question, timings))):
             # The words as typed found nothing ("pokucy", "hello ... in short", or two subjects
             # in one question): search again for the question(s) as the person meant them.
             # Nothing was shown yet.
@@ -315,6 +371,12 @@ class RAGService:
                 response, plan = combined, next(p for _, _, p, r in parts if r.status == "answered")
                 prepared_request = prepared_request.model_copy(update={"question": " · ".join(q for q, *_ in parts)})
                 rewrite = Rewrite(prepared_request.question, "split")
+            elif split_first:
+                # No part could be answered on its own: try the question as asked.
+                response, more = yield from self._run_pipeline(
+                    principal, prepared_request, plan, rewrite, named, timings, deadline, started
+                )
+                retrieved += more
         response = self._decorate_and_persist(
             principal, request, prepared_request, response, plan, rewrite, retrieved, timings, started, key
         )
@@ -479,13 +541,18 @@ class RAGService:
             # applies the same check, and a claim shown and then withdrawn reads as a
             # glitch ("an answer for a second, then no answer").
             held: list[dict] = []
+            names: list[str] = []  # the policies cited so far
+            passages: list[str] = []  # and their passages
             on_topic = evidence.comparison is not None or is_document_question(request.question)
             for part in self._generate_stream(principal, request, plan, evidence):
                 if isinstance(part, LLMResult):
                     attempt.llm_result = part
                     continue
                 held.append(part)
-                if not on_topic and self._off_topic(principal, request.question, [c["text"] for c in held]) is not None:
+                for source in part.get("sources", []):
+                    names.append(" ".join(filter(None, [source.get("policy_name"), source.get("document_title"), source.get("section_path")])))
+                    passages.append(source.get("excerpt") or "")
+                if not on_topic and self._off_topic(principal, request.question, [c["text"] for c in held] + names, passages) is not None:
                     continue
                 on_topic = True
                 timings.setdefault("first_claim", round((time.perf_counter() - started) * 1000, 1))
@@ -729,26 +796,36 @@ class RAGService:
         missing = [t for t in weights if t in set(evidence.missing_terms)]
         return 1 - sum(weights[t] for t in missing) / total, missing
 
-    def _check_on_topic(self, principal: Principal, question: str, claims: list[str]) -> None:
-        if (missing := self._off_topic(principal, question, claims)) is not None:
+    def _check_on_topic(self, principal: Principal, question: str, said: list[str], cited: list[str]) -> None:
+        if (missing := self._off_topic(principal, question, said, cited)) is not None:
             raise _NoAnswer("ANSWER_OFF_TOPIC", missing)
 
-    def _off_topic(self, principal: Principal, question: str, claims: list[str]) -> list[str] | None:
-        """The question's terms the claims leave out, when too much is left out; None when on topic.
+    def _off_topic(self, principal: Principal, question: str, said: list[str], cited: list[str]) -> list[str] | None:
+        """The question's terms the answer leaves out, when too much is left out; None when on topic.
 
-        Each claim is true to its evidence, but true statements about something else
-        ("the maximum rate on microfinance loans" for a question about home loans
-        for women) are not an answer. The same distinguishing-weight measure as the
-        evidence gate is applied to the claims themselves.
+        `said` is the answer's sentences and the names of the policies they cite; `cited` is
+        the passages they cite. Each claim is true to its evidence, but true statements about
+        something else are not an answer:
+
+        * the distinguishing weight of the question's terms (as for the evidence gate) must be
+          mostly covered by what the answer says, or the policies it names ("the maximum rate on
+          microfinance loans" does not answer a question about deposits);
+        * a place, organisation or other name the question asks about ("Kerala", "Goa") must
+          appear in the answer or in what it cites: general facts that never mention it are not
+          an answer about it.
         """
+        everything = TermIndex(" ".join(said + cited))
+        absent = [name for name in named_entities(question) if not everything.mentions(name)]
+        if absent:
+            return absent
         # A date in the question chose the version; the answer need not repeat it.
         terms = [t for t in key_terms(question) if not t.isdigit() and t not in _MONTHS]
         weights = self.retriever.visible_term_weights(principal, terms)
         total = sum(weights.values())
         if total <= 0:
             return None
-        said = TermIndex(" ".join(claims))
-        missing = [t for t in weights if not said.mentions(t)]
+        spoken = TermIndex(" ".join(said))
+        missing = [t for t in weights if not spoken.mentions(t)]
         if 1 - sum(weights[t] for t in missing) / total < self.settings.RAG_MIN_SALIENT_COVERAGE:
             return missing
         return None
@@ -871,9 +948,13 @@ class RAGService:
         _drop_metadata_echo(results, request.question, plan)
         # What the checks removed is for the audit trail and debugging, not the reader:
         # the answer they see is already only what passed.
+        if any(ABSENCE_PROBLEM in r.problems for r in results):
+            warnings_first = ["Part of your question is not covered by your documents."]
+        else:
+            warnings_first = []
         checks = [f"Removed an unsupported statement: {', '.join(r.problems)}" for r in results if not r.valid]
         checks += [f"Ignored {p}" for r in results if r.valid for p in r.problems]
-        warnings: list[str] = []
+        warnings: list[str] = warnings_first
         valid = [r for r in results if r.valid]
 
         verified = self._verify_citations(principal, {e for r in valid for e in r.evidence_ids if e != "D1"}, items)
@@ -883,7 +964,9 @@ class RAGService:
                 raise _NoAnswer("INSUFFICIENT_EVIDENCE")
             raise _NoAnswer("ANSWER_FAILED_VALIDATION")
         if evidence.comparison is None and not is_document_question(request.question):
-            self._check_on_topic(principal, request.question, [r.text for r in valid])
+            cited = [e for e in dict.fromkeys(e for r in valid for e in r.evidence_ids) if e in texts]
+            self._check_on_topic(principal, request.question, [r.text for r in valid] + [texts[e].label for e in cited],
+                                 [texts[e].text for e in cited])
 
         numbering: dict[str, int] = {}
         for result in valid:
@@ -1073,6 +1156,10 @@ class RAGService:
         # exits cleanly via the `with session_factory() as session` context.
         self.session.flush()
         return event.id
+
+
+def _label(source) -> str:
+    return " ".join(filter(None, [source.policy_name, source.document_title, source.section_path]))
 
 
 def _provenance_numbers(item) -> set[tuple[str, str]]:

@@ -64,3 +64,19 @@ def test_greetings_are_recognised(text, greeting):
     from app.modules.rag.service import is_greeting
 
     assert is_greeting(text) is greeting
+
+
+def test_places_the_question_names_are_recognised_but_titles_are_not_required_words():
+    from app.modules.rag.service import named_entities
+
+    assert named_entities("Why can't Kerala and Goa meet their electricity demand?") == ["kerala", "goa"]
+    assert named_entities("What is the processing fee for SBI Saral?") == []
+    assert named_entities("What is the gold loan LTV?") == []
+
+
+def test_questions_that_ask_several_things_are_recognised():
+    from app.modules.rag.service import asks_several
+
+    assert asks_several("What is the title and who is the issuing authority?")
+    assert asks_several("What is the LTV? Who approves it?")
+    assert not asks_several("What are the terms and conditions of the loan?")

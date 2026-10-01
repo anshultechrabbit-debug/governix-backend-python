@@ -65,6 +65,9 @@ SYSTEM_PROMPT = """You rewrite a user's latest message into ONE standalone quest
 
 Rules:
 - Use the earlier conversation only to resolve references such as "that discussion", "it", "the previous version".
+- Replace each reference with the subject it points to, named as in the earlier conversation
+  ("that discussion" -> "the 170 transmission schemes"). Never write "the earlier conversation",
+  "the previous answer" or "the discussion" in the question.
 - Do not answer the question.
 - Do not add facts, numbers or names that are in neither the latest message nor the earlier conversation.
 - If the latest message is already a standalone English question, return it unchanged.

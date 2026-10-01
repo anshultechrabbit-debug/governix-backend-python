@@ -42,7 +42,10 @@ PATTERNS = [
         rf"(?P<num>{_NUM})\s*(?P<unit>basis\s+points?|bps|years?|yrs?|months?|days?|weeks?)\b", re.I
     )),
     ("quantity", re.compile(rf"(?P<num>{_NUM})\s*(?P<mult>{_MULT})", re.I)),
-    ("number", re.compile(rf"(?<![\w.])(?P<num>{_NUM})(?![\w%])")),
+    # Not from inside a grouped figure: "00,000" of "4,00,000" is not a number of its own.
+    ("number", re.compile(rf"(?<![\w.])(?<!\d,)(?P<num>{_NUM})(?![\w%])")),
+    # A grouped figure glued to a letter: PDF fonts often draw "₹" as "I" or "`" ("I3,50,000").
+    ("number", re.compile(r"(?<=[A-Za-z`])(?P<num>\d{1,3}(?:,\d{2,3})+(?:\.\d+)?)(?![\w%])")),
 ]
 
 
@@ -76,6 +79,9 @@ def extract_numeric_facts(text: str, date_order: str = "DMY") -> list[NumericFac
     """All numeric facts, most specific interpretation first; spans never overlap."""
     taken: list[tuple[int, int]] = []
     facts: list[NumericFact] = []
+    # Scans set figures off with hyphens ("a minimum period of -7- days"); blank them out
+    # without moving any offset, so "7 days" is read as a duration.
+    text = re.sub(r"(?<![\w-])-(\d+)-(?=\s)", lambda m: f" {m.group(1)} ", text)
 
     def free(start: int, end: int) -> bool:
         return all(end <= s or start >= e for s, e in taken)

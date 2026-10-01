@@ -33,6 +33,16 @@ MIN_SUPPORT = 0.35
 # Claims are single sentences by contract; a claim much longer than any source
 # sentence is padding and is judged on support alone rather than trusted.
 _EVIDENCE_REF = re.compile(r"\b[EGD]\d{1,2}\b")
+# "The document does not provide the repo rate": a statement about what the evidence lacks,
+# not a fact from it. It is reported once as a note instead of cited to every passage.
+_ABSENCE = re.compile(
+    r"\b(?:document|documents|evidence|policy|policies|text|source|sources|records?)\s+(?:does|do|did)\s*n[o']t\s+"
+    r"(?:provide|mention|specify|state|contain|include|cover|say|address|give|list|define)"
+    r"|\bnot\s+(?:provided|mentioned|specified|stated|available|covered|included|addressed|defined)\s+in\s+the\b"
+    r"|\bno\s+(?:information|mention|details?)\s+(?:is\s+|are\s+)?(?:provided|given|available)\b",
+    re.IGNORECASE,
+)
+ABSENCE_PROBLEM = "says what the documents do not contain"
 # Evidence ids the model appended as citation marks ("... frozen (E1, E2).", "... frozen. [E3]"):
 # the citation is already in evidence_ids, so the marks are dropped rather than the claim.
 _ID = r"[EGD]\d{1,2}"
@@ -61,6 +71,9 @@ _FRAMING = frozenset(
 TERM_PREFIX = 5
 # Characters either side of a figure that count as "beside" it: about one table row.
 NUMBER_WINDOW = 200
+# A subject term beside at most this share of the evidence's figures identifies a row;
+# one beside more of them is a column heading.
+SPECIFIC_SHARE = 0.5
 # A claim this close to one source sentence is a restatement, so its negation must match.
 RESTATEMENT_OVERLAP = 0.7
 _TERM_WORD = re.compile(r"[a-z0-9]+(?:\.[0-9]+)?")
@@ -79,8 +92,9 @@ class TermIndex:
     """Stemmed words of a text, for asking whether it mentions a term."""
 
     def __init__(self, text: str) -> None:
-        # "FIU- IND" (a line broken at the hyphen) is the word "FIU-IND".
-        words = _TERM_WORD.findall(re.sub(r"(?<=\w)-\s+(?=\w)", "-", text.lower()))
+        # "FIU- IND" (a line broken at the hyphen) is the word "FIU-IND"; "75%" says "percent".
+        text = re.sub(r"(?<=\w)-\s+(?=\w)", "-", text.lower()).replace("%", " percent ")
+        words = _TERM_WORD.findall(text)
         self.counts: dict[str, int] = {}
         for word in words:
             reduced = stem(word)
@@ -111,6 +125,9 @@ class EvidenceText:
     id: str
     text: str  # evidence text including expanded context
     allowed_numbers: set[tuple[str, str]] = field(default_factory=set)  # provenance: section no., version, pages
+    # The policy name, document title and section heading: a passage is about its policy even
+    # where it does not repeat the name ("This policy is applicable to all employees").
+    label: str = ""
 
 
 @dataclass
@@ -185,20 +202,27 @@ def _window(text: str, start: int, end: int) -> str:
 
 
 def _unbound_numbers(text: str, cited_text: str, subjects: list[str], skip: set[tuple[str, str]]) -> list[str]:
-    """Figures in the claim that the evidence never states beside the claim's subject."""
-    index = TermIndex(cited_text)
-    present = [t for t in subjects if index.mentions(t)]
-    if not present:
+    """Figures in the claim that the evidence never states beside the claim's subject.
+
+    "Beside the subject" means within the same table row or sentence as one of the claim's
+    specific terms: those found near few of the evidence's figures (the row's subject, "MAP/SIR
+    Reports", "Xpress Credit"), not those near most of them (a column heading repeated on every
+    row, "Proposed retention period"). A figure taken from another row is then caught.
+    """
+    present = [t for t in subjects if TermIndex(cited_text).mentions(t)]
+    figures = [o for o in extract_numeric_facts(cited_text) if o.kind != "number"]
+    if not present or not figures:
         return []
-    rarest = min(index.count(t) for t in present)
-    anchors = [t for t in present if index.count(t) == rarest]
-    occurrences = extract_numeric_facts(cited_text)
+    windows = [TermIndex(_window(cited_text, o.start, o.end)) for o in figures]
+    specific = [t for t in present if sum(w.mentions(t) for w in windows) <= len(windows) * SPECIFIC_SHARE]
+    if not specific:
+        return []  # every subject term sits beside most figures: nothing to tell rows apart by
     unbound = []
     for fact in extract_numeric_facts(text):
         if fact.kind == "number" or fact.key in skip:
             continue  # bare numbers are section/clause references; provenance numbers are metadata
-        windows = [_window(cited_text, o.start, o.end) for o in occurrences if o.value == fact.value]
-        if windows and not any(TermIndex(w).mentions(t) for w in windows for t in anchors):
+        near = [w for o, w in zip(figures, windows, strict=True) if o.value == fact.value]
+        if near and not any(w.mentions(t) for w in near for t in specific):
             unbound.append(fact.raw)
     return unbound
 
@@ -213,6 +237,11 @@ def validate_claims(
         cited = [e for e in dict.fromkeys(raw.get("evidence_ids") or []) if isinstance(e, str)]
         result = ClaimResult(text=text, evidence_ids=[], valid=True)
         if not text:
+            continue
+        if _ABSENCE.search(text):
+            result.valid = False
+            result.problems.append(ABSENCE_PROBLEM)
+            results.append(result)
             continue
 
         known = [e for e in cited if e in evidence]
@@ -249,14 +278,15 @@ def validate_claims(
 
         claim_words = _content_words(text)
         if claim_words:
-            support = len(claim_words & _content_words(cited_text)) / len(claim_words)
+            labels = " ".join(evidence[e].label for e in known)
+            support = len(claim_words & _content_words(f"{cited_text}\n{labels}")) / len(claim_words)
             if support < MIN_SUPPORT:
                 result.valid = False
                 result.problems.append(f"weak support ({support:.0%} of terms found in evidence)")
 
         claim_index = TermIndex(text)
         named = [t for t in subjects or [] if _is_subject(t) and claim_index.mentions(t)]
-        evidence_index = TermIndex(cited_text)
+        evidence_index = TermIndex(cited_text + "\n" + "\n".join(evidence[e].label for e in known))
         if absent := [t for t in named if not evidence_index.mentions(t)]:
             result.valid = False
             result.problems.append(f"the cited evidence does not mention {', '.join(absent)}")

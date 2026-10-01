@@ -40,3 +40,17 @@ def test_numeric_changes_pairs_by_kind():
     assert [a["value"] for a in changes["added"]] == ["0.5%"]
     assert changes["removed"] == []
     assert "LTV shall not exceed 70%" in changes["changed"][0]["new_context"]
+
+
+def test_grouped_figures_are_read_whole():
+    from app.modules.citations.numerics import extract_numeric_facts
+
+    values = [f.value for f in extract_numeric_facts("requesting I4,00,000 for up to I3,50,000 and Rs. 75,000")]
+    assert "400000" in values and "350000" in values and "0" not in values and "50000" not in values
+
+
+def test_a_figure_set_off_with_hyphens_in_a_scan_keeps_its_unit():
+    from app.modules.citations.numerics import extract_numeric_facts
+
+    facts = extract_numeric_facts("a minimum period of -7- days and maximum period of 10 Years")
+    assert [(f.kind, f.value) for f in facts] == [("duration", "7 day"), ("duration", "10 year")]

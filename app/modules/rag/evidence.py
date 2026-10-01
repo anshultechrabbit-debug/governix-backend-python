@@ -64,7 +64,11 @@ QUESTION_TERMS = frozenset(
     # Reasoning about a quoted rule: "if the following conditions are met, what follows",
     # "which statement is inconsistent with the source".
     "following follows follow met statement statements inconsistent consistent incorrect correct true false "
-    "implies imply implied source quoted scenario conclusion conclude".split()
+    "implies imply implied source quoted scenario conclusion conclude "
+    "make makes made automatically basically actually giving given "
+    "told tell telling yesterday today tomorrow might maybe perhaps sure much many could would "
+    "some so am think thought heard said "
+    "each every list category categories type types kind kinds interval intervals topic topics cover covers covered".split()
 )
 # Questions about the document itself: its title, publisher, date, legal basis.
 _DOCUMENT_QUESTION = re.compile(

@@ -151,3 +151,44 @@ def test_a_negation_taken_from_another_cited_sentence_is_not_a_reversal():
         "evidence_ids": ["E1"],
     }], evidence)
     assert result.valid, result.problems
+
+
+def test_a_figure_on_its_own_table_row_passes_without_the_column_heading_beside_it():
+    evidence = {"E1": EvidenceText("E1", (
+        "7. PROCESSING FEES:\nProduct | Processing Fee\n"
+        "SBI Saral | 2.02% - 3.03% of the Loan Amount\n"
+        "Xpress Credit | 1.01% of the Loan Amount\n"
+        "SBI Career Loan | 0.51% of the Loan Amount"
+    ))}
+    subjects = ["processing", "fee", "xpress", "credit"]
+    ok = validate_claims([{"text": "The processing fee for Xpress Credit is 1.01% of the loan amount.", "evidence_ids": ["E1"]}], evidence, subjects)
+    wrong = validate_claims([{"text": "The processing fee for Xpress Credit is 0.51% of the loan amount.", "evidence_ids": ["E1"]}], evidence, subjects)
+    assert ok[0].valid, ok[0].problems
+    assert not wrong[0].valid
+
+
+def test_the_policy_name_counts_as_mentioning_its_subject():
+    evidence = {"E1": EvidenceText("E1", "This policy is applicable to all employees of the Bank.",
+                                   label="Equal Employment Opportunity Policy")}
+    [result] = validate_claims([{"text": "The Equal Employment Opportunity Policy applies to all employees of the Bank.",
+                                 "evidence_ids": ["E1"]}], evidence, ["equal", "employment", "opportunity"])
+    assert result.valid, result.problems
+
+
+def test_a_figure_glued_to_a_rupee_glyph_is_found_in_the_evidence():
+    evidence = {"E1": EvidenceText("E1", "A customer requesting I4,00,000 against 28 grams of gold may be eligible for up to I3,50,000.")}
+    [result] = validate_claims([{"text": "The customer may be eligible for up to Rs 3,50,000.", "evidence_ids": ["E1"]}], evidence)
+    assert result.valid, result.problems
+
+
+def test_a_statement_about_what_the_documents_lack_is_not_a_claim():
+    from app.modules.rag.validation import ABSENCE_PROBLEM
+
+    [result] = validate_claims([{"text": "The document does not provide the current RBI repo rate.", "evidence_ids": ["E2"]}], EVIDENCE)
+    assert not result.valid and result.problems == [ABSENCE_PROBLEM]
+
+
+def test_a_percent_sign_answers_a_question_about_a_percentage():
+    from app.modules.rag.validation import TermIndex
+
+    assert TermIndex("The maximum LTV for gold loans is 75%.").mentions("percentage")
