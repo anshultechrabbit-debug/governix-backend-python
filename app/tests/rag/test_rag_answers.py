@@ -21,9 +21,11 @@ class ScriptedLLM(LLMProvider):
         self.claims = claims or []
         self.fail = fail
         self.calls = 0
+        self.systems: list[str] = []
 
     def generate_json(self, system, user, schema, *, context=None):
         self.calls += 1
+        self.systems.append(system)
         if self.fail:
             raise LLMUnavailableError("down")
         return LLMResult(
@@ -110,8 +112,10 @@ def test_unanswerable_question_returns_no_answer_without_calling_the_llm(admin, 
     assert answer["status"] == "no_answer"
     assert answer["no_answer"]["reason"] in ("KEY_TERMS_NOT_FOUND", "LOW_RELEVANCE", "NO_RELEVANT_DOCUMENTS")
     assert "gold" in answer["no_answer"]["missing_terms"] or answer["no_answer"]["reason"] != "KEY_TERMS_NOT_FOUND"
-    assert answer["no_answer"]["message"].startswith("I couldn't find sufficient supporting information")
-    assert scripted.calls == 0
+    assert answer["no_answer"]["message"].startswith("None of the documents you can access answer this")
+    # At most a rewording of the question is asked for; no answer is ever generated.
+    from app.modules.rag.prompts import SYSTEM_PROMPT
+    assert SYSTEM_PROMPT not in scripted.systems
 
 
 def _use(llm):
@@ -136,7 +140,8 @@ def test_invalid_claims_are_dropped_and_reported(admin, home_loan):
     assert answer["status"] == "answered"
     assert [c["text"] for c in answer["claims"]] == ["For loans above Rs. 75 lakh the LTV shall not exceed 70%."]
     assert "90%" not in answer["answer"] and "waived" not in answer["answer"]
-    assert len([w for w in answer["warnings"] if w.startswith("Removed")]) == 2
+    assert len([c for c in answer["plan"]["checks"] if c.startswith("Removed")]) == 2
+    assert not any(w.startswith("Removed") for w in answer["warnings"])
 
 
 def test_llm_outage_degrades_to_no_answer(admin, home_loan):
@@ -168,7 +173,7 @@ def test_amending_circular_is_surfaced_as_a_conflict(client, app, tenant, admin,
     assert "AMENDED" in kinds
     titles = {s["policy_name"] for s in answer["sources"]}
     assert {"Home Loan Credit Policy", "Circular CRD/2026/45"} <= titles
-    assert answer["warnings"][0].startswith("Sources disagree")
+    assert answer["warnings"][0].startswith("Your sources disagree")
 
 
 def test_answers_are_cached_per_scope(client, tenant, admin, home_loan):
@@ -240,7 +245,7 @@ def test_stream_never_shows_a_claim_that_fails_validation(admin, home_loan):
     events = stream(admin, "What is the LTV for loans above 75 lakh?")
     streamed = [data["text"] for kind, data in events if kind == "claim"]
     assert streamed == ["For loans above Rs. 75 lakh the LTV shall not exceed 70%."]
-    assert events[-1][0] == "done" and len([w for w in events[-1][1]["warnings"] if w.startswith("Removed")]) == 2
+    assert events[-1][0] == "done" and len([c for c in events[-1][1]["plan"]["checks"] if c.startswith("Removed")]) == 2
 
 
 def test_stream_reports_no_answer_through_done(admin, home_loan):
@@ -271,3 +276,20 @@ def test_stream_never_shows_claims_that_do_not_answer_the_question(admin, home_l
     events = stream(admin, "What is the LTV for loans above 75 lakh?")
     assert [kind for kind, _ in events if kind == "claim"] == []
     assert events[-1][1]["status"] == "no_answer"
+
+
+@pytest.mark.parametrize("question, reason", [
+    ("hi", "GREETING"),
+    ("Hello Governix!", "GREETING"),
+    ("thanks", "GREETING"),
+    ("Can you please explain it to me in short?", "NO_SUBJECT"),
+])
+def test_greetings_and_questions_without_a_subject_are_never_answered_from_documents(admin, home_loan, question, reason):
+    scripted = ScriptedLLM([{"text": "For loans above Rs. 75 lakh the LTV shall not exceed 70%.", "evidence_ids": ["E1"]}])
+    _use(scripted)
+    answer = ask(admin, question)
+    assert answer["status"] == "no_answer" and answer["no_answer"]["reason"] == reason
+    assert answer["sources"] == [] and answer["claims"] == []
+    from app.modules.rag.prompts import SYSTEM_PROMPT
+    assert SYSTEM_PROMPT not in scripted.systems
+    assert answer["no_answer"]["suggestions"] == []

@@ -49,3 +49,18 @@ def test_a_hyphenated_term_matches_its_parts_even_when_the_line_broke_at_the_hyp
     coverage, missing = coverage_of("How is delay in reporting to FIU-IND treated?",
                                     ["Delay in reporting to the Director, FIU- IND is treated as a separate violation."])
     assert "fiu-ind" not in missing
+
+
+def test_greetings_and_answer_style_are_not_search_terms():
+    question = "Hello i want to know about the kyc policy can you please explain me in short i just want a short script"
+    assert key_terms(question) == ["kyc"]
+
+
+@pytest.mark.parametrize("text, greeting", [
+    ("hi", True), ("Hello there!", True), ("thank you so much", True), ("good morning team", True),
+    ("hi what is the kyc policy", False), ("What is the retention period?", False),
+])
+def test_greetings_are_recognised(text, greeting):
+    from app.modules.rag.service import is_greeting
+
+    assert is_greeting(text) is greeting

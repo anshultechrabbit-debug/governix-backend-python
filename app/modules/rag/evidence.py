@@ -53,7 +53,12 @@ QUESTION_TERMS = frozenset(
     "section sections part mentioned given provide provided provides list listed name named "
     "suggest suggested suggests suggestion propose proposed identify identifies identified "
     "consider considered considers main key important overall summary summarise summarize "
-    "agree agreed disagree did does stand stands mean means meant".split()
+    "agree agreed disagree did does stand stands mean means meant "
+    # Greetings, politeness and how the answer should look ("in short", "a short script"):
+    # they say how to answer, not what about, and no document is expected to contain them.
+    "hello hi hey dear please kindly thanks thank want wanted wants need know tell explain explanation "
+    "short shortly brief briefly simple simply quick quickly script overview whole entire just really "
+    "help understand lines words points bullet bullets".split()
 )
 # Questions about the document itself: its title, publisher, date, legal basis.
 _DOCUMENT_QUESTION = re.compile(
@@ -405,10 +410,18 @@ def detect_conflicts(items: list[EvidenceItem]) -> list[dict]:
     return conflicts
 
 
+# Units, comparisons and connecting words: two figures that share only these ("Rs 100 crore"
+# and "less than Rs 1 crore") are not about the same thing.
+_NOT_SUBJECT = frozenset(
+    "shall the and for not exceed exceeding with from above below than per this that which will may must "
+    "are was were has have been any all such other more less equal equals upto up to over under minimum maximum "
+    "crore crores lakh lakhs lac lacs rupees rupee inr thousand million billion amount amounts rate rates "
+    "percent per cent year years month months day days period value total".split()
+)
+
+
 def _subject_words(sentence: str) -> set[str]:
-    return {w for w in re.findall(r"[a-z]{3,}", sentence.lower())} - GENERIC_TERMS - {
-        "shall", "the", "and", "for", "not", "exceed", "with", "from", "above", "below", "than", "per",
-    }
+    return {w for w in re.findall(r"[a-z]{3,}", sentence.lower())} - GENERIC_TERMS - _NOT_SUBJECT
 
 
 def default_filters(scope: VersionScope, policy_ids: list[uuid.UUID]) -> SearchFilters:

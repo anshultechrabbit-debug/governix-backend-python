@@ -1,5 +1,5 @@
 import uuid
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -22,6 +22,8 @@ class AskRequest(BaseModel):
     version_ids: list[uuid.UUID] = Field(default_factory=list, max_length=2)
     policy_ids: list[uuid.UUID] = Field(default_factory=list, max_length=20)
     category_ids: list[uuid.UUID] = Field(default_factory=list, max_length=20)
+    # The saved conversation to add this question to; a new one is started when absent.
+    conversation_id: uuid.UUID | None = None
 
 
 class Source(BaseModel):
@@ -78,3 +80,29 @@ class AnswerResponse(BaseModel):
     usage: dict[str, int]
     timings_ms: dict[str, float]
     cache_hit: bool = False
+    # The saved conversation this answer was added to.
+    conversation_id: uuid.UUID | None = None
+
+
+class ConversationRead(BaseModel):
+    id: uuid.UUID
+    title: str
+    created_at: datetime
+    last_message_at: datetime
+    message_count: int = 0
+
+
+class ConversationMessageRead(BaseModel):
+    id: uuid.UUID
+    question: str
+    options: dict[str, Any]
+    answer: AnswerResponse
+    created_at: datetime
+
+
+class ConversationDetail(ConversationRead):
+    messages: list[ConversationMessageRead]
+
+
+class ConversationUpdate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)

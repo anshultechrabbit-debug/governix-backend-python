@@ -355,12 +355,19 @@ export interface Answer {
   conflicts: { type: string; description: string; evidence_ids: string[]; citations?: number[]; resolution_hint?: string }[];
   warnings: string[];
   no_answer: { reason: string; message: string; suggestions: string[]; missing_terms: string[] } | null;
-  plan: { query_class: string; mode: string; as_of: string | null; version_labels: string[]; explanation: string };
+  plan: {
+    query_class: string; mode: string; as_of: string | null; version_labels: string[]; explanation: string;
+    /** The question as it was searched, when it was restated (follow-up, translation, clarified). */
+    rewritten_question?: string; rewrite_reason?: "follow_up" | "translation" | "clarified";
+    fallback?: { used: boolean; depth: number };
+  };
   evidence_score: number;
   model: string | null;
   usage: Record<string, number>;
   timings_ms: Record<string, number>;
   cache_hit: boolean;
+  /** The saved conversation this answer was added to. */
+  conversation_id?: string | null;
 }
 
 export interface Branch { id: UUID; organization_id: UUID; name: string; code: string; is_active: boolean; created_at: string }
@@ -616,4 +623,24 @@ export interface DuplicateResult {
   duplicate: boolean;
   restricted: boolean;
   existing: { document_id: UUID; title: string | null; original_filename: string; uploaded_at: string; policy_id: UUID | null } | null;
+}
+
+export interface Conversation {
+  id: UUID;
+  title: string;
+  created_at: string;
+  last_message_at: string;
+  message_count: number;
+}
+
+export interface ConversationMessage {
+  id: UUID;
+  question: string;
+  options: Record<string, unknown>;
+  answer: Answer;
+  created_at: string;
+}
+
+export interface ConversationDetail extends Conversation {
+  messages: ConversationMessage[];
 }

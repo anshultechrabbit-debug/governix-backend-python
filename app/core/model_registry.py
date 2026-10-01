@@ -18,6 +18,7 @@ def import_all_models() -> None:
     import app.modules.notifications.model  # noqa: F401
     import app.modules.organizations.model  # noqa: F401
     import app.modules.policies.model  # noqa: F401
+    import app.modules.rag.model  # noqa: F401
     import app.modules.search.model  # noqa: F401
     import app.modules.tickets.model  # noqa: F401
     import app.modules.uploads.model  # noqa: F401

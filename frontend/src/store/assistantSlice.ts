@@ -1,6 +1,6 @@
 import { createAsyncThunk, createSlice, type PayloadAction } from "@reduxjs/toolkit";
 import { api, ApiError } from "../api/client";
-import type { Answer, Source } from "../api/types";
+import type { Answer, ConversationDetail, Source } from "../api/types";
 
 export type AnswerMode = "auto" | "current" | "historical" | "version" | "compare";
 
@@ -42,9 +42,19 @@ interface StreamEvent {
 interface AssistantState {
   turns: Turn[];
   options: AskOptions;
+  /** The saved conversation being continued; null for a new chat (the first answer creates it). */
+  conversationId: string | null;
+  /** A saved conversation being opened. */
+  loading: string | null;
 }
 
-const initialState: AssistantState = { turns: [], options: { mode: "auto" } };
+const initialState: AssistantState = { turns: [], options: { mode: "auto" }, conversationId: null, loading: null };
+
+/** Reopen a saved conversation: its turns come back exactly as they were answered. */
+export const openConversation = createAsyncThunk(
+  "assistant/openConversation",
+  (id: string) => api.get<ConversationDetail>(`/ai/conversations/${id}`),
+);
 
 // Earlier turns sent with a question so follow-ups ("what about that
 // scheme?") can be resolved. The server uses them only to restate the
@@ -59,7 +69,7 @@ export const ask = createAsyncThunk(
       .filter((turn) => turn.id !== id && turn.status === "done")
       .slice(-HISTORY_TURNS)
       .map((turn) => ({ question: turn.question, answer: turn.answer?.answer ?? null }));
-    const body = { question, history, ...options };
+    const body = { question, history, conversation_id: assistant.conversationId, ...options };
     // Streamed: progress and each validated claim appear as soon as they exist;
     // the final "done" event is the same answer /ai/ask would return.
     let answer: Answer | null = null;
@@ -92,6 +102,7 @@ const assistantSlice = createSlice({
     },
     clearConversation(state) {
       state.turns = [];
+      state.conversationId = null;
     },
     streamEvent(state, action: PayloadAction<StreamEvent>) {
       const turn = state.turns.find((t) => t.id === action.payload.id);
@@ -116,6 +127,26 @@ const assistantSlice = createSlice({
       .addCase(ask.fulfilled, (state, action) => {
         const turn = state.turns.find((t) => t.id === action.meta.arg.id);
         if (turn) Object.assign(turn, { status: "done", answer: action.payload, streamedClaims: undefined, streamedSources: undefined });
+        // Only adopt the id while this chat is still on screen (not after "New chat" mid-answer).
+        if (turn && action.payload.conversation_id) state.conversationId = action.payload.conversation_id;
+      })
+      .addCase(openConversation.pending, (state, action) => {
+        state.loading = action.meta.arg;
+      })
+      .addCase(openConversation.fulfilled, (state, action) => {
+        if (state.loading !== action.meta.arg) return;  // another chat was opened meanwhile
+        state.loading = null;
+        state.conversationId = action.payload.id;
+        state.turns = action.payload.messages.map((message) => ({
+          id: message.id,
+          question: message.question,
+          options: { mode: "auto", ...(message.options as Partial<AskOptions>) },
+          status: "done",
+          answer: message.answer,
+        }));
+      })
+      .addCase(openConversation.rejected, (state, action) => {
+        if (state.loading === action.meta.arg) state.loading = null;
       })
       .addCase(ask.rejected, (state, action) => {
         const turn = state.turns.find((t) => t.id === action.meta.arg.id);

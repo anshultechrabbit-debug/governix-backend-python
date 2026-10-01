@@ -55,7 +55,7 @@ def test_previous_version_answers_what_the_current_one_does_not_cover(admin, hom
     assert {s["version_label"] for s in answer["sources"]} == {"1"}
     assert all(s["previous_version"] for s in answer["sources"])
     assert answer["plan"]["fallback"]["used"] is True and answer["plan"]["fallback"]["depth"] == 1
-    assert answer["warnings"][0].startswith("The version currently in force does not cover this")
+    assert answer["warnings"][0].startswith("The version in force today does not cover this")
     assert "Home Loan Credit Policy v1" in answer["warnings"][0]
 
 

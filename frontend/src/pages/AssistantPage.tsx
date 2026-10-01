@@ -1,7 +1,9 @@
-import { Bot, ChevronDown, FileWarning, History, RotateCcw, Send, Sparkles } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
+import { ArrowDown, Bot, ChevronDown, FileWarning, History, MessagesSquare, Plus, Send, Sparkles, X } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
+import { ChatHistory } from "../components/ChatHistory";
 import { useCategories } from "../components/domain";
-import { Badge, Button, Card, EmptyState, ErrorState, Field, Select, Tabs, Textarea } from "../components/ui";
+import { Button, Card, EmptyState, ErrorState, Field, Select, SkeletonRows, Tabs, Textarea } from "../components/ui";
 import { groupSources, SourceGroupCard } from "../components/domain";
 import { PassageSearch } from "../components/PassageSearch";
 import { cn, formatDate } from "../lib/format";
@@ -23,7 +25,14 @@ const MODE_LABELS: Record<AnswerMode, string> = {
 export function AssistantPage() {
   const dispatch = useAppDispatch();
   const { me } = useAuth();
-  const { turns, options } = useAppSelector((state) => state.assistant);
+  const { turns, options, loading } = useAppSelector((state) => state.assistant);
+  const queryClient = useQueryClient();
+  const [historyOpen, setHistoryOpen] = useState(false);
+  // A finished answer is saved to the chat history: show it there.
+  const answered = turns.filter((turn) => turn.status === "done").length;
+  useEffect(() => {
+    if (answered) void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+  }, [answered, queryClient]);
   const categories = useCategories();
   const [view, setView] = useState<View>("ask");
   const [question, setQuestion] = useState("");
@@ -32,10 +41,22 @@ export function AssistantPage() {
   const endRef = useRef<HTMLDivElement>(null);
   const pending = turns.some((turn) => turn.status === "pending");
 
-  const streamed = turns.reduce((total, turn) => total + (turn.streamedClaims?.length ?? 0), 0);
+  // Scroll once, when a question is asked or a chat is opened: the newest question at the
+  // top, its answer appearing below it. The page then stays where the reader puts it.
+  const lastId = turns[turns.length - 1]?.id;
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [turns.length, pending, streamed]);
+    if (lastId) document.getElementById(`turn-${lastId}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [lastId]);
+
+  // Offer a way down when newer content is out of view, instead of pulling the reader there.
+  const [atEnd, setAtEnd] = useState(true);
+  useEffect(() => {
+    const end = endRef.current;
+    if (!end) return;
+    const observer = new IntersectionObserver(([entry]) => setAtEnd(entry.isIntersecting), { rootMargin: "0px 0px -160px 0px" });
+    observer.observe(end);
+    return () => observer.disconnect();
+  }, [view, loading]);
 
   function submit(event: FormEvent) {
     event.preventDefault();
@@ -58,10 +79,30 @@ export function AssistantPage() {
       : "Governix answers from your organization's policies, latest version first.";
 
   return (
-    <div className="mx-auto flex max-w-5xl flex-col">
-      <div className="mb-5">
-        <h1 className="flex items-center gap-2 text-xl font-semibold tracking-tight"><Bot className="size-5 text-ai-600" />AI Assistant</h1>
-        <p className="mt-1 text-sm text-muted">{scope} Every supported answer is cited.</p>
+    <div className="mx-auto grid max-w-7xl gap-6 lg:grid-cols-[16rem_minmax(0,1fr)]">
+      <aside className="sticky top-4 hidden h-[calc(100vh-2rem)] overflow-hidden rounded-lg border border-line bg-surface lg:block">
+        <ChatHistory />
+      </aside>
+      {historyOpen && (
+        <div className="fixed inset-0 z-40 lg:hidden" role="dialog" aria-modal="true" aria-label="Chat history">
+          <div className="absolute inset-0 bg-ink/40" onClick={() => setHistoryOpen(false)} />
+          <div className="absolute inset-y-0 left-0 flex w-72 max-w-[85vw] flex-col bg-surface shadow-xl">
+            <div className="flex items-center justify-between border-b border-line px-3 py-2">
+              <p className="text-sm font-semibold">Chat history</p>
+              <button onClick={() => setHistoryOpen(false)} className="rounded p-1 text-muted hover:bg-subtle" aria-label="Close"><X className="size-4" /></button>
+            </div>
+            <div className="min-h-0 flex-1"><ChatHistory onPicked={() => setHistoryOpen(false)} /></div>
+          </div>
+        </div>
+      )}
+
+    <div className="flex min-w-0 flex-col">
+      <div className="mb-5 flex items-start justify-between gap-3">
+        <div>
+          <h1 className="flex items-center gap-2 text-xl font-semibold tracking-tight"><Bot className="size-5 text-ai-600" />AI Assistant</h1>
+          <p className="mt-1 text-sm text-muted">{scope} Every supported answer is cited.</p>
+        </div>
+        <Button variant="secondary" size="sm" className="lg:hidden" onClick={() => setHistoryOpen(true)}><MessagesSquare className="size-4" />History</Button>
       </div>
 
       <Tabs<View> value={view} onChange={setView} tabs={[
@@ -76,16 +117,29 @@ export function AssistantPage() {
       ) : (
         <>
           <section className="min-h-[22rem] space-y-5 pt-5">
-            {!turns.length && (
+            {loading && <Card><SkeletonRows rows={4} /></Card>}
+            {!loading && !turns.length && (
               <EmptyState
                 icon={<Sparkles className="size-6 text-ai-600" />}
                 title="Ask about your policies and documents"
                 description="Governix searches only the information you are allowed to access, validates the evidence, then cites every supported answer. If nothing supports an answer, it says so instead of guessing."
               />
             )}
-            {turns.map((turn) => <Turn key={turn.id} turn={turn} />)}
+            {!loading && turns.map((turn) => <Turn key={turn.id} turn={turn} />)}
             <div ref={endRef} />
           </section>
+
+          {!atEnd && turns.length > 0 && (
+            <div className="pointer-events-none sticky bottom-44 z-10 flex justify-center">
+              <button
+                type="button"
+                onClick={() => endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" })}
+                className="pointer-events-auto inline-flex items-center gap-1.5 rounded-full border border-line bg-surface px-3 py-1.5 text-xs font-medium text-ink-soft shadow-md hover:text-brand-700"
+              >
+                <ArrowDown className="size-3.5" />{pending ? "Answer in progress" : "Jump to latest"}
+              </button>
+            </div>
+          )}
 
           <Card className="sticky bottom-4 mt-5 overflow-hidden shadow-lg">
             <form onSubmit={submit} className="p-3">
@@ -122,7 +176,7 @@ export function AssistantPage() {
                   ? <span className="text-xs text-warn-600" role="alert">Type your question in words, e.g. the policy or topic and what you want to know.</span>
                   : <span className="text-xs text-muted">{question.length}/2000 · Enter to ask, Shift + Enter for a new line</span>}
                 <div className="flex gap-2">
-                  {turns.length > 0 && <Button type="button" variant="secondary" size="sm" onClick={() => dispatch(clearConversation())}><RotateCcw className="size-3.5" />Clear</Button>}
+                  {turns.length > 0 && <Button type="button" variant="secondary" size="sm" disabled={pending} onClick={() => dispatch(clearConversation())}><Plus className="size-3.5" />New chat</Button>}
                   <Button type="submit" loading={pending} disabled={!question.trim()}><Send className="size-4" />Ask</Button>
                 </div>
               </div>
@@ -131,13 +185,14 @@ export function AssistantPage() {
         </>
       )}
     </div>
+    </div>
   );
 }
 
 function Turn({ turn }: { turn: Turn }) {
   const answer = turn.answer;
   return (
-    <div className="space-y-3">
+    <div id={`turn-${turn.id}`} className="scroll-mt-4 space-y-3">
       <div className="ml-auto w-fit max-w-[80%] whitespace-pre-wrap break-words rounded-lg bg-brand-600 px-4 py-3 text-sm text-white">{turn.question}</div>
       {turn.status === "pending" && <Streaming turn={turn} />}
       {turn.status === "error" && <ErrorState error={new Error(turn.error)} />}
@@ -188,8 +243,10 @@ function Answered({ answer }: { answer: Answer }) {
     .map((source) => `${source.policy_name ?? source.document_title} v${source.version_label}`))];
   // The banner already says this; the matching backend warning would repeat it.
   const warnings = older.length
-    ? answer.warnings.filter((warning) => !warning.startsWith("The version currently in force does not cover this"))
+    ? answer.warnings.filter((warning) => !warning.startsWith("The version in force today does not cover this"))
     : answer.warnings;
+  const understood = answer.plan.rewritten_question && answer.plan.rewritten_question !== answer.question
+    ? answer.plan.rewritten_question : null;
   const disagree = answer.conflicts.some((conflict) => conflict.citations?.length);
   // The short answer: the verified plain-words summary, else the first points as written.
   const lead = answer.summary ? null : answer.claims.slice(0, SHORT_CLAIMS);
@@ -221,6 +278,11 @@ function Answered({ answer }: { answer: Answer }) {
           ? <p>{answer.summary}</p>
           : lead?.map((claim, index) => <p key={`${claim.text}-${index}`}>{claim.text} {citations(claim.citations)}</p>)}
       </div>
+      {understood && (
+        <p className="mt-2 text-xs text-muted">
+          {answer.plan.rewrite_reason === "translation" ? "Translated and answered as" : "Understood as"}: <span className="italic">“{understood}”</span>
+        </p>
+      )}
       {disagree && (
         <p className="mt-2 flex items-center gap-1.5 text-xs font-medium text-warn-600"><FileWarning className="size-3.5" />Sources disagree on part of this. See details.</p>
       )}
@@ -267,9 +329,26 @@ function Answered({ answer }: { answer: Answer }) {
               </div>
             </div>
           )}
-          {!!warnings.length && <div className="rounded-md border border-warn-600/20 bg-warn-50 p-3 text-xs text-warn-600">{warnings.map((warning) => <p key={warning}>{warning}</p>)}</div>}
-          {!!answer.conflicts.length && <div className="rounded-md border border-warn-600/30 bg-warn-50 p-3"><p className="flex items-center gap-1.5 text-sm font-medium text-warn-600"><FileWarning className="size-4" />Potential source conflict</p>{answer.conflicts.map((conflict, index) => <p key={index} className="mt-1 text-xs text-ink-soft">{conflict.description} {conflict.citations && citations(conflict.citations)}</p>)}</div>}
-          <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted"><span>{answer.plan.explanation}</span><span>Evidence score: {Math.round(answer.evidence_score * 100)}%</span>{answer.plan.as_of && <span>As of {formatDate(answer.plan.as_of)}</span>}{answer.cache_hit && <span>Cached result</span>}</div>
+          {!!warnings.length && (
+            <div className="rounded-md border border-warn-600/20 bg-warn-50 p-3 text-xs text-warn-600">
+              <p className="mb-1 font-semibold">Please note</p>
+              <ul className="list-disc space-y-0.5 pl-4">{warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>
+            </div>
+          )}
+          {!!answer.conflicts.length && (
+            <div className="rounded-md border border-warn-600/30 bg-warn-50 p-3">
+              <p className="flex items-center gap-1.5 text-sm font-medium text-warn-600"><FileWarning className="size-4" />Sources disagree</p>
+              <ul className="mt-1 space-y-1 text-xs text-ink-soft">
+                {answer.conflicts.map((conflict, index) => (
+                  <li key={index}>
+                    {conflict.description} {conflict.citations && citations(conflict.citations)}
+                    {conflict.resolution_hint && conflict.type === "AMENDED" && <span className="block text-muted">{conflict.resolution_hint}</span>}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          <p className="text-xs text-muted">{answerBasis(answer)}</p>
           <div>
             <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-muted">Verified sources</p>
             <div className="space-y-3">{groups.map((group) => <SourceGroupCard key={group.key} group={group} anchor={anchor} />)}</div>
@@ -280,10 +359,48 @@ function Answered({ answer }: { answer: Answer }) {
   );
 }
 
+/** Where the answer comes from, in plain words, and how closely the documents matched the question. */
+function answerBasis(answer: Answer) {
+  const plan = answer.plan;
+  const when = plan.as_of ? formatDate(plan.as_of) : null;
+  const basis = plan.fallback?.used
+    ? "Answered from an earlier version of the policy"
+    : plan.query_class === "historical" && when ? `Answered from the policies in force on ${when}`
+    : plan.query_class === "specific_version" ? "Answered from the version you asked about"
+    : plan.query_class === "comparison" ? "Answered by comparing the two versions"
+    : when ? `Answered from the policies in force today (${when})` : "Answered from your policies";
+  const match = answer.evidence_score >= 0.6 ? "strong" : answer.evidence_score >= 0.35 ? "good" : "partial";
+  return `${basis} · ${match} match with the documents`;
+}
+
 /** Points shown in the short answer when there is no plain-words summary. */
 const SHORT_CLAIMS = 2;
 
+/** Replies to a greeting or a question with no subject: not a failed search, a prompt to ask. */
+const CONVERSATIONAL = ["GREETING", "NO_SUBJECT"];
+
 function NoAnswer({ reason }: { reason: Answer["no_answer"] }) {
   if (!reason) return null;
-  return <div className="p-5"><p className="font-medium">No verified answer available</p><p className="mt-1 text-sm text-muted">{reason.message}</p>{reason.missing_terms.length > 0 && <p className="mt-2 text-xs text-muted">Terms not found: {reason.missing_terms.join(", ")}</p>}<div className="mt-4 flex flex-wrap gap-2">{reason.suggestions.map((suggestion) => <Badge key={suggestion} tone="neutral">{suggestion}</Badge>)}</div></div>;
+  if (CONVERSATIONAL.includes(reason.reason)) {
+    return (
+      <div className="p-5">
+        <p className="flex items-start gap-2 text-[15px] leading-7 text-ink"><Sparkles className="mt-1.5 size-4 shrink-0 text-ai-600" />{reason.message}</p>
+      </div>
+    );
+  }
+  return (
+    <div className="p-5">
+      <p className="font-medium text-ink">I couldn’t find this in your documents</p>
+      <p className="mt-1 text-sm text-ink-soft">{reason.message}</p>
+      {reason.missing_terms.length > 0 && (
+        <p className="mt-2 text-xs text-muted">Not mentioned in the documents you can access: <span className="font-medium text-ink-soft">{reason.missing_terms.join(", ")}</span></p>
+      )}
+      {!!reason.suggestions.length && (
+        <div className="mt-3">
+          <p className="text-xs font-medium text-muted">You could try:</p>
+          <ul className="mt-1 list-disc space-y-0.5 pl-4 text-xs text-ink-soft">{reason.suggestions.map((suggestion) => <li key={suggestion}>{suggestion}</li>)}</ul>
+        </div>
+      )}
+    </div>
+  );
 }

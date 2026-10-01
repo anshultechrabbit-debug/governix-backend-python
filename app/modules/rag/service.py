@@ -47,7 +47,7 @@ from app.modules.rag.prompts import (
     OUTPUT_SCHEMA, SUMMARY_CHECK_PROMPT, SUMMARY_CHECK_SCHEMA, SYSTEM_PROMPT, build_user_prompt, comparison_text,
 )
 from app.modules.rag.query_plan import QueryClass, QueryPlan, plan_query
-from app.modules.rag.query_rewrite import standalone_question
+from app.modules.rag.query_rewrite import Rewrite, clarified_question, standalone_question
 from app.modules.rag.schema import AnswerResponse, AskRequest, Claim, NoAnswer, Source
 from app.modules.rag.validation import EvidenceText, TermIndex, validate_claims
 from app.modules.search.model import Chunk
@@ -59,11 +59,11 @@ from app.modules.versions.timeline import compare_versions, effective_on
 logger = logging.getLogger(__name__)
 
 SUGGESTIONS = [
-    "Try another policy name or its policy number",
-    "Specify a date or version (e.g. 'as of March 2025' or 'v3')",
-    "Ask a more specific question",
+    "Use the policy's name or number",
+    "Add a date or version, for example “as of March 2025” or “v3”",
+    "Ask about one specific rule or topic",
 ]
-NO_ANSWER_MESSAGE = "I couldn't find sufficient supporting information in the available documents."
+NO_ANSWER_MESSAGE = "None of the documents you can access answer this, so I won't guess."
 # Bump when the answer-generation or validation contract changes so cached
 # answers (including cached no-answers) are recomputed under the new contract.
 #
@@ -79,7 +79,7 @@ NO_ANSWER_MESSAGE = "I couldn't find sufficient supporting information in the av
 #   v13    acronym fast-path answer added
 #   v14    cache key changed: raw history excluded; keyed on rewritten question
 #   v15    summary check merged into claim validation (no second LLM call)
-ANSWER_CACHE_VERSION = "v16"
+ANSWER_CACHE_VERSION = "v21"
 # No supported answer in the version in force: worth looking one version back.
 FALLBACK_REASONS = frozenset({
     "NO_RELEVANT_DOCUMENTS", "LOW_RELEVANCE", "KEY_TERMS_NOT_FOUND", "INSUFFICIENT_EVIDENCE",
@@ -137,6 +137,18 @@ def _without_file_names(question: str, named: list[NamedDocument]) -> str:
     return question
 
 
+_GREETING = re.compile(
+    r"^\W*(?:(?:hi+|hello+|hey+|hiya|namaste|greetings|good\s+(?:morning|afternoon|evening|day)|"
+    r"thanks?(?:\s+you)?|thank\s+you(?:\s+(?:so|very)\s+much)?|ty|ok(?:ay)?|cool|great|bye|goodbye|"
+    r"how\s+are\s+you|what'?s\s+up|there|governix|sir|madam|dear|all|team)\W*)+$",
+    re.IGNORECASE,
+)
+
+
+def is_greeting(question: str) -> bool:
+    return bool(_GREETING.match(question.strip()))
+
+
 def acronym_in_question(question: str) -> str | None:
     if match := _ACRONYM_QUESTION.search(question):
         return next(group for group in match.groups() if group).upper()
@@ -151,9 +163,10 @@ def has_words(text: str) -> bool:
 
 
 class _NoAnswer(Exception):
-    def __init__(self, reason: str, missing_terms: list[str] | None = None) -> None:
+    def __init__(self, reason: str, missing_terms: list[str] | None = None, suggestions: list[str] | None = None) -> None:
         self.reason = reason
         self.missing_terms = missing_terms or []
+        self.suggestions = suggestions
 
 
 @dataclass
@@ -222,6 +235,20 @@ class RAGService:
         response, retrieved = yield from self._run_pipeline(
             principal, prepared_request, plan, rewrite, named, timings, deadline, started
         )
+        if self._worth_clarifying(response, deadline) and (clarified := self._clarify(prepared_request.question, timings)):
+            # The words as typed found nothing ("pokucy", "hello ... in short"): search once
+            # more for the question as the person meant it. Nothing was shown yet.
+            retry_request, _, retry_named, retry_plan = self._prepare_request(
+                principal, prepared_request.model_copy(update={"question": clarified, "history": []}), timings,
+            )
+            yield "stage", {"stage": "searching"}
+            retry, retry_retrieved = yield from self._run_pipeline(
+                principal, retry_request, retry_plan, Rewrite(clarified), retry_named, timings, deadline, started,
+            )
+            retrieved += retry_retrieved
+            if retry.status == "answered":
+                response, prepared_request, plan = retry, retry_request, retry_plan
+                rewrite = Rewrite(clarified, "clarified")
         response = self._decorate_and_persist(
             principal, request, prepared_request, response, plan, rewrite, retrieved, timings, started, key
         )
@@ -282,6 +309,10 @@ class RAGService:
                 raise _NoAnswer("NOT_A_QUESTION")
             if not rewrite.resolvable:
                 raise _NoAnswer("NEEDS_CONTEXT")
+            if is_greeting(request.question) or not self._has_subject(request.question, plan):
+                # "hi", "thanks", "can you explain in short?": nothing to search for. Searching
+                # anyway lets any passage pass the term checks, which have nothing to check.
+                raise _NoAnswer("GREETING" if is_greeting(request.question) else "NO_SUBJECT", suggestions=[])
             referenced = request.policy_ids or self.retriever.referenced_policies(principal, request.question)
             filters = self._filters(principal, plan, request, referenced, named)
             try:
@@ -318,13 +349,33 @@ class RAGService:
         if rewrite and rewrite.reason:
             response.plan["rewritten_question"] = prepared.question
             response.plan["rewrite_reason"] = rewrite.reason
-            if rewrite.reason == "translation" and response.status == "answered":
-                response.warnings.insert(0, f'Answered in English. The question was searched as: "{prepared.question}"')
+            # Shown by the client as "Understood as: …" from plan.rewritten_question.
         timings["total"] = round((time.perf_counter() - started) * 1000, 1)
         response.timings_ms = timings
         response.query_id = self._audit(principal, original, response, retrieved=retrieved, cache_hit=False)
         self.cache.set(key, response.model_dump(mode="json"), ttl_seconds=self.settings.RAG_CACHE_TTL_SECONDS)
         return response
+
+    # Nothing matched the words as typed: a rewording may. Not for an outage, a deadline,
+    # or a question the documents were searched for and simply do not answer.
+    CLARIFY_REASONS = frozenset({"KEY_TERMS_NOT_FOUND", "NO_RELEVANT_DOCUMENTS", "LOW_RELEVANCE", "ANSWER_OFF_TOPIC"})
+
+    def _worth_clarifying(self, response: AnswerResponse, deadline: float) -> bool:
+        return (
+            response.status == "no_answer" and response.no_answer is not None
+            and response.no_answer.reason in self.CLARIFY_REASONS
+            and time.perf_counter() < deadline
+        )
+
+    def _clarify(self, question: str, timings: dict[str, float]) -> str | None:
+        step = time.perf_counter()
+        try:
+            llm = self._llm_factory()
+        except LLMUnavailableError:
+            return None
+        clarified = clarified_question(llm, question)
+        timings["clarify"] = round((time.perf_counter() - step) * 1000, 1)
+        return clarified
 
     # --- one pass: retrieve, gate, generate --------------------------------------------
 
@@ -483,7 +534,7 @@ class RAGService:
                 if note not in cited:
                     cited.append(note)
         response.warnings.insert(0, (
-            "The version currently in force does not cover this. Answered from a previous version: "
+            "The version in force today does not cover this, so this answer comes from an earlier version: "
             + "; ".join(cited) + "."
         ))
         response.plan["fallback"] = {"used": True, "depth": depth, "reason": reason}
@@ -752,8 +803,11 @@ class RAGService:
         content = llm_result.content if llm_result else {}
         results = validate_claims(content.get("claims", []), texts, key_terms(request.question))
         _drop_metadata_echo(results, request.question, plan)
-        warnings = [f"Removed an unsupported statement: {', '.join(r.problems)}" for r in results if not r.valid]
-        warnings += [f"Ignored {p}" for r in results if r.valid for p in r.problems]
+        # What the checks removed is for the audit trail and debugging, not the reader:
+        # the answer they see is already only what passed.
+        checks = [f"Removed an unsupported statement: {', '.join(r.problems)}" for r in results if not r.valid]
+        checks += [f"Ignored {p}" for r in results if r.valid for p in r.problems]
+        warnings: list[str] = []
         valid = [r for r in results if r.valid]
 
         verified = self._verify_citations(principal, {e for r in valid for e in r.evidence_ids if e != "D1"}, items)
@@ -777,6 +831,14 @@ class RAGService:
             ids = [e for e in noted.get("evidence_ids", []) if e in items]
             if ids and not any(set(ids) == set(c["evidence_ids"]) for c in conflicts):
                 conflicts.append({"type": "NOTED_BY_MODEL", "description": noted.get("description", ""), "evidence_ids": ids})
+        # Show a disagreement only between sources the answer actually cites; an amendment
+        # whenever the amended clause is cited, since the reader is relying on it.
+        conflicts = [
+            c for c in conflicts if c["evidence_ids"] and (
+                c["evidence_ids"][0] in numbering if c["type"] == "AMENDED"
+                else all(e in numbering for e in c["evidence_ids"])
+            )
+        ]
         for conflict in conflicts:
             conflict["citations"] = [numbering[e] for e in conflict["evidence_ids"] if e in numbering]
 
@@ -784,11 +846,11 @@ class RAGService:
         summary = self._summary(request.question, content.get("summary"), valid, texts, claims)
         if llm_result and llm_result.model == LocalLLM.model_id and self.settings.LLM_PROVIDER != "local":
             warnings.insert(0, "The AI service was unavailable, so this answer quotes the documents directly.")
-        if any(c["citations"] for c in conflicts):
-            warnings.insert(0, "Sources disagree on part of this answer; see conflicts.")
+        if conflicts:
+            warnings.insert(0, "Your sources disagree on part of this. Check both before relying on it.")
         return AnswerResponse(
             question=request.question, status="answered", answer=answer, summary=summary, claims=claims, sources=sources,
-            conflicts=conflicts, warnings=warnings, plan=plan.describe(), evidence_score=evidence.top_score,
+            conflicts=conflicts, warnings=warnings, plan={**plan.describe(), "checks": checks}, evidence_score=evidence.top_score,
             model=llm_result.model if llm_result else None,
             usage={"input_tokens": llm_result.input_tokens, "output_tokens": llm_result.output_tokens} if llm_result else {},
             timings_ms={},
@@ -869,6 +931,11 @@ class RAGService:
     def _no_answer(self, request, plan, evidence, no_answer: _NoAnswer, llm_result) -> AnswerResponse:
         messages = {
             "NOT_A_QUESTION": "Please type your question in words, for example the policy or topic and what you want to know.",
+            "GREETING": (
+                "Hello! I answer questions about your organization's policies and documents, "
+                "with a citation for every point. What would you like to know?"
+            ),
+            "NO_SUBJECT": "What would you like to know? Please name the policy or topic you are asking about.",
             "LLM_UNAVAILABLE": "The answering service is currently unavailable. Please try again later.",
             "COMPARISON_TARGET_UNCLEAR": "Please name the policy (and versions) you want to compare.",
             "NEEDS_CONTEXT": (
@@ -886,13 +953,21 @@ class RAGService:
             no_answer=NoAnswer(
                 reason=no_answer.reason,
                 message=messages.get(no_answer.reason, NO_ANSWER_MESSAGE),
-                suggestions=SUGGESTIONS,
+                suggestions=no_answer.suggestions if no_answer.suggestions is not None else SUGGESTIONS,
                 missing_terms=no_answer.missing_terms,
             ),
             plan=plan.describe(), evidence_score=evidence.top_score,
             model=llm_result.model if llm_result else None,
             usage={"input_tokens": llm_result.input_tokens, "output_tokens": llm_result.output_tokens} if llm_result else {},
             timings_ms={},
+        )
+
+    @staticmethod
+    def _has_subject(question: str, plan: QueryPlan) -> bool:
+        """The question names something to look for, or asks about a document or its versions."""
+        return bool(
+            key_terms(question) or is_document_question(question) or acronym_in_question(question)
+            or plan.query_class is not QueryClass.CURRENT or plan.version_ids
         )
 
     # --- audit ---------------------------------------------------------------------

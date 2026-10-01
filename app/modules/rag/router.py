@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import func, select
@@ -18,7 +18,10 @@ from app.infrastructure.cache.base import Cache
 from app.modules.audit.model import AuditEvent
 from app.modules.auth.dependencies import require
 from app.modules.auth.permissions import Permission, Principal
-from app.modules.rag.schema import AnswerResponse, AskRequest
+from app.modules.rag.conversations import ConversationService
+from app.modules.rag.schema import (
+    AnswerResponse, AskRequest, ConversationDetail, ConversationMessageRead, ConversationRead, ConversationUpdate,
+)
 from app.modules.rag.service import RAGService
 from app.workers.runtime import get_runtime
 
@@ -52,9 +55,21 @@ def ask(
 
     Rate limited per principal: this is the only endpoint that spends LLM budget.
     """
-    settings = request.app.state.settings
     request.app.state.ai_limiter.check(f"ai:{principal.organization_id}:{principal.user_id}")
-    return ok(service.ask(principal, body))
+    response = service.ask(principal, body)
+    _save(service.session, principal, body, response)
+    return ok(response)
+
+
+def _save(session: Session, principal: Principal, body: AskRequest, response: AnswerResponse) -> None:
+    """Add the turn to the asker's chat history. A failure here never costs them the answer."""
+    try:
+        conversation = ConversationService(session).record(principal, body, response)
+    except Exception:
+        logger.exception("Could not save the answer to the chat history")
+        session.rollback()
+        return
+    response.conversation_id = conversation.id if conversation else None
 
 
 def _sse(event: str, data: Any) -> str:
@@ -93,7 +108,10 @@ def ask_stream(
             )
             try:
                 for kind, data in service.answer_events(principal, body):
-                    yield _sse(kind, data.model_dump(mode="json") if kind == "done" else data)
+                    if kind == "done":
+                        _save(session, principal, body, data)
+                        data = data.model_dump(mode="json")
+                    yield _sse(kind, data)
             except Exception:
                 logger.exception("Streaming answer failed")
                 yield _sse("error", {"code": "ANSWER_FAILED", "message": "The answer could not be completed. Please try again."})
@@ -139,3 +157,65 @@ def my_queries(
         for e in events
     ]
     return ok(Page(items=items, total=total, **page.model_dump()))
+
+
+# --- chat history ------------------------------------------------------------------
+
+
+def get_conversations(db: Annotated[Session, Depends(get_db)]) -> ConversationService:
+    return ConversationService(db)
+
+
+Conversations = Annotated[ConversationService, Depends(get_conversations)]
+
+
+def _read(conversation, message_count: int) -> ConversationRead:
+    return ConversationRead(
+        id=conversation.id, title=conversation.title, created_at=conversation.created_at,
+        last_message_at=conversation.last_message_at, message_count=message_count,
+    )
+
+
+@router.get("/conversations", response_model=ApiResponse[Page[ConversationRead]])
+def list_conversations(
+    principal: Asker,
+    service: Conversations,
+    page: Annotated[PageParams, Depends(page_params)],
+    search: Annotated[str | None, Query(max_length=200)] = None,
+):
+    """The caller's own conversations, most recent first."""
+    rows, total = service.recent(principal, search=search, limit=page.limit, offset=page.offset)
+    return ok(Page(items=[_read(c, n) for c, n in rows], total=total, **page.model_dump()))
+
+
+@router.get("/conversations/{conversation_id}", response_model=ApiResponse[ConversationDetail])
+def get_conversation(conversation_id: uuid.UUID, principal: Asker, service: Conversations):
+    """A conversation with every question and the answer it got."""
+    conversation = service.get(principal, conversation_id)
+    messages = service.messages(conversation)
+    return ok(ConversationDetail(
+        **_read(conversation, len(messages)).model_dump(),
+        messages=[
+            ConversationMessageRead(id=m.id, question=m.question, options=m.options,
+                                    answer=AnswerResponse.model_validate(m.answer), created_at=m.created_at)
+            for m in messages
+        ],
+    ))
+
+
+@router.patch("/conversations/{conversation_id}", response_model=ApiResponse[ConversationRead])
+def rename_conversation(conversation_id: uuid.UUID, body: ConversationUpdate, principal: Asker, service: Conversations):
+    conversation = service.rename(principal, conversation_id, body.title)
+    return ok(_read(conversation, len(service.messages(conversation))))
+
+
+@router.delete("/conversations/{conversation_id}", response_model=ApiResponse[dict])
+def delete_conversation(conversation_id: uuid.UUID, principal: Asker, service: Conversations):
+    service.delete(principal, conversation_id)
+    return ok({"deleted": True})
+
+
+@router.delete("/conversations", response_model=ApiResponse[dict])
+def delete_all_conversations(principal: Asker, service: Conversations):
+    """Clear the caller's whole chat history."""
+    return ok({"deleted": service.delete_all(principal)})

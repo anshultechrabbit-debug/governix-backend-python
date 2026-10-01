@@ -106,3 +106,20 @@ def test_a_translation_is_never_unresolvable():
     rewrite = standalone_question(_Rewriter("How is the interest rate on microfinance loans decided?", False),
                                   "माइक्रोफाइनेंस ऋण की ब्याज दर कैसे तय की जाती है?", [])
     assert rewrite.resolvable and rewrite.reason == "translation"
+
+
+def test_a_misspelt_chatty_question_is_clarified():
+    from app.modules.rag.query_rewrite import clarified_question
+
+    llm = _Rewriter("", True)
+    llm.content = {"question": "What is the KYC policy?"}
+    assert clarified_question(llm, "Tell me about the kyc pokucy") == "What is the KYC policy?"
+
+
+def test_an_unchanged_or_missing_clarification_is_none():
+    from app.modules.rag.query_rewrite import clarified_question
+
+    llm = _Rewriter("", True)
+    llm.content = {"question": "What is the KYC policy"}
+    assert clarified_question(llm, "What is the KYC policy?") is None
+    assert clarified_question(None, "Tell me about the kyc pokucy") is None
