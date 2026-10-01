@@ -54,6 +54,9 @@ _VERB_RULES = (
 IRREGULAR = {
     "children": "child", "men": "man", "women": "woman", "people": "person",
     "feet": "foot", "teeth": "tooth", "geese": "goose", "mice": "mouse",
+    # Irregular past forms policy text uses, including the common "freezed".
+    "freeze": "freez", "freezes": "freez", "frozen": "freez", "froze": "freez", "freezed": "freez",
+    "unfreeze": "unfreez", "unfrozen": "unfreez",
     "licence": "license", "practise": "practice", "organisation": "organization",
     "organisations": "organizations", "recognise": "recognize", "labour": "labor",
     "neighbour": "neighbor", "neighbours": "neighbors", "behaviour": "behavior",

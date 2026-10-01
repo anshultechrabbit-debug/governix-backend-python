@@ -126,3 +126,28 @@ def test_a_short_answer_after_the_question_keeps_its_negation():
 
 def test_a_paraphrase_is_not_judged_on_negation():
     assert check("Loans above Rs. 75 lakh have a maximum LTV of 70%.", ["E1"]).valid
+
+
+def test_appended_citation_marks_are_dropped_not_the_claim():
+    for text in ("For loans above Rs. 75 lakh the LTV shall not exceed 70% (E1).",
+                 "For loans above Rs. 75 lakh the LTV shall not exceed 70% [E1, E2].",
+                 "For loans above Rs. 75 lakh the LTV shall not exceed 70%. E1"):
+        result = check(text, ["E1"])
+        assert result.valid, (text, result.problems)
+        assert "E1" not in result.text
+
+
+def test_a_claim_about_an_evidence_id_is_still_rejected():
+    assert not check("E2 says the LTV shall not exceed 70%.", ["E1"]).valid
+
+
+def test_a_negation_taken_from_another_cited_sentence_is_not_a_reversal():
+    evidence = {"E1": EvidenceText("E1", (
+        "Where the OVD furnished by the customer does not have updated address, the following documents shall be "
+        "deemed to be OVDs. The customer shall submit OVD with current address within a period of three months."
+    ))}
+    [result] = validate_claims([{
+        "text": "Where the OVD does not have updated address, the customer shall submit OVD with current address within a period of three months.",
+        "evidence_ids": ["E1"],
+    }], evidence)
+    assert result.valid, result.problems

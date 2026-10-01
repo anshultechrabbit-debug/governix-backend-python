@@ -109,17 +109,29 @@ def test_a_translation_is_never_unresolvable():
 
 
 def test_a_misspelt_chatty_question_is_clarified():
-    from app.modules.rag.query_rewrite import clarified_question
+    from app.modules.rag.query_rewrite import restated_questions
 
     llm = _Rewriter("", True)
-    llm.content = {"question": "What is the KYC policy?"}
-    assert clarified_question(llm, "Tell me about the kyc pokucy") == "What is the KYC policy?"
+    llm.content = {"questions": ["What is the KYC policy?"]}
+    assert restated_questions(llm, "Tell me about the kyc pokucy") == ["What is the KYC policy?"]
 
 
-def test_an_unchanged_or_missing_clarification_is_none():
-    from app.modules.rag.query_rewrite import clarified_question
+def test_a_question_about_two_subjects_is_split():
+    from app.modules.rag.query_rewrite import restated_questions
 
     llm = _Rewriter("", True)
-    llm.content = {"question": "What is the KYC policy"}
-    assert clarified_question(llm, "What is the KYC policy?") is None
-    assert clarified_question(None, "Tell me about the kyc pokucy") is None
+    llm.content = {"questions": ["How should KYC information be maintained?", "How are pet-product variants handled?", "x", "y"]}
+    assert restated_questions(llm, "KYC and pet products?") == [
+        "How should KYC information be maintained?", "How are pet-product variants handled?", "x",
+    ]
+
+
+def test_an_unchanged_or_missing_restatement_is_none():
+    from app.modules.rag.query_rewrite import restated_questions
+
+    llm = _Rewriter("", True)
+    llm.content = {"questions": ["What is the KYC policy"]}
+    assert restated_questions(llm, "What is the KYC policy?") is None
+    llm.content = {"questions": []}
+    assert restated_questions(llm, "What is the KYC policy?") is None
+    assert restated_questions(None, "Tell me about the kyc pokucy") is None

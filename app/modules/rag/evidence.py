@@ -58,7 +58,13 @@ QUESTION_TERMS = frozenset(
     # they say how to answer, not what about, and no document is expected to contain them.
     "hello hi hey dear please kindly thanks thank want wanted wants need know tell explain explanation "
     "short shortly brief briefly simple simply quick quickly script overview whole entire just really "
-    "help understand lines words points bullet bullets".split()
+    "help understand lines words points bullet bullets "
+    # How to proceed, not what about: "how should X be handled", "different variants".
+    "handle handled handling treat treated dealt deal manage managed different various "
+    # Reasoning about a quoted rule: "if the following conditions are met, what follows",
+    # "which statement is inconsistent with the source".
+    "following follows follow met statement statements inconsistent consistent incorrect correct true false "
+    "implies imply implied source quoted scenario conclusion conclude".split()
 )
 # Questions about the document itself: its title, publisher, date, legal basis.
 _DOCUMENT_QUESTION = re.compile(

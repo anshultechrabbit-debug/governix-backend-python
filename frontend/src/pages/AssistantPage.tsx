@@ -278,7 +278,12 @@ function Answered({ answer }: { answer: Answer }) {
           ? <p>{answer.summary}</p>
           : lead?.map((claim, index) => <p key={`${claim.text}-${index}`}>{claim.text} {citations(claim.citations)}</p>)}
       </div>
-      {understood && (
+      {answer.plan.rewrite_reason === "split" && answer.plan.parts ? (
+        <div className="mt-2 text-xs text-muted">
+          <p>Answered as {answer.plan.parts.length} questions:</p>
+          <ol className="mt-0.5 list-decimal pl-5 italic">{answer.plan.parts.map((part) => <li key={part}>{part}</li>)}</ol>
+        </div>
+      ) : understood && (
         <p className="mt-2 text-xs text-muted">
           {answer.plan.rewrite_reason === "translation" ? "Translated and answered as" : "Understood as"}: <span className="italic">“{understood}”</span>
         </p>

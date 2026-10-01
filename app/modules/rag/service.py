@@ -47,7 +47,7 @@ from app.modules.rag.prompts import (
     OUTPUT_SCHEMA, SUMMARY_CHECK_PROMPT, SUMMARY_CHECK_SCHEMA, SYSTEM_PROMPT, build_user_prompt, comparison_text,
 )
 from app.modules.rag.query_plan import QueryClass, QueryPlan, plan_query
-from app.modules.rag.query_rewrite import Rewrite, clarified_question, standalone_question
+from app.modules.rag.query_rewrite import Rewrite, restated_questions, standalone_question
 from app.modules.rag.schema import AnswerResponse, AskRequest, Claim, NoAnswer, Source
 from app.modules.rag.validation import EvidenceText, TermIndex, validate_claims
 from app.modules.search.model import Chunk
@@ -79,7 +79,7 @@ NO_ANSWER_MESSAGE = "None of the documents you can access answer this, so I won'
 #   v13    acronym fast-path answer added
 #   v14    cache key changed: raw history excluded; keyed on rewritten question
 #   v15    summary check merged into claim validation (no second LLM call)
-ANSWER_CACHE_VERSION = "v21"
+ANSWER_CACHE_VERSION = "v23"
 # No supported answer in the version in force: worth looking one version back.
 FALLBACK_REASONS = frozenset({
     "NO_RELEVANT_DOCUMENTS", "LOW_RELEVANCE", "KEY_TERMS_NOT_FOUND", "INSUFFICIENT_EVIDENCE",
@@ -147,6 +147,60 @@ _GREETING = re.compile(
 
 def is_greeting(question: str) -> bool:
     return bool(_GREETING.match(question.strip()))
+
+
+def _without_claims(run: Generator[tuple[str, Any], None, Any]) -> Generator[tuple[str, Any], None, Any]:
+    """Pass a pipeline's progress through but hold back its claims; return its result."""
+    while True:
+        try:
+            kind, data = next(run)
+        except StopIteration as stop:
+            return stop.value
+        if kind != "claim":
+            yield kind, data
+
+
+def _combine(parts: list[tuple[str, AnswerResponse]]) -> AnswerResponse | None:
+    """One answer from the answers to each part of a question, with one set of source numbers.
+
+    Each part was answered and checked on its own. A part the documents do not answer is
+    named, never filled in. None when no part was answered.
+    """
+    answered = [(q, r) for q, r in parts if r.status == "answered"]
+    if not answered:
+        return None
+    sources: list[Source] = []
+    numbers: dict[Any, int] = {}
+    claims: list[Claim] = []
+    conflicts: list[dict] = []
+    warnings: list[str] = []
+    checks: list[str] = []
+    for index, (_question, response) in enumerate(answered, start=1):
+        remap: dict[int, int] = {}
+        for source in response.sources:
+            key = source.chunk_id or f"{index}-{source.evidence_id}"
+            if key not in numbers:
+                numbers[key] = len(numbers) + 1
+                sources.append(source.model_copy(update={"number": numbers[key], "evidence_id": f"P{index}-{source.evidence_id}"}))
+            remap[source.number] = numbers[key]
+        claims += [Claim(text=c.text, citations=[remap[n] for n in c.citations if n in remap]) for c in response.claims]
+        conflicts += [{**c, "citations": [remap[n] for n in c.get("citations", []) if n in remap]} for c in response.conflicts]
+        warnings += [w for w in response.warnings if w not in warnings]
+        checks += response.plan.get("checks", [])
+    warnings += [f'Not found in your documents: "{q}"' for q, r in parts if r.status != "answered"]
+    summaries = [r.summary for _, r in answered if r.summary]
+    first = answered[0][1]
+    return AnswerResponse(
+        question=first.question, status="answered",
+        answer=" ".join(f"{c.text} [{', '.join(map(str, c.citations))}]" for c in claims),
+        summary=" ".join(summaries) if len(summaries) == len(answered) else None,
+        claims=claims, sources=sources, conflicts=conflicts, warnings=warnings,
+        plan={**first.plan, "checks": checks, "parts": [q for q, _ in parts]},
+        evidence_score=max(r.evidence_score for _, r in answered),
+        model=first.model,
+        usage={k: sum(r.usage.get(k, 0) for _, r in answered) for k in ("input_tokens", "output_tokens")},
+        timings_ms={},
+    )
 
 
 def acronym_in_question(question: str) -> str | None:
@@ -235,20 +289,32 @@ class RAGService:
         response, retrieved = yield from self._run_pipeline(
             principal, prepared_request, plan, rewrite, named, timings, deadline, started
         )
-        if self._worth_clarifying(response, deadline) and (clarified := self._clarify(prepared_request.question, timings)):
-            # The words as typed found nothing ("pokucy", "hello ... in short"): search once
-            # more for the question as the person meant it. Nothing was shown yet.
-            retry_request, _, retry_named, retry_plan = self._prepare_request(
-                principal, prepared_request.model_copy(update={"question": clarified, "history": []}), timings,
-            )
-            yield "stage", {"stage": "searching"}
-            retry, retry_retrieved = yield from self._run_pipeline(
-                principal, retry_request, retry_plan, Rewrite(clarified), retry_named, timings, deadline, started,
-            )
-            retrieved += retry_retrieved
-            if retry.status == "answered":
-                response, prepared_request, plan = retry, retry_request, retry_plan
-                rewrite = Rewrite(clarified, "clarified")
+        if self._worth_clarifying(response, deadline) and (restated := self._clarify(prepared_request.question, timings)):
+            # The words as typed found nothing ("pokucy", "hello ... in short", or two subjects
+            # in one question): search again for the question(s) as the person meant them.
+            # Nothing was shown yet.
+            parts = []
+            for question in restated:
+                if time.perf_counter() >= deadline:
+                    break
+                part_request, _, part_named, part_plan = self._prepare_request(
+                    principal, prepared_request.model_copy(update={"question": question, "history": []}), timings,
+                )
+                yield "stage", {"stage": "searching"}
+                run = self._run_pipeline(
+                    principal, part_request, part_plan, Rewrite(question), part_named, timings, deadline, started,
+                )
+                # Parts are numbered independently; their claims are shown once combined.
+                part, part_retrieved = yield from (run if len(restated) == 1 else _without_claims(run))
+                retrieved += part_retrieved
+                parts.append((question, part_request, part_plan, part))
+            if len(parts) == 1 and parts[0][3].status == "answered":
+                _question, prepared_request, plan, response = parts[0]
+                rewrite = Rewrite(_question, "clarified")
+            elif len(parts) > 1 and (combined := _combine([(q, r) for q, _, _, r in parts])) is not None:
+                response, plan = combined, next(p for _, _, p, r in parts if r.status == "answered")
+                prepared_request = prepared_request.model_copy(update={"question": " · ".join(q for q, *_ in parts)})
+                rewrite = Rewrite(prepared_request.question, "split")
         response = self._decorate_and_persist(
             principal, request, prepared_request, response, plan, rewrite, retrieved, timings, started, key
         )
@@ -367,13 +433,13 @@ class RAGService:
             and time.perf_counter() < deadline
         )
 
-    def _clarify(self, question: str, timings: dict[str, float]) -> str | None:
+    def _clarify(self, question: str, timings: dict[str, float]) -> list[str] | None:
         step = time.perf_counter()
         try:
             llm = self._llm_factory()
         except LLMUnavailableError:
             return None
-        clarified = clarified_question(llm, question)
+        clarified = restated_questions(llm, question)
         timings["clarify"] = round((time.perf_counter() - step) * 1000, 1)
         return clarified
 

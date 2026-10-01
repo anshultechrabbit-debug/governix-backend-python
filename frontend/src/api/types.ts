@@ -358,7 +358,9 @@ export interface Answer {
   plan: {
     query_class: string; mode: string; as_of: string | null; version_labels: string[]; explanation: string;
     /** The question as it was searched, when it was restated (follow-up, translation, clarified). */
-    rewritten_question?: string; rewrite_reason?: "follow_up" | "translation" | "clarified";
+    rewritten_question?: string; rewrite_reason?: "follow_up" | "translation" | "clarified" | "split";
+    /** A question about several subjects, answered as these separate questions. */
+    parts?: string[];
     fallback?: { used: boolean; depth: number };
   };
   evidence_score: number;

@@ -33,6 +33,13 @@ MIN_SUPPORT = 0.35
 # Claims are single sentences by contract; a claim much longer than any source
 # sentence is padding and is judged on support alone rather than trusted.
 _EVIDENCE_REF = re.compile(r"\b[EGD]\d{1,2}\b")
+# Evidence ids the model appended as citation marks ("... frozen (E1, E2).", "... frozen. [E3]"):
+# the citation is already in evidence_ids, so the marks are dropped rather than the claim.
+_ID = r"[EGD]\d{1,2}"
+_CITATION_MARKS = re.compile(
+    rf"\s*[\(\[]\s*{_ID}(?:\s*(?:,|;|and|&)\s*{_ID})*\s*[\)\]]"
+    rf"|(?:\s*,?\s*\b{_ID}\b)+(?=\s*[.;!?]?\s*$)"
+)
 _WORD = re.compile(r"[a-z][a-z0-9]{2,}")
 _STOP = frozenset(
     "the and for with that this from shall will are was were have has not any all per such under "
@@ -143,10 +150,26 @@ def _flips_polarity(claim: str, cited_text: str) -> bool:
     if best < RESTATEMENT_OVERLAP:
         return False  # a paraphrase ("maximum 70%" for "shall not exceed 70%"): polarity is not comparable
     claim_negated, source_negated = _negated(claim), _negated(sentences[best_index])
+    if claim_negated and not source_negated and _negations_quoted(claim, cited_text):
+        return False  # its negation comes from another sentence it combines ("... does not have updated address")
     if claim_negated and not source_negated:
         # The next sentences may carry the short answer of a question-and-answer pair ("... income? Ans. No.").
         return not _negated(" ".join(sentences[best_index + 1:best_index + 3]))
     return source_negated and not claim_negated
+
+
+def _normal(text: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def _negations_quoted(claim: str, cited_text: str) -> bool:
+    """Every negation in the claim appears, with the words after it, in the cited text."""
+    source = _normal(cited_text)
+    for match in _NEGATION.finditer(_NOT_NEGATION.sub(" ", claim)):
+        phrase = _normal(claim[match.start():match.end() + 40]).split()[:4]
+        if len(phrase) < 3 or " ".join(phrase) not in source:
+            return False
+    return True
 
 
 def _negated(text: str) -> bool:
@@ -186,7 +209,7 @@ def validate_claims(
     """`subjects` are the question's key terms: what the claims must be about."""
     results = []
     for raw in raw_claims:
-        text = " ".join(str(raw.get("text", "")).split())
+        text = " ".join(_CITATION_MARKS.sub("", str(raw.get("text", ""))).split())
         cited = [e for e in dict.fromkeys(raw.get("evidence_ids") or []) if isinstance(e, str)]
         result = ClaimResult(text=text, evidence_ids=[], valid=True)
         if not text:
