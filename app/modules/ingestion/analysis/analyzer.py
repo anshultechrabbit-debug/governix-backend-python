@@ -31,6 +31,9 @@ from app.modules.ingestion.analysis.naming import NAMING_PAGES, content_title, r
 from app.modules.ingestion.model import Decision, DocumentAnalysis, ReviewStatus
 from app.modules.policies.model import Policy, PolicyStatus, PolicyVersion, VersionStatus
 
+# The general category a document goes to when nothing identifies a more specific one.
+DEFAULT_CATEGORY_SLUG = "policies"
+
 OPENING_PAGES = 3
 OPENING_CHARS = 20_000
 TITLE_CANDIDATES = 10
@@ -242,12 +245,18 @@ def analyze_document(
         conflict = {"type": "DUPLICATE", **detail, "existing_document_id": str(existing.id),
                     "existing_policy_id": str(existing.policy_id) if existing.policy_id else None}
 
+    # Nothing identified the category: file it under the organization's general "Policies"
+    # category rather than hold it for review. A person can still change it.
+    suggested_category_id = classification.category_id or next(
+        (c.id for c in categories if c.slug == DEFAULT_CATEGORY_SLUG), None
+    )
+
     # The effective date is optional: when the document does not state one, the
     # upload date keeps the timeline ordered, so it is not reported as missing.
     missing = []
     if not title.value:
         missing.append("name")
-    if not (document.category_id or classification.category_id):
+    if not (document.category_id or suggested_category_id):
         missing.append("category")
 
     best = result.best
@@ -257,7 +266,7 @@ def analyze_document(
         "detected": meta.to_json(),
         "suggested_name": title.value,
         "name_confidence": title.confidence,
-        "suggested_category_id": classification.category_id,
+        "suggested_category_id": suggested_category_id,
         "category_confidence": classification.confidence,
         "category_ranking": [
             {"category_id": str(s.category_id), "name": s.name, "score": s.score, "matched": list(s.matched)}

@@ -278,3 +278,33 @@ def test_the_policy_a_file_is_meant_for_wins_when_it_fits_too(db, app, tenant, a
         response = admin.post("/uploads/suggestions", data={"policy_id": meant},
                               files={"file": ("v2.pdf", io.BytesIO(build(spec)), "application/pdf")})
         assert response.json()["data"]["existing_policy"]["policy_id"] == meant
+
+
+def unclassifiable() -> bytes:
+    """A document no category's keywords describe."""
+    return build(PolicySpec(
+        title="PETS 2.0 FEATURE REQUIREMENTS",
+        header_lines=["Owner: Digital Banking", "Release: 2.0"],
+        sections=[
+            Section("1", "Overview", ["Customers can buy pet food and accessories in the mobile app."]),
+            Section("2", "Variants", ["Each item lists its weight and dose variants with separate prices."]),
+        ],
+    ))
+
+
+def test_a_file_whose_category_is_not_identified_is_filed_under_policies(db, app, tenant, admin):
+    batch = run_batch(admin, app, [{
+        "new_policy_name": "Pets 2.0 Feature Requirements",
+        "items": [{"filename": "pets.pdf"}],
+    }], [[unclassifiable()]])
+    assert batch["status"] == "completed", batch
+    group = batch["groups"][0]
+    assert group["items"][0]["status"] == "confirmed"
+    from app.modules.policies.model import Policy
+    assert str(db.get(Policy, group["policy_id"]).category_id) == category_id(db, tenant)
+
+
+def test_an_unidentified_category_is_suggested_as_policies_for_review(db, app, client, tenant):
+    _document_id, analysis = process(client, app, tenant.admin, unclassifiable())
+    assert analysis["suggested_category_id"] == category_id(db, tenant)
+    assert "category" not in analysis["missing_fields"]
