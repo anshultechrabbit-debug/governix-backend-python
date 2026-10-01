@@ -120,6 +120,8 @@ MAX_TERM_SHARE = 0.2
 MAX_RANKED_TERMS = 10
 # Sections whose chunks the section lane ranks.
 SECTION_CANDIDATES = 200
+# Matches kept by a lane's cheap first ranking for its weighted second one.
+PRESELECT = {"keyword": 300, "section": 1000}
 # One shared pool for the whole process. Sized for the lanes of a single
 # request, not for the number of requests: lanes are short database calls, so
 # threads are recycled rather than grown.
@@ -492,10 +494,20 @@ class HybridRetriever:
             return []
         terms = self.selective_terms(principal, terms)
         or_query = _or_of(terms)
+        # Two steps: one cheap rank picks the best matches, the weighted rank (one ts_rank_cd
+        # per term) orders only those. Weighting every match is what made the lane slow.
+        cheap = func.ts_rank_cd(Chunk.tsv, or_query, 32)
+        best = (
+            _base((Chunk.id.label("id"),), principal, filters)
+            .where(Chunk.tsv.op("@@")(or_query))
+            .order_by(cheap.desc())
+            .limit(PRESELECT["keyword"])
+            .subquery()
+        )
         rank = self._weighted_rank(Chunk.tsv, terms, self.term_weights(principal, terms), or_query).label("score")
         statement = (
-            _base((*CHUNK_COLUMNS, rank), principal, filters)
-            .where(Chunk.tsv.op("@@")(or_query))
+            select(*CHUNK_COLUMNS, rank)
+            .join(best, best.c.id == Chunk.id)
             .order_by(rank.desc())
             .limit(LANE_LIMITS["keyword"])
         )
@@ -643,10 +655,17 @@ class HybridRetriever:
         # Two steps: the best-matching sections first (their own short text, from the index),
         # then only their chunks are ranked. Ranking every chunk of every matching section
         # does not finish in time on a 10,000-page document.
+        matching = (
+            select(DocumentSection.id.label("id"))
+            .where(DocumentSection.organization_id == principal.organization_id, DocumentSection.tsv.op("@@")(tsquery))
+            .order_by(func.ts_rank_cd(DocumentSection.tsv, tsquery, 32).desc())
+            .limit(PRESELECT["section"])
+            .subquery()
+        )
         section_rank = self._weighted_rank(DocumentSection.tsv, terms, weights, tsquery)
         top = (
             select(DocumentSection.id.label("id"), section_rank.label("rank"))
-            .where(DocumentSection.organization_id == principal.organization_id, DocumentSection.tsv.op("@@")(tsquery))
+            .join(matching, matching.c.id == DocumentSection.id)
             .order_by(section_rank.desc())
             .limit(SECTION_CANDIDATES)
             .subquery()

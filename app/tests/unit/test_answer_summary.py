@@ -52,3 +52,16 @@ def test_no_checker_means_no_summary():
 
 def test_an_empty_summary_is_none():
     assert summary("", _Checker({"supported": True, "unsupported": []})) is None
+
+
+def test_a_summary_that_only_restates_the_claims_needs_no_second_call():
+    checker = _Checker({"supported": False, "unsupported": ["anything"]})
+    text = "The KYC Policy is issued as per RBI's Master Direction on KYC."
+    assert summary(text, checker) == text and checker.calls == 0
+
+
+def test_a_summary_that_adds_a_negation_is_still_checked():
+    from app.modules.rag.service import restates
+
+    assert not restates("The KYC Policy is not issued as per RBI's Master Direction.", [CLAIMS[0].text])
+    assert not restates("The KYC Policy, issued in 2019, follows RBI's Master Direction.", [CLAIMS[0].text])

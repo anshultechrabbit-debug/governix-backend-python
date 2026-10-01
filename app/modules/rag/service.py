@@ -79,7 +79,7 @@ NO_ANSWER_MESSAGE = "None of the documents you can access answer this, so I won'
 #   v13    acronym fast-path answer added
 #   v14    cache key changed: raw history excluded; keyed on rewritten question
 #   v15    summary check merged into claim validation (no second LLM call)
-ANSWER_CACHE_VERSION = "v30"
+ANSWER_CACHE_VERSION = "v31"
 # No supported answer in the version in force: worth looking one version back.
 FALLBACK_REASONS = frozenset({
     "NO_RELEVANT_DOCUMENTS", "LOW_RELEVANCE", "KEY_TERMS_NOT_FOUND", "INSUFFICIENT_EVIDENCE",
@@ -190,6 +190,30 @@ _SEVERAL = re.compile(
 def asks_several(question: str) -> bool:
     """ "What is X and who issued it?", or two questions in one message."""
     return bool(_SEVERAL.search(question))
+
+
+# A summary is a plain restatement of the claims when at least this share of its content words,
+# and every figure in it, comes from them. It then cannot add knowledge, so the model check
+# (a full round trip, about a second) is skipped.
+RESTATEMENT_SHARE = 0.9
+
+
+def restates(summary: str, claims: list[str]) -> bool:
+    said = " ".join(claims)
+    if {f.value for f in extract_numeric_facts(summary)} - {f.value for f in extract_numeric_facts(said)}:
+        return False
+    words = [w for w in re.findall(r"[a-z][a-z0-9-]{2,}", summary.lower()) if w not in _RESTATEMENT_FILLER]
+    if not words:
+        return True
+    index = TermIndex(said)
+    return sum(index.mentions(w) for w in words) / len(words) >= RESTATEMENT_SHARE
+
+
+_RESTATEMENT_FILLER = frozenset(
+    # "not", "no" and "never" are deliberately absent: a negation must come from the claims.
+    "the and for with that this from are was were has have any all per such which their there "
+    "its can may must shall should will would been being into than then also only".split()
+)
 
 
 def is_greeting(question: str) -> bool:
@@ -1020,6 +1044,8 @@ class RAGService:
         [result] = validate_claims([{"text": text, "evidence_ids": cited}], texts, key_terms(question), question)
         if not result.valid:
             return None
+        if restates(result.text, [claim.text for claim in claims]):
+            return result.text  # nothing in it the verified claims do not already say: no second call
         statements = "\n".join(f"- {claim.text}" for claim in claims)
         try:
             check = self._llm_factory().generate_json(
