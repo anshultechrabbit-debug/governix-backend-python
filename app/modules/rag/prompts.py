@@ -34,8 +34,8 @@ Rules (non-negotiable):
 - Respect the effective dates given: answer for the period the question asks about.
 - If the evidence does not answer the question at all, return no claims and set
   insufficient_evidence to true. Never fill a gap with outside knowledge.
-- Also write "summary": the direct answer to the question in 1-3 plain, natural
-  sentences, as a knowledgeable colleague would say it (e.g. "It is the Bank's Know
+- Also write "summary": the direct answer to the question in 1-2 short, plain, natural
+  sentences (at most 45 words), as a knowledgeable colleague would say it (e.g. "It is the Bank's Know
   Your Customer (KYC) policy, issued under RBI's Master Direction on KYC."). Lead
   with the answer itself, not with "The document states". Use only facts in your
   claims, copy every number exactly, and add no citations. Add nothing the claims do

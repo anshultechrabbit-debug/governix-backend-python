@@ -1,14 +1,15 @@
 import { useQuery } from "@tanstack/react-query";
-import { GitCompare, Link2, Loader2, RefreshCw, UploadCloud } from "lucide-react";
+import { GitCompare, Link2, Loader2, RefreshCw, Trash2, UploadCloud } from "lucide-react";
 import { useState } from "react";
-import { Link, useParams, useSearchParams } from "react-router";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 import { api, ApiError, qs } from "../api/client";
 import type { AuditEvent, CategoryVersion, Page, PolicyDetail, Version, VersionDetail, VersionSummary } from "../api/types";
 import { PolicyAssignments } from "../components/Assignments";
 import { BulkUploadModal } from "../components/BulkUpload";
+import { DeletePolicyDialog } from "../components/DeletePolicy";
 import { hasRealEffectiveDate, ScopeBadge, useCategoryName } from "../components/domain";
 import {
-  Badge, Button, Card, CardHeader, EmptyState, ErrorState, KeyValue, PageHeader, Select, SkeletonRows, StatusBadge,
+  Badge, Button, Card, CardHeader, EmptyState, ErrorState, KeyValue, Menu, PageHeader, Select, SkeletonRows, StatusBadge,
   SuggestedBadge, Tabs,
 } from "../components/ui";
 import { VersionManager } from "../components/VersionManager";
@@ -24,6 +25,8 @@ export function PolicyDetailPage() {
   const { can, me } = useAuth();
   const categoryName = useCategoryName();
   const [adding, setAdding] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const navigate = useNavigate();
   const { data: policy, error, isLoading, refetch } = useQuery({
     queryKey: ["policy", id],
     queryFn: () => api.get<PolicyDetail>(`/policies/${id}`),
@@ -51,6 +54,11 @@ export function PolicyDetailPage() {
           {current && <Badge tone="brand">Latest v{current.version_label}{hasRealEffectiveDate(current) && ` · effective ${formatDate(current.effective_from)}`}</Badge>}
           {canAddVersions && <Button variant="secondary" onClick={() => setAdding(true)}><UploadCloud className="size-4" />Add Version</Button>}
           {active.length > 1 && <Link to={`/policies/${policy.id}/compare`}><Button variant="secondary"><GitCompare className="size-4" />Compare Versions</Button></Link>}
+          {can("policies:manage") && (
+            <Menu label="Policy actions" items={[
+              { label: "Delete policy…", icon: <Trash2 className="size-4" />, danger: true, onSelect: () => setDeleting(true) },
+            ]} />
+          )}
         </>}
       />
       <Tabs<Tab>
@@ -96,6 +104,7 @@ export function PolicyDetailPage() {
         {tab === "related" && <RelatedTab policy={policy} />}
         {tab === "audit" && <PolicyAudit policy={policy} />}
       </div>
+      <DeletePolicyDialog policy={policy} open={deleting} onClose={() => setDeleting(false)} onDeleted={() => navigate("/policies")} />
       <BulkUploadModal open={adding} onClose={() => setAdding(false)} title={`New versions of ${policy.name}`}
         link={`/policies/${policy.id}?tab=versions`} policy={{ id: policy.id, name: policy.name }} />
     </>
@@ -138,7 +147,7 @@ function VersionsTab({ policy, onAdd }: { policy: PolicyDetail; onAdd?: () => vo
     <div className="space-y-6">
       {policy.versions.some((v) => v.status === "active") && <Card className="p-5"><Timeline versions={policy.versions} /></Card>}
       <Card className="overflow-hidden">
-        <CardHeader title="Versions" subtitle="Newest first. Versions are never deleted: withdrawn ones stay in the history."
+        <CardHeader title="Versions" subtitle="Newest first. Withdraw a version to keep it in the history, or delete it permanently from its menu."
           actions={onAdd && <Button size="sm" onClick={onAdd}><UploadCloud className="size-3.5" />Add Version</Button>} />
         {versions.error ? <div className="p-4"><ErrorState error={versions.error} onRetry={versions.refetch} /></div>
           : versions.isLoading ? <SkeletonRows rows={3} />

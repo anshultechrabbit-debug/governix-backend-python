@@ -1,9 +1,10 @@
 import { useQuery } from "@tanstack/react-query";
-import { FileText, Upload } from "lucide-react";
+import { FileText, Trash2, Upload } from "lucide-react";
 import { useState } from "react";
 import { Link } from "react-router";
 import { api, qs } from "../api/client";
 import type { DocumentRead, Page } from "../api/types";
+import { canDelete, DeleteDocumentDialog } from "../components/DeleteDocument";
 import { ScopeBadge, useCategories, useCategoryName } from "../components/domain";
 import { Button, Card, EmptyState, ErrorState, Input, PageHeader, Select, SkeletonRows, StatusBadge, Table } from "../components/ui";
 import { formatBytes, formatDate } from "../lib/format";
@@ -17,6 +18,7 @@ export function DocumentsPage() {
   const [status, setStatus] = useState("");
   const [category, setCategory] = useState("");
   const [offset, setOffset] = useState(0);
+  const [deleting, setDeleting] = useState<DocumentRead | null>(null);
   const categories = useCategories();
   const categoryName = useCategoryName();
   const params = { search, status, category_id: category, limit: PAGE_SIZE, offset };
@@ -41,6 +43,7 @@ export function DocumentsPage() {
         subtitle={subtitle}
         actions={can("documents:upload") && <Link to="/documents/upload"><Button><Upload className="size-4" />Upload</Button></Link>}
       />
+      {deleting && <DeleteDocumentDialog document={deleting} open onClose={() => setDeleting(null)} />}
       <Card>
         <div className="flex flex-wrap gap-3 border-b border-line p-4">
           <Input className="max-w-xs" placeholder="Search title or filename…" value={search} onChange={(e) => { setSearch(e.target.value); setOffset(0); }} />
@@ -63,7 +66,7 @@ export function DocumentsPage() {
               action={can("documents:upload") && <Link to="/documents/upload"><Button>Upload document</Button></Link>} />
           ) : (
             <>
-              <Table head={["Document", "Category", "Scope", "Status", "Pages", "Size", "Uploaded"]}>
+              <Table head={["Document", "Category", "Scope", "Status", "Pages", "Size", "Uploaded", ...(can("documents:upload") ? [<span className="sr-only">Actions</span>] : [])]}>
                 {data.items.map((doc) => (
                   <tr key={doc.id} className="hover:bg-subtle/50">
                     <td className="px-4 py-3">
@@ -76,6 +79,18 @@ export function DocumentsPage() {
                     <td className="px-4 py-3 tabular-nums">{doc.page_count?.toLocaleString() ?? "—"}</td>
                     <td className="px-4 py-3 tabular-nums text-ink-soft">{formatBytes(doc.size_bytes)}</td>
                     <td className="px-4 py-3 text-ink-soft">{formatDate(doc.created_at)}</td>
+                    {can("documents:upload") && (
+                      <td className="px-2 py-3 text-right">
+                        {canDelete(doc) && (
+                          <button
+                            onClick={() => setDeleting(doc)}
+                            className="rounded-md p-1.5 text-muted transition-colors hover:bg-bad-50 hover:text-bad-600"
+                            aria-label={`Delete ${doc.title ?? doc.original_filename}`}
+                            title="Delete"
+                          ><Trash2 className="size-4" /></button>
+                        )}
+                      </td>
+                    )}
                   </tr>
                 ))}
               </Table>

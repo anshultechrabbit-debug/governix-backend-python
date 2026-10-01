@@ -1,7 +1,8 @@
+import logging
 import uuid
 from datetime import UTC, date, datetime
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.orm import Session
 
 from app.core.database import translate_unique_violation
@@ -14,7 +15,8 @@ from app.modules.branches.repository import BranchRepository
 from app.modules.categories.model import Category
 from app.modules.categories.repository import CategoryRepository
 from app.modules.departments.repository import DepartmentRepository
-from app.modules.documents.model import Document
+from app.infrastructure.storage.base import Storage
+from app.modules.documents.model import Document, DocumentStatus
 from app.modules.documents.repository import DocumentRepository
 from app.modules.documents.scope_sync import sync_document_scope
 from app.modules.ingestion.analysis.metadata import normalize_title
@@ -63,6 +65,11 @@ def version_read(version: PolicyVersion, as_of: date) -> VersionRead:
     read.timeline_state = timeline_state(version, as_of)
     read.has_ai_summary = version.ai_summary is not None
     return read
+
+
+logger = logging.getLogger(__name__)
+# The pipeline is still writing these; deleting under it would leave it half-done.
+_PROCESSING = (DocumentStatus.UPLOADED, DocumentStatus.PROCESSING, DocumentStatus.INDEXING)
 
 
 class PolicyService:
@@ -351,6 +358,67 @@ class PolicyService:
         self._announce_if_latest_changed(principal, target, target_before, f"Version {version.version_label} was moved here from {source.name}.")
         self.session.commit()
         return version
+
+    def delete(self, principal: Principal, policy_id: uuid.UUID, storage: Storage) -> dict:
+        """Delete a policy for good: every version, its documents and their files.
+
+        Chunks, pages and analyses go with the documents (database cascades);
+        assignments and relationships to the policy go with it. The audit log keeps
+        a record of what was deleted.
+        """
+        policy = self.get(principal, policy_id)
+        ensure_can_write_scope(principal, policy.branch_id, policy.department_id)
+        documents = list(self.session.scalars(select(Document).where(Document.policy_id == policy.id)))
+        if any(d.status in _PROCESSING for d in documents):
+            raise ConflictError(
+                "A document of this policy is still being processed. Delete the policy once processing finishes.",
+                code="INVALID_STATE",
+            )
+        versions = list(self.session.scalars(select(PolicyVersion).where(PolicyVersion.policy_id == policy.id)))
+        version_ids = {v.id for v in versions}
+        documents += [d for d in self.session.scalars(
+            select(Document).where(Document.id.in_({v.document_id for v in versions}))
+        ) if d not in documents]
+        keys = [d.storage_key for d in documents]
+        details = {
+            "name": policy.name, "policy_number": policy.policy_number,
+            "versions": [v.version_label for v in versions],
+            "documents": [d.original_filename for d in documents],
+        }
+
+        for document in documents:
+            document.policy_version_id = None
+        # Versions outside this policy that point at its versions (none expected) are unlinked by the FKs.
+        self.session.execute(
+            update(PolicyVersion).where(PolicyVersion.id.in_(version_ids))
+            .values(supersedes_version_id=None, superseded_by_version_id=None)
+        )
+        self.session.flush()
+        self.session.execute(delete(PolicyVersion).where(PolicyVersion.id.in_(version_ids)))
+        ids = {"ids": [str(d.id) for d in documents], "policy": str(policy.id)}
+        self.session.execute(text(
+            "DELETE FROM queue_jobs WHERE status IN ('queued', 'failed') AND payload->>'document_id' = ANY(:ids)"
+        ), ids)
+        self.session.execute(text(
+            "DELETE FROM notifications WHERE data->>'document_id' = ANY(:ids) OR data->>'policy_id' = :policy "
+            "OR link LIKE '/policies/' || :policy || '%'"
+        ), ids)
+        for document in documents:
+            self.session.delete(document)
+        self.session.flush()
+        self.session.execute(delete(Policy).where(Policy.id == policy.id))
+        bump_knowledge_version(self.session, policy.organization_id)  # cached answers may cite it
+        record_event(
+            self.session, "policy.deleted", actor=principal, resource_type="policy", resource_id=policy_id,
+            details=details,
+        )
+        self.session.commit()
+        for key in keys:
+            try:
+                storage.delete(key)
+            except Exception:  # the records are gone either way; an orphaned file is only wasted space
+                logger.warning("Could not delete the stored file %s", key, exc_info=True)
+        return {"deleted": True, "versions": len(versions), "documents": len(documents)}
 
     def move(self, principal: Principal, policy_id: uuid.UUID, *, after_id: uuid.UUID | None, before_id: uuid.UUID | None) -> Policy:
         """Place a document after/before another in its category (neither: first) and keep that order."""

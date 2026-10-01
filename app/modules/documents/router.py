@@ -160,6 +160,13 @@ def archive_document(document_id: uuid.UUID, principal: Uploader, service: Servi
     return ok(DocumentRead.model_validate(service.archive(principal, document_id)))
 
 
+@router.delete("/{document_id}", response_model=ApiResponse[dict])
+def delete_document(document_id: uuid.UUID, principal: Uploader, service: Service):
+    """Delete a document permanently, with its version, chunks and stored file."""
+    service.delete(principal, document_id)
+    return ok({"deleted": True})
+
+
 @router.post("/{document_id}/retry", response_model=ApiResponse[DocumentRead])
 def retry_document(document_id: uuid.UUID, principal: Uploader, service: Service):
     return ok(DocumentRead.model_validate(service.retry(principal, document_id)))

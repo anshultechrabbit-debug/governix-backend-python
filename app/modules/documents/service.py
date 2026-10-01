@@ -1,7 +1,9 @@
 import uuid
 from typing import BinaryIO
 
-from sqlalchemy import select, update
+import logging
+
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
@@ -38,6 +40,10 @@ from app.modules.ingestion import progress
 from app.modules.ingestion.model import Stage, StageStatus
 from app.modules.ingestion.pipeline import enqueue_inspection, enqueue_resume
 from app.modules.organizations.repository import bump_knowledge_version
+from app.modules.policies.model import Policy, PolicyVersion, VersionStatus
+from app.modules.versions.timeline import refresh_change_summaries, withdraw_version
+
+logger = logging.getLogger(__name__)
 
 PDF_MAGIC = b"%PDF-"
 MIN_DUPLICATE_REASON = 5
@@ -308,6 +314,74 @@ class DocumentService:
         )
         self.session.commit()
         return document
+
+    def delete(self, principal: Principal, document_id: uuid.UUID) -> None:
+        """Delete a document and everything derived from it, for good.
+
+        Its version leaves the policy's timeline the way a withdrawn one does (the
+        previous version runs on until the next), then is deleted; a policy left
+        with no versions is deleted too. Pages, sections, chunks and analyses go
+        with the document (database cascades), as do its pending pipeline jobs,
+        notifications that link to it, and the stored file. The audit log keeps a
+        record of what was deleted.
+        """
+        document = self._get_manageable(principal, document_id)
+        if document.status in (DocumentStatus.UPLOADED, DocumentStatus.PROCESSING, DocumentStatus.INDEXING):
+            raise ConflictError(
+                "This document is still being processed. Delete it once processing finishes or fails.",
+                code="INVALID_STATE",
+            )
+        version = self.session.scalar(select(PolicyVersion).where(PolicyVersion.document_id == document.id))
+        policy = self.session.get(Policy, version.policy_id if version else document.policy_id) if (
+            version or document.policy_id) else None
+        details = {
+            "filename": document.original_filename, "title": document.title, "status": document.status,
+            "policy_id": str(policy.id) if policy else None, "policy": policy.name if policy else None,
+            "version": version.version_label if version else None,
+        }
+
+        if version is not None:
+            if version.status == VersionStatus.ACTIVE:
+                following_id = version.superseded_by_version_id
+                withdraw_version(self.session, version, "Document deleted")
+                refresh_change_summaries(self.session, self.session.get(PolicyVersion, following_id) if following_id else None)
+            document.policy_version_id = None
+            self.session.flush()
+            self.session.delete(version)
+            self.session.flush()
+
+        key, organization_id, was_searchable = document.storage_key, document.organization_id, document.status == DocumentStatus.READY
+        ids = {"id": str(document.id)}
+        self.session.execute(
+            text("DELETE FROM queue_jobs WHERE status IN ('queued', 'failed') AND payload->>'document_id' = :id"), ids,
+        )
+        self.session.execute(
+            text("DELETE FROM notifications WHERE data->>'document_id' = :id OR link LIKE '/documents/' || :id || '%'"), ids,
+        )
+        self.session.delete(document)
+        self.session.flush()
+
+        if policy is not None and not self.session.scalar(
+            select(func.count()).select_from(PolicyVersion).where(PolicyVersion.policy_id == policy.id)
+        ):
+            self.session.execute(
+                text("DELETE FROM notifications WHERE data->>'policy_id' = :id OR link LIKE '/policies/' || :id || '%'"),
+                {"id": str(policy.id)},
+            )
+            self.session.execute(delete(Policy).where(Policy.id == policy.id))
+            details["policy_deleted"] = True
+
+        if was_searchable or version is not None:
+            bump_knowledge_version(self.session, organization_id)  # cached answers may cite it
+        record_event(
+            self.session, "document.deleted", actor=principal, resource_type="document",
+            resource_id=document_id, details=details,
+        )
+        self.session.commit()
+        try:
+            self.storage.delete(key)
+        except Exception:  # the record is gone either way; an orphaned file is only wasted space
+            logger.warning("Could not delete the stored file %s", key, exc_info=True)
 
     def retry(self, principal: Principal, document_id: uuid.UUID) -> Document:
         document = self._get_manageable(principal, document_id)

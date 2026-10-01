@@ -1,11 +1,14 @@
 import { AlertTriangle, Eye, EyeOff, Inbox, Loader2, MoreHorizontal, X } from "lucide-react";
 import {
+  Fragment,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type ButtonHTMLAttributes, type ComponentProps, type ReactNode, type SelectHTMLAttributes,
   type TextareaHTMLAttributes,
 } from "react";
+import { createPortal } from "react-dom";
 import { cn } from "../../lib/format";
 import { useAppDispatch, useAppSelector } from "../../store/hooks";
 import { dismissToast } from "../../store/toastSlice";
@@ -350,12 +353,46 @@ export interface MenuItem { label: string; onSelect: () => void; danger?: boolea
 
 export function Menu({ items, label = "More actions" }: { items: (MenuItem | false | null | undefined)[]; label?: string }) {
   const [open, setOpen] = useState(false);
+  const [position, setPosition] = useState<{ top: number; left: number } | null>(null);
   const root = useRef<HTMLDivElement>(null);
+  const button = useRef<HTMLButtonElement>(null);
+  const panel = useRef<HTMLDivElement>(null);
   const shown = items.filter(Boolean) as MenuItem[];
+
+  // The panel is rendered on <body> so a scrolling table or card never clips it.
+  // It opens below the button, or above when there is no room below.
+  useLayoutEffect(() => {
+    if (!open) return setPosition(null);
+    const place = () => {
+      const anchor = button.current?.getBoundingClientRect();
+      const menu = panel.current;
+      if (!anchor || !menu) return;
+      const { offsetWidth: width, offsetHeight: height } = menu;
+      const gap = 4;
+      const below = anchor.bottom + gap + height <= window.innerHeight - 8;
+      setPosition({
+        top: below ? anchor.bottom + gap : Math.max(8, anchor.top - gap - height),
+        left: Math.min(Math.max(8, anchor.right - width), window.innerWidth - width - 8),
+      });
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [open]);
+
   useEffect(() => {
     if (!open) return;
     const close = (event: MouseEvent | KeyboardEvent) => {
-      if (event instanceof KeyboardEvent ? event.key === "Escape" : !root.current?.contains(event.target as Node)) setOpen(false);
+      if (event instanceof KeyboardEvent) {
+        if (event.key === "Escape") { setOpen(false); button.current?.focus(); }
+        return;
+      }
+      const target = event.target as Node;
+      if (!root.current?.contains(target) && !panel.current?.contains(target)) setOpen(false);
     };
     window.addEventListener("mousedown", close);
     window.addEventListener("keydown", close);
@@ -364,24 +401,35 @@ export function Menu({ items, label = "More actions" }: { items: (MenuItem | fal
       window.removeEventListener("keydown", close);
     };
   }, [open]);
+
   if (!shown.length) return null;
   return (
     <div ref={root} className="relative">
-      <button type="button" aria-label={label} aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((v) => !v)}
-        className="rounded p-1.5 text-muted hover:bg-subtle hover:text-ink">
+      <button ref={button} type="button" aria-label={label} aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen((v) => !v)}
+        className={cn("rounded p-1.5 text-muted hover:bg-subtle hover:text-ink", open && "bg-subtle text-ink")}>
         <MoreHorizontal className="size-4" />
       </button>
-      {open && (
-        <div role="menu" className="absolute right-0 z-30 mt-1 min-w-44 overflow-hidden rounded-md border border-line bg-surface py-1 shadow-lg">
-          {shown.map((item) => (
-            <button key={item.label} type="button" role="menuitem" disabled={item.disabled}
-              onClick={() => { setOpen(false); item.onSelect(); }}
-              className={cn("flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm hover:bg-subtle disabled:opacity-40",
-                item.danger ? "text-bad-600" : "text-ink")}>
-              {item.icon}{item.label}
-            </button>
+      {open && createPortal(
+        <div
+          ref={panel}
+          role="menu"
+          aria-label={label}
+          style={position ?? { top: 0, left: 0, visibility: "hidden" }}
+          className="fixed z-50 min-w-48 overflow-hidden rounded-lg border border-line bg-surface py-1 shadow-lg"
+        >
+          {shown.map((item, index) => (
+            <Fragment key={item.label}>
+              {item.danger && index > 0 && !shown[index - 1].danger && <div className="my-1 border-t border-line" role="separator" />}
+              <button type="button" role="menuitem" disabled={item.disabled}
+                onClick={() => { setOpen(false); item.onSelect(); }}
+                className={cn("flex w-full items-center gap-2.5 whitespace-nowrap px-3 py-2 text-left text-sm disabled:opacity-40",
+                  item.danger ? "text-bad-600 hover:bg-bad-50" : "text-ink hover:bg-subtle")}>
+                <span className="flex size-4 shrink-0 items-center justify-center">{item.icon}</span>{item.label}
+              </button>
+            </Fragment>
           ))}
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );

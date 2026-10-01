@@ -140,37 +140,70 @@ export function viewerLink(source: { document_id: string | null; page_start: num
   return `/documents/${source.document_id}/view?${params}`;
 }
 
-export function SourceCard({ source, compact }: { source: Source; compact?: boolean }) {
+export interface SourceGroup {
+  key: string;
+  title: string;
+  sources: Source[];
+}
+
+/** Sources grouped by the document version they come from, in citation order. */
+export function groupSources(sources: Source[]): SourceGroup[] {
+  const groups = new Map<string, SourceGroup>();
+  for (const source of sources) {
+    const key = source.kind === "comparison" ? `comparison-${source.number}` : `${source.document_id ?? source.policy_name}-${source.version_id ?? ""}`;
+    const title = source.kind === "comparison" ? "Version comparison" : source.policy_name ?? source.document_title ?? "Document";
+    if (!groups.has(key)) groups.set(key, { key, title, sources: [] });
+    groups.get(key)!.sources.push(source);
+  }
+  return [...groups.values()];
+}
+
+function pages(source: Source) {
+  if (!source.page_start) return null;
+  return source.page_end && source.page_end !== source.page_start ? `pp. ${source.page_start}–${source.page_end}` : `p. ${source.page_start}`;
+}
+
+/** One card per document, its cited passages listed under it. `anchor` gives each passage a scroll target id. */
+export function SourceGroupCard({ group, anchor }: { group: SourceGroup; anchor: (number: number) => string }) {
+  const first = group.sources[0];
   return (
-    <div className="rounded-md border border-line bg-surface p-3 text-sm">
-      <div className="flex items-start justify-between gap-2">
+    <div className="rounded-md border border-line bg-surface text-sm">
+      <div className="flex items-start justify-between gap-2 border-b border-line px-3 py-2.5">
         <div className="min-w-0">
-          <p className="font-medium text-ink">
-            <span className="mr-1.5 inline-flex size-5 items-center justify-center rounded bg-brand-50 text-xs text-brand-700">{source.number}</span>
-            {source.kind === "comparison" ? "Version comparison" : source.policy_name ?? source.document_title}
-          </p>
+          <p className="truncate font-medium text-ink" title={group.title}>{group.title}</p>
           <p className="mt-0.5 text-xs text-muted">
             {[
-              source.version_label && `Version ${source.version_label}`,
-              source.section_number && `Section ${source.section_number}`,
-              source.page_start && `Page ${source.page_start}${source.page_end && source.page_end !== source.page_start ? `–${source.page_end}` : ""}`,
-              source.effective_from && `Effective ${formatDate(source.effective_from)}${source.effective_to ? ` – ${formatDate(source.effective_to)}` : ""}`,
+              first.version_label && `Version ${first.version_label}`,
+              first.effective_from && `Effective ${formatDate(first.effective_from)}${first.effective_to ? ` – ${formatDate(first.effective_to)}` : ""}`,
+              `${group.sources.length} passage${group.sources.length === 1 ? "" : "s"}`,
             ].filter(Boolean).join(" • ")}
           </p>
         </div>
-        {source.previous_version ? <Badge tone="warn">Previous version</Badge> : source.category ? <Badge>{source.category}</Badge> : null}
+        {first.previous_version ? <Badge tone="warn">Previous version</Badge> : first.category ? <Badge>{first.category}</Badge> : null}
       </div>
-      {source.previous_version && (
-        <p className="mt-2 rounded bg-warn-50 px-2 py-1 text-[11px] text-warn-600">
-          The version in force did not cover this, so it is answered from an earlier version.
+      {first.previous_version && (
+        <p className="mx-3 mt-2 rounded bg-warn-50 px-2 py-1 text-[11px] text-warn-600">
+          The version in force did not cover this, so it is answered from this earlier version.
         </p>
       )}
-      {!compact && <p className="mt-2 line-clamp-4 whitespace-pre-line text-xs leading-relaxed text-ink-soft">{source.excerpt}</p>}
-      {source.kind === "passage" && source.document_id && (
-        <Link to={viewerLink(source)} className="mt-2 inline-flex items-center gap-1 text-xs font-medium text-brand-700 hover:underline">
-          Open evidence <ExternalLink className="size-3" />
-        </Link>
-      )}
+      <ul className="divide-y divide-line">
+        {group.sources.map((source) => (
+          <li key={source.evidence_id} id={anchor(source.number)} className="flex scroll-mt-4 gap-2.5 px-3 py-2.5">
+            <span className="mt-0.5 inline-flex size-5 shrink-0 items-center justify-center rounded bg-brand-50 text-xs font-medium text-brand-700">{source.number}</span>
+            <div className="min-w-0 flex-1">
+              <p className="text-xs font-medium text-ink-soft">
+                {[source.section_number && `Section ${source.section_number}`, pages(source)].filter(Boolean).join(" · ") || "Passage"}
+              </p>
+              <p className="mt-0.5 line-clamp-2 whitespace-pre-line text-xs leading-relaxed text-muted">{source.excerpt}</p>
+            </div>
+            {source.kind === "passage" && source.document_id && (
+              <Link to={viewerLink(source)} className="shrink-0 self-start rounded p-1 text-brand-700 hover:bg-brand-50" title="Open evidence" aria-label={`Open evidence for source ${source.number}`}>
+                <ExternalLink className="size-3.5" />
+              </Link>
+            )}
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

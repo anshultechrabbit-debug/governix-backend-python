@@ -261,3 +261,13 @@ def test_a_question_without_words_is_refused_not_answered(db, admin, home_loan, 
     result = ask(admin, question)
     assert result["status"] == "no_answer" and result["sources"] == []
     assert result["no_answer"]["reason"] == "NOT_A_QUESTION"
+
+
+def test_stream_never_shows_claims_that_do_not_answer_the_question(admin, home_loan):
+    # True to the evidence, but about something else: never shown, then withdrawn.
+    _use(StreamingScriptedLLM([
+        {"text": "The interest rate is linked to the repo rate.", "evidence_ids": ["E1"]},
+    ]))
+    events = stream(admin, "What is the LTV for loans above 75 lakh?")
+    assert [kind for kind, _ in events if kind == "claim"] == []
+    assert events[-1][1]["status"] == "no_answer"

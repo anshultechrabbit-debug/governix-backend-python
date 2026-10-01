@@ -1,12 +1,13 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowUpToLine, Eye, FolderInput, GitCompare, GripVertical, RotateCcw, Undo2 } from "lucide-react";
+import { ArrowUpToLine, Eye, FolderInput, GitCompare, GripVertical, RotateCcw, Trash2, Undo2 } from "lucide-react";
 import { useEffect, useState } from "react";
-import { Link } from "react-router";
+import { Link, useNavigate } from "react-router";
 import { api, ApiError, qs } from "../api/client";
 import type { CategoryVersion, Page, Policy } from "../api/types";
 import { cn, formatBytes, formatDate } from "../lib/format";
 import { useReorder } from "../lib/useReorder";
 import { useToast } from "../store/hooks";
+import { DeleteDocumentDialog } from "./DeleteDocument";
 import { EffectiveDate, hasRealEffectiveDate } from "./domain";
 import { Badge, Button, Field, Menu, Modal, Select, StatusBadge, Textarea } from "./ui";
 
@@ -38,6 +39,8 @@ export function VersionManager({ policy, versions, canManage, arrangeable = true
   const [withdrawing, setWithdrawing] = useState<CategoryVersion | null>(null);
   const [restoring, setRestoring] = useState<CategoryVersion | null>(null);
   const [moving, setMoving] = useState<CategoryVersion | null>(null);
+  const [deleting, setDeleting] = useState<CategoryVersion | null>(null);
+  const navigate = useNavigate();
   const activeKey = active.map((v) => `${v.id}:${v.version_label}:${v.timeline_state}`).join(",");
   useEffect(() => setOrder(active), [activeKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -165,6 +168,7 @@ export function VersionManager({ policy, versions, canManage, arrangeable = true
                           isActive && { label: "Withdraw version", icon: <Undo2 className="size-4" />, danger: true, onSelect: () => setWithdrawing(v) },
                           !isActive && { label: "Restore version", icon: <RotateCcw className="size-4" />, onSelect: () => setRestoring(v) },
                           { label: "Move to another policy…", icon: <FolderInput className="size-4" />, onSelect: () => setMoving(v) },
+                          { label: "Delete permanently…", icon: <Trash2 className="size-4" />, danger: true, onSelect: () => setDeleting(v) },
                         ]} />
                       )}
                     </div>
@@ -210,6 +214,15 @@ export function VersionManager({ policy, versions, canManage, arrangeable = true
       <WithdrawModal policyId={policy.id} version={withdrawing} onClose={() => setWithdrawing(null)} onDone={refresh} />
       <RestoreModal policyId={policy.id} version={restoring} onClose={() => setRestoring(null)} onDone={refresh} />
       <MoveModal policy={policy} version={moving} onClose={() => setMoving(null)} onDone={refresh} />
+      {deleting && (
+        <DeleteDocumentDialog
+          document={{ id: deleting.document_id, title: `${policy.name} · v${deleting.version_label}`, original_filename: deleting.filename, policy_id: policy.id }}
+          open
+          onClose={() => setDeleting(null)}
+          // The last version takes the policy with it.
+          onDeleted={() => (versions.length === 1 ? navigate("/policies") : refresh())}
+        />
+      )}
     </>
   );
 }

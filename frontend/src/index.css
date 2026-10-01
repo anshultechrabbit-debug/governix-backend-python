@@ -42,3 +42,7 @@
 /* Diff marks in version comparison. */
 .diff-ins { background: #dcfae6; color: #054f31; border-radius: 2px; }
 .diff-del { background: #fee4e2; color: #7a271a; text-decoration: line-through; border-radius: 2px; }
+
+/* Dialog entrance (DocumentDetailPage's "Upload complete"). */
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes pop-in { from { opacity: 0; transform: translateY(8px) scale(0.96); } to { opacity: 1; transform: none; } }

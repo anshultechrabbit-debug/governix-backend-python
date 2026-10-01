@@ -2,7 +2,7 @@ import { Bot, ChevronDown, FileWarning, History, RotateCcw, Send, Sparkles } fro
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useCategories } from "../components/domain";
 import { Badge, Button, Card, EmptyState, ErrorState, Field, Select, Tabs, Textarea } from "../components/ui";
-import { SourceCard } from "../components/domain";
+import { groupSources, SourceGroupCard } from "../components/domain";
 import { PassageSearch } from "../components/PassageSearch";
 import { cn, formatDate } from "../lib/format";
 import { newId } from "../lib/id";
@@ -171,18 +171,17 @@ function Streaming({ turn }: { turn: Turn }) {
         </p>
         {!!claims.length && (
           <div className="mt-3 space-y-3 text-sm leading-6 text-ink">
-            {claims.map((claim, index) => <p key={`${claim.text}-${index}`}>{claim.text} {claim.citations.map((citation) => <a key={citation} href={`#source-${citation}`} className="ml-0.5 text-xs font-semibold text-brand-700 hover:underline">[{citation}]</a>)}</p>)}
+            {claims.map((claim, index) => <p key={`${claim.text}-${index}`}>{claim.text} {claim.citations.map((citation) => <span key={citation} className="ml-0.5 text-xs font-semibold text-brand-700">[{citation}]</span>)}</p>)}
           </div>
         )}
-        {!!sources.length && (
-          <div className="mt-5 border-t border-line pt-4"><p className="mb-3 text-xs font-semibold uppercase tracking-wide text-muted">Verified sources</p><div className="space-y-3">{sources.map((source) => <div key={source.evidence_id} id={`source-${source.number}`} className="scroll-mt-4"><SourceCard source={source} /></div>)}</div></div>
-        )}
+        {!!sources.length && <p className="mt-3 text-xs text-muted">{sources.length} verified source{sources.length === 1 ? "" : "s"} so far</p>}
       </div>
     </Card>
   );
 }
 
 function Answered({ answer }: { answer: Answer }) {
+  const [open, setOpen] = useState(false);
   // Spec §31/§55: when the version in force did not answer it, the older version
   // used must be named explicitly rather than blended into the answer.
   const older = [...new Set(answer.sources.filter((source) => source.previous_version)
@@ -191,30 +190,98 @@ function Answered({ answer }: { answer: Answer }) {
   const warnings = older.length
     ? answer.warnings.filter((warning) => !warning.startsWith("The version currently in force does not cover this"))
     : answer.warnings;
+  const disagree = answer.conflicts.some((conflict) => conflict.citations?.length);
+  // The short answer: the verified plain-words summary, else the first points as written.
+  const lead = answer.summary ? null : answer.claims.slice(0, SHORT_CLAIMS);
+  const more = answer.summary ? answer.claims.length : answer.claims.length - SHORT_CLAIMS;
+  const notes = warnings.length + answer.conflicts.length;
+  const groups = groupSources(answer.sources);
+  const anchor = (number: number) => `source-${answer.query_id}-${number}`;
+
+  function cite(number: number) {
+    setOpen(true);
+    requestAnimationFrame(() => document.getElementById(anchor(number))?.scrollIntoView({ behavior: "smooth", block: "center" }));
+  }
+  const citations = (numbers: number[]) => numbers.map((n) => (
+    <button key={n} type="button" onClick={() => cite(n)} className="ml-0.5 align-baseline text-xs font-semibold text-brand-700 hover:underline">[{n}]</button>
+  ));
+
   return (
     <div className="p-5">
       <p className="text-sm font-medium text-ai-600">Grounded answer</p>
       {!!older.length && (
-        <div className="mt-2 flex items-start gap-2 rounded-md border border-warn-600/25 bg-warn-50 p-3 text-xs text-warn-600">
-          <History className="mt-0.5 size-4 shrink-0" />
-          <span>
-            Part of this answer comes from an earlier version, because the version currently in force did not cover it:{" "}
-            <span className="font-medium">{older.join(", ")}</span>.
+        <p className="mt-2 flex items-start gap-1.5 text-xs text-warn-600">
+          <History className="mt-px size-3.5 shrink-0" />
+          <span>From an earlier version, because the version in force does not cover this: <span className="font-medium">{older.join(", ")}</span></span>
+        </p>
+      )}
+
+      <div className="mt-2 space-y-2 text-[15px] leading-7 text-ink">
+        {answer.summary
+          ? <p>{answer.summary}</p>
+          : lead?.map((claim, index) => <p key={`${claim.text}-${index}`}>{claim.text} {citations(claim.citations)}</p>)}
+      </div>
+      {disagree && (
+        <p className="mt-2 flex items-center gap-1.5 text-xs font-medium text-warn-600"><FileWarning className="size-3.5" />Sources disagree on part of this. See details.</p>
+      )}
+
+      <div className="mt-3 flex flex-wrap items-center gap-1.5">
+        {groups.map((group) => (
+          <button
+            key={group.key}
+            type="button"
+            onClick={() => cite(group.sources[0].number)}
+            className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-line bg-subtle/60 px-2.5 py-0.5 text-xs text-ink-soft hover:border-brand-500 hover:text-brand-700"
+            title={group.title}
+          >
+            <span className="truncate">{group.title}</span>
+            <span className="shrink-0 text-muted">
+              {group.sources.length > 1 ? `${group.sources.length} passages` : group.sources[0].page_start ? `p. ${group.sources[0].page_start}` : ""}
+            </span>
+          </button>
+        ))}
+      </div>
+
+      <button
+        type="button"
+        onClick={() => setOpen((shown) => !shown)}
+        aria-expanded={open}
+        className="mt-4 inline-flex items-center gap-1 text-sm font-medium text-brand-700 hover:underline"
+      >
+        {open ? "Hide details" : "Show details"}
+        <ChevronDown className={cn("size-4 transition-transform", open && "rotate-180")} />
+        {!open && (more > 0 || notes > 0) && (
+          <span className="ml-1 font-normal text-muted">
+            ({[more > 0 && `${more} cited point${more === 1 ? "" : "s"}`, notes > 0 && `${notes} note${notes === 1 ? "" : "s"}`].filter(Boolean).join(", ")})
           </span>
+        )}
+      </button>
+
+      {open && (
+        <div className="mt-4 space-y-4 border-t border-line pt-4">
+          {!!answer.claims.length && (
+            <div>
+              <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted">What the sources say</p>
+              <div className="space-y-2 text-sm leading-6 text-ink-soft">
+                {answer.claims.map((claim, index) => <p key={`${claim.text}-${index}`}>{claim.text} {citations(claim.citations)}</p>)}
+              </div>
+            </div>
+          )}
+          {!!warnings.length && <div className="rounded-md border border-warn-600/20 bg-warn-50 p-3 text-xs text-warn-600">{warnings.map((warning) => <p key={warning}>{warning}</p>)}</div>}
+          {!!answer.conflicts.length && <div className="rounded-md border border-warn-600/30 bg-warn-50 p-3"><p className="flex items-center gap-1.5 text-sm font-medium text-warn-600"><FileWarning className="size-4" />Potential source conflict</p>{answer.conflicts.map((conflict, index) => <p key={index} className="mt-1 text-xs text-ink-soft">{conflict.description} {conflict.citations && citations(conflict.citations)}</p>)}</div>}
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted"><span>{answer.plan.explanation}</span><span>Evidence score: {Math.round(answer.evidence_score * 100)}%</span>{answer.plan.as_of && <span>As of {formatDate(answer.plan.as_of)}</span>}{answer.cache_hit && <span>Cached result</span>}</div>
+          <div>
+            <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-muted">Verified sources</p>
+            <div className="space-y-3">{groups.map((group) => <SourceGroupCard key={group.key} group={group} anchor={anchor} />)}</div>
+          </div>
         </div>
       )}
-      {answer.summary && <p className="mt-2 text-[15px] leading-7 text-ink">{answer.summary}</p>}
-      {answer.summary && <p className="mt-4 text-xs font-semibold uppercase tracking-wide text-muted">What the sources say</p>}
-      <div className={cn("mt-2 space-y-3 text-sm leading-6", answer.summary ? "text-ink-soft" : "text-ink")}>
-        {answer.claims.map((claim, index) => <p key={`${claim.text}-${index}`}>{claim.text} {claim.citations.map((citation) => <a key={citation} href={`#source-${citation}`} className="ml-0.5 text-xs font-semibold text-brand-700 hover:underline">[{citation}]</a>)}</p>)}
-      </div>
-      {!!warnings.length && <div className="mt-4 rounded-md border border-warn-600/20 bg-warn-50 p-3 text-xs text-warn-600">{warnings.map((warning) => <p key={warning}>{warning}</p>)}</div>}
-      {!!answer.conflicts.length && <div className="mt-4 rounded-md border border-warn-600/30 bg-warn-50 p-3"><p className="flex items-center gap-1.5 text-sm font-medium text-warn-600"><FileWarning className="size-4" />Potential source conflict</p>{answer.conflicts.map((conflict, index) => <p key={index} className="mt-1 text-xs text-ink-soft">{conflict.description} {conflict.citations?.map((citation) => <a key={citation} href={`#source-${citation}`} className="font-medium text-brand-700">[{citation}]</a>)}</p>)}</div>}
-      <details className="mt-4 text-xs text-muted"><summary className="cursor-pointer">Answer details</summary><div className="mt-2 flex flex-wrap gap-x-4 gap-y-1"><span>{answer.plan.explanation}</span><span>Evidence score: {Math.round(answer.evidence_score * 100)}%</span>{answer.plan.as_of && <span>As of {formatDate(answer.plan.as_of)}</span>}{answer.cache_hit && <span>Cached result</span>}</div></details>
-      <div className="mt-5 border-t border-line pt-4"><p className="mb-3 text-xs font-semibold uppercase tracking-wide text-muted">Verified sources</p><div className="space-y-3">{answer.sources.map((source) => <div key={source.evidence_id} id={`source-${source.number}`} className="scroll-mt-4"><SourceCard source={source} /></div>)}</div></div>
     </div>
   );
 }
+
+/** Points shown in the short answer when there is no plain-words summary. */
+const SHORT_CLAIMS = 2;
 
 function NoAnswer({ reason }: { reason: Answer["no_answer"] }) {
   if (!reason) return null;

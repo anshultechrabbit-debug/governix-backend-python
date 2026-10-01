@@ -79,7 +79,7 @@ NO_ANSWER_MESSAGE = "I couldn't find sufficient supporting information in the av
 #   v13    acronym fast-path answer added
 #   v14    cache key changed: raw history excluded; keyed on rewritten question
 #   v15    summary check merged into claim validation (no second LLM call)
-ANSWER_CACHE_VERSION = "v15"
+ANSWER_CACHE_VERSION = "v16"
 # No supported answer in the version in force: worth looking one version back.
 FALLBACK_REASONS = frozenset({
     "NO_RELEVANT_DOCUMENTS", "LOW_RELEVANCE", "KEY_TERMS_NOT_FOUND", "INSUFFICIENT_EVIDENCE",
@@ -358,13 +358,24 @@ class RAGService:
         if response is None:
             self._check_deadline(deadline, evidence)
             yield "stage", {"stage": "writing"}
+            # Claims are held back until together they are on topic: the final answer
+            # applies the same check, and a claim shown and then withdrawn reads as a
+            # glitch ("an answer for a second, then no answer").
+            held: list[dict] = []
+            on_topic = evidence.comparison is not None or is_document_question(request.question)
             for part in self._generate_stream(principal, request, plan, evidence):
                 if isinstance(part, LLMResult):
                     attempt.llm_result = part
-                else:
-                    timings.setdefault("first_claim", round((time.perf_counter() - started) * 1000, 1))
+                    continue
+                held.append(part)
+                if not on_topic and self._off_topic(principal, request.question, [c["text"] for c in held]) is not None:
+                    continue
+                on_topic = True
+                timings.setdefault("first_claim", round((time.perf_counter() - started) * 1000, 1))
+                for claim in held:
                     attempt.claims_streamed += 1
-                    yield "claim", part
+                    yield "claim", claim
+                held = []
             response = self._validated_answer(principal, request, plan, evidence, attempt.llm_result)
         timings[f"{prefix}llm"] = round((time.perf_counter() - step) * 1000, 1)
         if attempt.llm_result is not None:
@@ -602,7 +613,11 @@ class RAGService:
         return 1 - sum(weights[t] for t in missing) / total, missing
 
     def _check_on_topic(self, principal: Principal, question: str, claims: list[str]) -> None:
-        """The verified claims, together, must be about what the question asks.
+        if (missing := self._off_topic(principal, question, claims)) is not None:
+            raise _NoAnswer("ANSWER_OFF_TOPIC", missing)
+
+    def _off_topic(self, principal: Principal, question: str, claims: list[str]) -> list[str] | None:
+        """The question's terms the claims leave out, when too much is left out; None when on topic.
 
         Each claim is true to its evidence, but true statements about something else
         ("the maximum rate on microfinance loans" for a question about home loans
@@ -614,11 +629,12 @@ class RAGService:
         weights = self.retriever.visible_term_weights(principal, terms)
         total = sum(weights.values())
         if total <= 0:
-            return
+            return None
         said = TermIndex(" ".join(claims))
         missing = [t for t in weights if not said.mentions(t)]
         if 1 - sum(weights[t] for t in missing) / total < self.settings.RAG_MIN_SALIENT_COVERAGE:
-            raise _NoAnswer("ANSWER_OFF_TOPIC", missing)
+            return missing
+        return None
 
     def _check_deadline(self, deadline: float, evidence: EvidenceSet) -> None:
         """Abandon an answer that has already spent its whole budget.

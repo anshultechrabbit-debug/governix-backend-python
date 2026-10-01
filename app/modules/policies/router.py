@@ -6,7 +6,8 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.dependencies import get_queue
+from app.core.dependencies import get_queue, get_storage
+from app.infrastructure.storage.base import Storage
 from app.infrastructure.queue.base import Queue
 from app.core.pagination import Page, PageParams, page_params
 from app.core.responses import ApiResponse, ok
@@ -151,6 +152,14 @@ def regenerate_summary(
     version = service.version(principal, policy_id, version_id)
     queue.enqueue(SUMMARIZE, {"version_id": str(version.id)}, organization_id=version.organization_id)
     return ok(summary_view(version))
+
+
+@router.delete("/policies/{policy_id}", response_model=ApiResponse[dict])
+def delete_policy(
+    policy_id: uuid.UUID, principal: Manager, service: Service, storage: Annotated[Storage, Depends(get_storage)],
+):
+    """Delete a policy permanently, with every version, document and stored file."""
+    return ok(service.delete(principal, policy_id, storage))
 
 
 @router.post("/policies/{policy_id}/move", response_model=ApiResponse[PolicyRead])
