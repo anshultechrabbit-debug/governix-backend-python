@@ -7,6 +7,7 @@ import {
   Button, Card, EmptyState, ErrorState, Field, Input, Modal, PageHeader, PasswordInput, SkeletonRows, StatusBadge, Table,
   Textarea,
 } from "../components/ui";
+// import { AIUsageCard } from "../components/AIUsageCard";
 import { formatDateTime } from "../lib/format";
 import { useToast } from "../store/hooks";
 
@@ -69,6 +70,8 @@ export function OrganizationsPage() {
         subtitle="Create organizations, their branding and their first administrator"
         actions={<Button onClick={() => setCreating(true)}><Plus className="size-4" />New organization</Button>}
       />
+      {/* OpenAI usage card: hidden for now. */}
+      {/* <div className="mb-6"><AIUsageCard /></div> */}
       <Card>
         {error ? <div className="p-4"><ErrorState error={error} onRetry={refetch} /></div>
           : isLoading ? <SkeletonRows />

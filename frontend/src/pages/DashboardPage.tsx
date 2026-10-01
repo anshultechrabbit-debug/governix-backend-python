@@ -3,6 +3,7 @@ import { AlertTriangle, Bell, Bot, LifeBuoy, ScrollText, Upload, Users } from "l
 import { Link } from "react-router";
 import { api } from "../api/client";
 import type { Dashboard } from "../api/types";
+// import { AIUsageCard } from "../components/AIUsageCard";
 import { hasRealEffectiveDate } from "../components/domain";
 import { Button, Card, CardHeader, EmptyState, ErrorState, PageHeader, SkeletonRows, Stat, StatusBadge } from "../components/ui";
 import { formatDate, formatDateTime } from "../lib/format";
@@ -67,6 +68,9 @@ export function DashboardPage() {
           </Link>
         )}
       </div>
+
+      {/* OpenAI usage card: hidden for now. */}
+      {/* {me?.role === "org_admin" && <div className="mt-6"><AIUsageCard /></div>} */}
 
       <div className="mt-6 grid gap-6 xl:grid-cols-3">
         <Card className="xl:col-span-2">

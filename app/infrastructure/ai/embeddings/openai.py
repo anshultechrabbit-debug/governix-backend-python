@@ -1,5 +1,6 @@
 import logging
 
+from app.infrastructure.ai import usage as usage_log
 from app.infrastructure.ai.credit import CreditPause, transient
 from app.infrastructure.ai.embeddings.base import Embedded, EmbeddingProvider, EmbeddingUnavailableError
 
@@ -36,9 +37,12 @@ class OpenAIEmbedding(EmbeddingProvider):
             for start in range(0, len(texts), MAX_INPUTS_PER_REQUEST):
                 batch = [t[:MAX_CHARS_PER_INPUT] or " " for t in texts[start:start + MAX_INPUTS_PER_REQUEST]]
                 response = self._client.embeddings.create(model=self.model, input=batch, dimensions=self.dimensions)
+                usage_log.record("embeddings", response.model or self.model,
+                                 input_tokens=getattr(response.usage, "prompt_tokens", 0) or 0)
                 vectors.extend(item.embedding for item in sorted(response.data, key=lambda d: d.index))
             return Embedded(vectors, self.model_id)
         except Exception as exc:
+            usage_log.record("embeddings", self.model, error=usage_log.error_code(exc))
             if transient(exc):
                 raise
             logger.warning(

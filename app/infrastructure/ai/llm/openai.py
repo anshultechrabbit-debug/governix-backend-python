@@ -4,6 +4,7 @@ import re
 import time
 from typing import Any
 
+from app.infrastructure.ai import usage as usage_log
 from app.infrastructure.ai.credit import CreditPause
 from app.infrastructure.ai.llm.base import LLMProvider, LLMResult, LLMUnavailableError
 
@@ -87,9 +88,13 @@ class OpenAILLM(LLMProvider):
                 )
             except OpenAIError as exc:
                 logger.warning("OpenAI LLM request failed (%s: %s). Falling back to LocalLLM.", type(exc).__name__, exc)
+                usage_log.record("answers", self.model, error=usage_log.error_code(exc))
                 self._credit.failed(exc)
                 return self._local(system, user, schema, context)
             choice = response.choices[0]
+            spent = response.usage
+            usage_log.record("answers", response.model or self.model, input_tokens=getattr(spent, "prompt_tokens", 0),
+                         output_tokens=getattr(spent, "completion_tokens", 0))
             if choice.finish_reason != "length" or attempt == retries:
                 break
             logger.warning("LLM output truncated at %s tokens; retrying with a larger budget", budget)
@@ -158,6 +163,7 @@ class OpenAILLM(LLMProvider):
                     if choice.finish_reason:
                         finish_reason = choice.finish_reason
         except OpenAIError as exc:
+            usage_log.record("answers", self.model, error=usage_log.error_code(exc))
             self._credit.failed(exc)
             if parts:
                 # Part of the model's answer was already passed on; appending a
@@ -170,6 +176,8 @@ class OpenAILLM(LLMProvider):
             yield res
             return
         raw = "".join(parts)
+        usage_log.record("answers", model or self.model, input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+                         output_tokens=getattr(usage, "completion_tokens", 0) or 0)
         if finish_reason == "length":
             logger.warning("Streamed LLM output truncated at %s tokens; retrying without streaming", self.max_output_tokens)
             yield self._complete(system, user, schema, budget=self.max_output_tokens * 2,

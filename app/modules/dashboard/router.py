@@ -8,9 +8,12 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core.dependencies import get_app_settings
+from app.core.exceptions import PermissionDeniedError
 from app.core.responses import ApiResponse, ok
+from app.modules.ai_usage.service import usage_overview
 from app.modules.audit.model import AuditEvent
-from app.modules.auth.dependencies import require
+from app.modules.auth.dependencies import get_current_principal, require
 from app.modules.auth.permissions import Permission, Principal, Role
 from app.modules.documents.model import Document, DocumentStatus
 from app.modules.documents.repository import document_visible
@@ -113,3 +116,20 @@ def dashboard(principal: Reader, db: Annotated[Session, Depends(get_db)]):
         ],
         attention=attention,
     ))
+
+
+def _platform_admin(principal: Annotated[Principal, Depends(get_current_principal)]) -> Principal:
+    """The provider key and its credit are the platform's: shown to organization and platform admins."""
+    if principal.role not in (Role.MASTER_ADMIN, Role.ORG_ADMIN):
+        raise PermissionDeniedError("Only administrators can see AI usage and credit.")
+    return principal
+
+
+@router.get("/ai-usage", response_model=ApiResponse[dict])
+def ai_usage(
+    _principal: Annotated[Principal, Depends(_platform_admin)],
+    db: Annotated[Session, Depends(get_db)],
+    settings=Depends(get_app_settings),
+):
+    """AI provider usage (tokens, estimated or exact cost) and the credit left, if one is configured."""
+    return ok(usage_overview(db, settings))

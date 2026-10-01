@@ -1,5 +1,6 @@
 import secrets
 import warnings
+from datetime import date
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
@@ -183,6 +184,15 @@ class Settings(BaseSettings):
     RAG_DEADLINE_SECONDS: float = 20.0
     OPENAI_API_KEY: SecretStr | None = None
     OPENAI_BASE_URL: str | None = None
+    # Credit view on the dashboard. OpenAI does not let an API key read its balance, so
+    # the credit added (and from when) is stated here; spend is subtracted from it.
+    OPENAI_CREDIT_USD: float | None = None
+    OPENAI_CREDIT_SINCE: date | None = None
+    # Optional organization Admin key (sk-admin-...): exact spend from OpenAI's Costs API
+    # instead of an estimate from recorded tokens.
+    OPENAI_ADMIN_KEY: SecretStr | None = None
+    # Price overrides, USD per 1M tokens: {"gpt-4o-mini": [0.15, 0.60]} (input, output).
+    OPENAI_PRICES: dict[str, list[float]] = {}
 
     @field_validator("DATABASE_URL")
     @classmethod
