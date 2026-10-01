@@ -65,10 +65,21 @@ def advance(session: Session, document_id: uuid.UUID, stage: Stage, units: int) 
     )
 
 
+# The time left is estimated from the recent pace, not the average since the stage began:
+# after a restart or a change of worker count, the average lags for a long time.
+RATE_SAMPLE_SECONDS = 15
+RATE_SAMPLES = 6  # about the last 90 seconds
+MIN_RATE_WINDOW_SECONDS = 20
+
+
 def set_done(session: Session, document_id: uuid.UUID, stage: Stage, units: int) -> None:
-    session.execute(
-        update(IngestionStage).where(*_where(document_id, stage)).values(done_units=units)
-    )
+    detail = session.scalar(select(IngestionStage.detail).where(*_where(document_id, stage))) or {}
+    now = datetime.now(UTC)
+    window = list(detail.get("rate_window") or [])
+    values: dict[str, Any] = {"done_units": units}
+    if not window or (now - datetime.fromisoformat(window[-1][0])).total_seconds() >= RATE_SAMPLE_SECONDS:
+        values["detail"] = {**detail, "rate_window": (window + [[now.isoformat(), units]])[-RATE_SAMPLES:]}
+    session.execute(update(IngestionStage).where(*_where(document_id, stage)).values(**values))
 
 
 def finish(
@@ -148,6 +159,12 @@ def _eta_seconds(row: IngestionStage, now: datetime) -> int | None:
     done = row.done_units
     if done < MIN_UNITS_FOR_ETA or done / row.total_units < MIN_FRACTION_FOR_ETA:
         return None
+    window = (row.detail or {}).get("rate_window") or []
+    if window:
+        since, units = datetime.fromisoformat(window[0][0]), window[0][1]
+        span = (now - since).total_seconds()
+        if span >= MIN_RATE_WINDOW_SECONDS and done > units:
+            return int((row.total_units - done) / ((done - units) / span))
     elapsed = (now - row.started_at).total_seconds()
     if elapsed <= 0:
         return None
