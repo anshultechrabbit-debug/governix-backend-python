@@ -151,4 +151,6 @@ class DocumentSection(UUIDPrimaryKeyMixin, Base):
     __table_args__ = (
         Index("ix_document_sections_document_order", "document_id", "order_index"),
         Index("ix_document_sections_tsv", "tsv", postgresql_using="gin"),
+        # ON DELETE CASCADE looks up each deleted section's children by parent_id.
+        Index("ix_document_sections_parent", "parent_id"),
     )

@@ -20,11 +20,15 @@ class QueryClass(StrEnum):
     HISTORICAL = "historical"
     SPECIFIC_VERSION = "specific_version"
     COMPARISON = "comparison"
+    ACROSS_VERSIONS = "across_versions"
 
 
-_VERSION_REF = re.compile(r"\b(?:v|version\s*)(\d{1,3}(?:\.\d{1,3})?)\b", re.I)
+_VERSION_REF = re.compile(r"\b(?:v|version\s*|edition\s*)(\d{1,3}(?:\.\d{1,3})?)\b", re.I)
+# A comparison names at most this many versions ("v1, v2 and v3").
+MAX_COMPARED_VERSIONS = 5
 _COMPARE = re.compile(
-    r"\b(compare|comparison|difference|differences|differ|changed|changes|what'?s new|what is new|vs\.?|versus)\b", re.I
+    r"\b(compare|comparison|difference|differences|differ|change|changed|changes|what'?s new|what is new|"
+    r"vs\.?|versus|introduced|added|removed|deleted|dropped|withdrawn|inserted)\b", re.I
 )
 # "Difference", "changes" and "compare" are about versions only when the question says so:
 # "the unreconciled position difference" or "changes in address" are subjects of a rule.
@@ -32,6 +36,27 @@ _VERSION_CONTEXT = re.compile(
     r"\b(?:versions?|latest|previous|earlier|older|newer|current|revised|revision|amended|amendment|"
     r"updated|update|last\s+year|over\s+time|edition)\b",
     re.I,
+)
+# "... in each edition, and which edition sets the higher figure?": one subject, looked up in
+# every version. The version in force alone can only ever answer for one of them.
+_ACROSS = re.compile(
+    # "all three versions", "each of the 3 versions", "all the versions", "every version".
+    r"\b(?:each|every|both|all|either|the\s+two)\s+(?:of\s+)?(?:the\s+)?(?:(?:two|three|four|five|six|\d{1,2})\s+)?"
+    r"(?:editions?|versions?)\b"
+    r"|\bacross\s+(?:the\s+|all\s+)?(?:editions|versions)\b"
+    r"|\bwhich\s+(?:edition|version)\s+(?:sets|has|gives|allows|requires|is)\s+(?:the\s+|a\s+)?"
+    r"(?:higher|lower|larger|smaller|greater|stricter|longer|shorter|more|less|"
+    r"later|earlier|newer|older|latest|earliest|newest|oldest|more\s+recent)\b",
+    re.I,
+)
+# Words that ask for a comparison, or say which versions, rather than name what to compare.
+COMPARISON_WORDS = frozenset(
+    "compare compared comparing comparison difference differences differ differs different change changed "
+    "changes changing new between versus latest previous earlier older newer current revised revision "
+    "amended amendment amendments updated update updates over time year years two both same "
+    # what happened to a rule ("introduced", "removed"), and how the policy moved ("became stricter")
+    "introduced introduce added removed deleted dropped withdrawn inserted original originally "
+    "became become becomes strict stricter strictness lenient looser loose tighter tightened relaxed evolved".split()
 )
 _PAST = re.compile(r"\b(was|were|used to|previously|earlier|before|prior to|as of|as on|at that time|back in)\b", re.I)
 _YEAR = re.compile(r"\b(?:in|during|for)\s+((?:19|20)\d{2})\b", re.I)
@@ -47,11 +72,16 @@ _YEAR_RANGE = re.compile(
 @dataclass
 class QueryPlan:
     query_class: QueryClass
-    mode: str  # current | as_of | versions
+    mode: str  # current | as_of | versions | all
     as_of: date | None = None
     version_labels: list[str] = field(default_factory=list)
     version_ids: list[uuid.UUID] = field(default_factory=list)
     explanation: str = ""
+    # A comparison with no subject ("what changed in v2?") is answered from the section diff.
+    diff: bool = False
+    # A comparison of one subject ("how did the LTV change?", "which version first changed it?"):
+    # one policy's versions, oldest first, whose consecutive diffs are searched for that subject.
+    diff_versions: list[uuid.UUID] = field(default_factory=list)
 
     def describe(self) -> dict:
         return {
@@ -86,8 +116,20 @@ def plan_query(
         return QueryPlan(QueryClass.CURRENT, "as_of", as_of=today, explanation="Current version selected")
 
     labels = list(dict.fromkeys(_VERSION_REF.findall(question)))
-    if _COMPARE.search(question) and (len(labels) >= 2 or (not labels and _VERSION_CONTEXT.search(question))):
-        return QueryPlan(QueryClass.COMPARISON, "versions", version_labels=labels[:2],
+    if len(labels) >= 2:
+        # "Compare the owner in v1 and v2", "Who is the owner in Version 1.0 and Version 2.0?":
+        # every version named, each answered from its own text.
+        return QueryPlan(QueryClass.COMPARISON, "versions", version_labels=labels[:MAX_COMPARED_VERSIONS],
+                         explanation="Question compares versions " + ", ".join(labels[:MAX_COMPARED_VERSIONS]))
+    if labels and _COMPARE.search(question):
+        # "What changed in version 2.0?": that version and the one it is compared with.
+        return QueryPlan(QueryClass.COMPARISON, "versions", version_labels=labels,
+                         explanation=f"Question asks how version {labels[0]} differs from another version")
+    if not labels and _ACROSS.search(question):
+        return QueryPlan(QueryClass.ACROSS_VERSIONS, "all",
+                         explanation="Question asks about every version; each passage is labelled with its version")
+    if _COMPARE.search(question) and not labels and _VERSION_CONTEXT.search(question):
+        return QueryPlan(QueryClass.COMPARISON, "versions",
                          explanation="Question asks what changed between versions")
     if labels:
         return QueryPlan(QueryClass.SPECIFIC_VERSION, "versions", version_labels=labels[:1],
@@ -120,3 +162,32 @@ def _date_in_question(question: str, date_order: str) -> date | None:
     if match := _YEAR.search(question):
         return date(int(match[1]), 12, 31)
     return None
+
+
+def without_version_refs(text: str) -> str:
+    """The question without "Version 1.0", "v2" or "edition 3": those choose the versions to
+    search, and a passage seldom repeats its own version number."""
+    return _VERSION_REF.sub(" ", text)
+
+
+def version_mentions(text: str) -> list[str]:
+    """The version references as written ("Version 1.0", "v2"), in order, without repeats."""
+    return list(dict.fromkeys(m.group(0).strip() for m in _VERSION_REF.finditer(text)))
+
+
+def normal_label(label: str) -> str:
+    """One spelling per version label: "v1", "1", "1.0" and "01.00" are the same version,
+    while "2.1" and "2.10" are not."""
+    parts = label.strip().lower().removeprefix("version").strip().removeprefix("v").strip().split(".")
+    while len(parts) > 1 and not parts[-1].strip("0"):
+        parts.pop()
+    return ".".join(part.lstrip("0") or "0" for part in parts)
+
+
+def compares_versions(question: str) -> bool:
+    """ "Has the owner changed between the versions?", "What changed in v2?", "... in each edition":
+    words like "changed" and "between" then frame the question instead of naming its subject."""
+    return bool(
+        (_COMPARE.search(question) and (_VERSION_REF.search(question) or _VERSION_CONTEXT.search(question)))
+        or _ACROSS.search(question)
+    )

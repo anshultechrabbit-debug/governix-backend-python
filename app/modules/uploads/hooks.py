@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.infrastructure.queue.base import Queue
 from app.modules.documents.model import Document
-from app.modules.uploads.model import ItemStatus, UploadBatchItem
+from app.modules.uploads.model import ItemStatus, UploadBatchGroup, UploadBatchItem
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,10 @@ def document_confirmed(session: Session, document: Document) -> None:
     if item.status == ItemStatus.NEEDS_REVIEW:
         item.message = "Confirmed after review."
     item.status, item.policy_version_id = ItemStatus.CONFIRMED, document.policy_version_id
+    group = session.get(UploadBatchGroup, item.group_id)
+    if group is not None and group.policy_id is None:
+        # Confirmed by a person: the group's other files are now offered as versions of this policy.
+        group.policy_id = document.policy_id
     session.flush()
     from app.modules.uploads.service import refresh_statuses
 

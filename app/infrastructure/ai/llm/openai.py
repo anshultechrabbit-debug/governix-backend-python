@@ -5,7 +5,7 @@ import time
 from typing import Any
 
 from app.infrastructure.ai import usage as usage_log
-from app.infrastructure.ai.credit import CreditPause
+from app.infrastructure.ai.credit import CreditPause, transient
 from app.infrastructure.ai.llm.base import LLMProvider, LLMResult, LLMUnavailableError
 
 logger = logging.getLogger(__name__)
@@ -13,6 +13,25 @@ logger = logging.getLogger(__name__)
 TRUNCATION_RETRIES = 1  # default when the caller does not pass one
 # Only reasoning models accept `reasoning_effort`; sending it to others is a 400.
 _REASONING_MODEL = re.compile(r"^(?:gpt-5|o\d)", re.I)
+
+
+# A rate limit or a dropped connection passes within seconds; the client's own retries are
+# quick, and under a token-per-minute limit they can all land inside the same minute. These
+# waits come on top, before an answer is downgraded to quoting the documents.
+TRANSIENT_WAITS = (2.0, 5.0, 10.0)
+MAX_WAIT_SECONDS = 15.0
+_TRY_AGAIN = re.compile(r"try again in ([\d.]+)\s*(ms|s)\b", re.I)
+
+
+def _wait_for(exc: Exception, attempt: int) -> float | None:
+    """How long to wait before trying again after `exc`, or None when it will not pass."""
+    if attempt >= len(TRANSIENT_WAITS) or not transient(exc):
+        return None
+    wait = TRANSIENT_WAITS[attempt]
+    if match := _TRY_AGAIN.search(str(exc)):
+        hinted = float(match.group(1)) / (1000 if match.group(2).lower() == "ms" else 1)
+        wait = max(wait, hinted + 0.5)
+    return min(wait, MAX_WAIT_SECONDS)
 
 
 class OpenAILLM(LLMProvider):
@@ -75,22 +94,30 @@ class OpenAILLM(LLMProvider):
         choice = None
         response = None
         for attempt in range(retries + 1):
-            try:
-                response = self._client.chat.completions.create(
-                    model=self.model,
-                    messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                    response_format={
-                        "type": "json_schema",
-                        "json_schema": {"name": "grounded_answer", "schema": schema, "strict": True},
-                    },
-                    max_completion_tokens=budget,
-                    **options,
-                )
-            except OpenAIError as exc:
-                logger.warning("OpenAI LLM request failed (%s: %s). Falling back to LocalLLM.", type(exc).__name__, exc)
-                usage_log.record("answers", self.model, error=usage_log.error_code(exc))
-                self._credit.failed(exc)
-                return self._local(system, user, schema, context)
+            waited = 0
+            while True:
+                try:
+                    response = self._client.chat.completions.create(
+                        model=self.model,
+                        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                        response_format={
+                            "type": "json_schema",
+                            "json_schema": {"name": "grounded_answer", "schema": schema, "strict": True},
+                        },
+                        max_completion_tokens=budget,
+                        **options,
+                    )
+                    break
+                except OpenAIError as exc:
+                    usage_log.record("answers", self.model, error=usage_log.error_code(exc))
+                    if (wait := _wait_for(exc, waited)) is not None:
+                        logger.warning("OpenAI LLM request failed (%s); retrying in %.1fs", type(exc).__name__, wait)
+                        time.sleep(wait)
+                        waited += 1
+                        continue
+                    logger.warning("OpenAI LLM request failed (%s: %s). Falling back to LocalLLM.", type(exc).__name__, exc)
+                    self._credit.failed(exc)
+                    return self._local(system, user, schema, context)
             choice = response.choices[0]
             spent = response.usage
             usage_log.record("answers", response.model or self.model, input_tokens=getattr(spent, "prompt_tokens", 0),
@@ -120,6 +147,20 @@ class OpenAILLM(LLMProvider):
             metadata={"finish_reason": choice.finish_reason},
         )
 
+    def _open_stream(self, system: str, user: str, schema: dict[str, Any], options: dict[str, Any]):
+        return self._client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "grounded_answer", "schema": schema, "strict": True},
+            },
+            max_completion_tokens=self.max_output_tokens,
+            stream=True,
+            stream_options={"include_usage": True},
+            **options,
+        )
+
     def stream_json(self, system: str, user: str, schema: dict[str, Any], *, context=None):
         """Stream the structured output: text deltas as they arrive, then the LLMResult.
 
@@ -139,19 +180,24 @@ class OpenAILLM(LLMProvider):
         started = time.perf_counter()
         parts: list[str] = []
         finish_reason, model, usage = None, None, None
+        waited = 0
+        while True:
+            try:
+                stream = self._open_stream(system, user, schema, options)
+                break
+            except OpenAIError as exc:
+                usage_log.record("answers", self.model, error=usage_log.error_code(exc))
+                if (wait := _wait_for(exc, waited)) is None:
+                    self._credit.failed(exc)
+                    logger.warning("OpenAI LLM stream failed (%s: %s). Falling back to LocalLLM.", type(exc).__name__, exc)
+                    res = self._local(system, user, schema, context)
+                    yield json.dumps(res.content)
+                    yield res
+                    return
+                logger.warning("OpenAI LLM stream failed to start (%s); retrying in %.1fs", type(exc).__name__, wait)
+                time.sleep(wait)
+                waited += 1
         try:
-            stream = self._client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {"name": "grounded_answer", "schema": schema, "strict": True},
-                },
-                max_completion_tokens=self.max_output_tokens,
-                stream=True,
-                stream_options={"include_usage": True},
-                **options,
-            )
             for chunk in stream:
                 model = chunk.model or model
                 if chunk.usage is not None:

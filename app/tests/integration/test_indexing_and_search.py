@@ -1,9 +1,11 @@
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from app.infrastructure.ai.embeddings.local import LocalEmbedding
 from app.modules.audit.model import AuditEvent
 from app.modules.documents.model import Document
+from app.modules.ingestion.model import IngestionStage, Stage
+from app.modules.ingestion.recovery import resume_ready_embeddings
 from app.modules.organizations.model import Organization
 from app.modules.search.model import Chunk, EmbeddingCache
 from app.tests.factories import login, make_tenant
@@ -146,7 +148,8 @@ def test_withdrawn_versions_and_archived_documents_leave_search(admin, home_loan
     assert search(admin, "What is the LTV for loans above 75 lakh?")["passages"] == []
 
 
-def test_missing_embedding_provider_fails_clearly(client, db, app, tenant, admin):
+def test_missing_embedding_provider_leaves_the_document_searchable_then_resumes(client, db, app, tenant, admin):
+    """Embedding finishes after a document is searchable by keyword; its failure does not undo that."""
     from app.infrastructure.ai.embeddings.base import EmbeddingUnavailableError
 
     class Broken:
@@ -164,6 +167,89 @@ def test_missing_embedding_provider_fails_clearly(client, db, app, tenant, admin
     confirm_new_policy(admin, document_id, analysis)
     drain(app)
     document = db.get(Document, document_id)
-    assert document.status == "failed"
-    assert document.error["code"] == "EMBEDDINGS_UNAVAILABLE"
-    assert "OPENAI_API_KEY" in document.error["message"]
+    assert document.status == "ready"
+    stage = stage_row(db, document_id, Stage.EMBEDDING)
+    assert stage.status == "failed" and stage.detail["code"] == "EMBEDDINGS_UNAVAILABLE"
+    assert "OPENAI_API_KEY" in stage.detail["error"]
+
+    # The key is configured: the document, still without vectors, is found by keyword.
+    runtime.overrides["embedder"] = LocalEmbedding(1536)
+    assert search(admin, "home loan credit policy interest rate")["passages"]
+    # The worker restarts: only the missing vectors are written.
+    with app.state.session_factory() as session:
+        assert [d.id for d in resume_ready_embeddings(session, runtime.queue, 256)] == [document_id]
+    drain(app)
+    db.expire_all()
+    embedded, total = db.execute(
+        select(func.count(Chunk.embedding), func.count()).where(Chunk.document_id == document_id)
+    ).one()
+    assert embedded == total > 0
+    assert stage_row(db, document_id, Stage.EMBEDDING).status == "completed"
+    assert stage_row(db, document_id, Stage.INDEXING).status == "completed"
+
+
+def stage_row(db, document_id, stage):
+    return db.scalar(select(IngestionStage).where(
+        IngestionStage.document_id == document_id, IngestionStage.stage == stage))
+
+
+def test_a_numbered_clause_inside_a_section_is_found_by_its_number(client, app, tenant, admin, embedder):
+    """Manuals number clauses inside a section's text ("4.25.9 ..." under "Section 4.25")."""
+    from app.tests.pdfs import PolicySpec, Section
+
+    spec = PolicySpec(sections=[
+        Section("Section 4.25", "Deposit Products and Pricing", [
+            "4.25.8 The Bank shall maintain a liquidity buffer of not less than 12%.",
+            "4.25.9 The Bank shall maintain a monitoring buffer of not less than 16%.",
+            "4.25.19 The Bank shall maintain a reconciliation buffer of not less than 22%.",
+        ]),
+        Section("Section 4.26", "Collateral", ["4.26.1 Collateral shall be valued annually."]),
+    ])
+    document_id, analysis = process(client, app, tenant.admin, build(spec))
+    confirm_new_policy(admin, document_id, analysis)
+    drain(app)
+    top = search(admin, "what does section 4.25.9 say")["passages"][0]
+    assert "4.25.9 The Bank shall maintain a monitoring buffer" in top["text"] and "exact" in top["lanes"]
+
+
+class Rewording:
+    """Stands in for the model: rewords the question in the document's terms."""
+
+    def __init__(self, queries):
+        self.queries, self.calls = queries, 0
+
+    def generate_json(self, system, user, schema, *, context=None):
+        from app.infrastructure.ai.llm.base import LLMResult
+
+        self.calls += 1
+        return LLMResult(content={"queries": self.queries}, model="fake")
+
+
+def test_a_reworded_question_finds_a_document_still_being_embedded(db, admin, home_loan):
+    _policy_id, _v3_doc, v4_doc = home_loan
+    llm = Rewording(["LTV high value loans above 75 lakh"])
+    get_runtime().overrides["llm"] = llm
+    get_runtime().__dict__.pop("llm", None)
+    # The document is searchable, but its vectors have not been written yet.
+    db.execute(update(Chunk).where(Chunk.document_id == v4_doc).values(embedding=None))
+    db.execute(update(IngestionStage).where(IngestionStage.document_id == v4_doc,
+                                            IngestionStage.stage == Stage.EMBEDDING).values(status="running"))
+    db.commit()
+    question = "ceiling on borrowing relative to property worth for big mortgages"
+
+    def found(text):
+        passages = search(admin, text, mode="all", document_ids=[str(v4_doc)])["passages"]
+        return any("70%" in p["text"] for p in passages)
+
+    llm.queries = []
+    assert not found(question + "?")  # as asked, the keyword lanes miss it
+    llm.queries = ["LTV high value loans above 75 lakh"]
+    assert found(question)
+    assert llm.calls == 2
+
+    # Once the vectors are written, the question is searched as asked.
+    db.execute(update(IngestionStage).where(IngestionStage.document_id == v4_doc,
+                                            IngestionStage.stage == Stage.EMBEDDING).values(status="completed"))
+    db.commit()
+    search(admin, question + " please", mode="all", document_ids=[str(v4_doc)])
+    assert llm.calls == 2

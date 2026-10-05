@@ -1,5 +1,6 @@
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -21,6 +22,7 @@ from app.modules.search.retrieval import (
     query_terms,
 )
 from app.modules.search.query_intelligence import query_variants
+from app.modules.search.rephrase import MAX_REPHRASINGS, rephraser
 from app.modules.search.schema import Passage, PolicyHit, Provenance, SearchRequest, SearchResponse
 
 QUERY_VECTOR_TTL = 24 * 3600
@@ -64,31 +66,35 @@ def build_filters(request) -> SearchFilters:
     )
 
 
-def retrieve_with_variants(principal, retriever, embedder, cache, query, filters, *, limit: int):
+def retrieve_with_variants(principal, retriever, embedder, cache, query, filters, *, limit: int, rephrase=None):
     """Fuse independently retrieved lexical variants with RRF.
 
     Every individual retrieval retains its SQL ACL/version predicate; fusion
     only combines already-authorised candidates.
+
+    `rephrase` (see search.rephrase) rewords the query for documents whose vectors
+    are still being written; each rewording runs the keyword lanes over those only.
     """
-    variants = query_variants(query)
-    if len(variants) == 1:
+    jobs = [(variant, filters, True) for variant in query_variants(query)]
+    if rephrase is not None and (pending := retriever.documents_still_embedding(principal, filters)):
+        scoped = replace(filters, document_ids=pending)
+        jobs += [(reworded, scoped, False) for reworded in rephrase(query)]
+    if len(jobs) == 1:
         return retriever.retrieve(
-            principal, variants[0], filters, limit=limit,
-            query_vector=embed_query_cached(embedder, cache, variants[0]),
+            principal, jobs[0][0], filters, limit=limit,
+            query_vector=embed_query_cached(embedder, cache, jobs[0][0]),
         )
     # Variants run concurrently on the shared lane pool. Running them in series
     # tripled wall-clock latency for a recall gain that does not need it.
-    with ThreadPoolExecutor(max_workers=min(len(variants), VARIANT_POOL_SIZE)) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(jobs), VARIANT_POOL_SIZE + MAX_REPHRASINGS)) as pool:
         futures = [
             pool.submit(
-                retriever.retrieve, principal, variant, filters,
-                limit=limit, query_vector=embed_query_cached(embedder, cache, variant),
+                retriever.retrieve, principal, variant, scope, limit=limit, semantic=semantic,
+                query_vector=embed_query_cached(embedder, cache, variant) if semantic else None,
             )
-            for variant in variants
+            for variant, scope, semantic in jobs
         ]
         results = [future.result() for future in futures]
-    if len(results) == 1:
-        return results[0]
     fused = {}
     for variant_index, result in enumerate(results):
         for rank, candidate in enumerate(result.candidates, start=1):
@@ -98,8 +104,8 @@ def retrieve_with_variants(principal, retriever, embedder, cache, query, filters
     merged = sorted(fused.values(), key=lambda c: c.fused, reverse=True)[:limit]
     base = results[0]
     base.candidates = merged
-    base.timings_ms["query_variants"] = len(variants)
-    base.lane_counts["query_variants"] = len(variants)
+    base.timings_ms["query_variants"] = len(jobs)
+    base.lane_counts["query_variants"] = len(jobs)
     return base
 
 
@@ -170,8 +176,10 @@ class SearchService:
         session_factory: sessionmaker[Session],
         embedder: EmbeddingProvider | None,
         cache: Cache,
+        llm_factory=None,
     ) -> None:
         self.session = session
+        self.rephrase = rephraser(llm_factory)
         self.cache = cache
         self.embedder: EmbeddingProvider | None = embedder
         self.retriever = HybridRetriever(session_factory, embedder)
@@ -188,6 +196,7 @@ class SearchService:
         filters = build_filters(request)
         result = retrieve_with_variants(
             principal, self.retriever, self.embedder, self.cache, request.query, filters, limit=request.limit,
+            rephrase=self.rephrase,
         )
         sources = provenance(self.session, result.candidates)
         response = SearchResponse(

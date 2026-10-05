@@ -8,13 +8,16 @@ works again. Failures caused by the document itself are never retried here.
 """
 
 import logging
+import time
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.infrastructure.queue.base import Queue
 from app.modules.documents.model import Document, DocumentStatus
 from app.modules.documents.service import requeue_failed
+from app.modules.ingestion import pipeline, progress
+from app.modules.ingestion.model import IngestionStage, Stage, StageStatus
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +48,31 @@ def resume_provider_failures(session: Session, queue: Queue, available: set[str]
     return list(documents)
 
 
+def resume_ready_embeddings(session: Session, queue: Queue, batch_size: int) -> list[Document]:
+    """Finish the vectors of READY documents whose embedding stage failed after they became searchable."""
+    from app.modules.search.model import Chunk
+
+    documents = session.scalars(
+        select(Document)
+        .join(IngestionStage, IngestionStage.document_id == Document.id)
+        .where(Document.status == DocumentStatus.READY, IngestionStage.stage == Stage.EMBEDDING,
+               IngestionStage.status == StageStatus.FAILED)
+        .order_by(Document.updated_at)
+        .limit(SWEEP_LIMIT)
+        .with_for_update(of=Document, skip_locked=True)
+    ).all()
+    for document in documents:
+        total = session.scalar(select(func.count()).where(Chunk.document_id == document.id))
+        progress.start(session, document.id, Stage.EMBEDDING)
+        progress.start(session, document.id, Stage.INDEXING)
+        # A new round: the failed batches' jobs are spent; their idempotency keys stay taken.
+        pipeline.enqueue_embedding(queue, session, document, total, batch_size,
+                                   round_=f":r{int(time.time())}")
+        logger.info("Resuming embeddings of document %s", document.id)
+    session.commit()
+    return list(documents)
+
+
 def available_providers(runtime) -> set[str]:
     """Providers that can be constructed with the current configuration."""
     available = set()
@@ -69,7 +97,10 @@ def startup_sweep(session_factory) -> None:
     try:
         runtime = get_runtime()
         with session_factory() as session:
-            resumed = resume_provider_failures(session, runtime.queue, available_providers(runtime))
+            available = available_providers(runtime)
+            resumed = resume_provider_failures(session, runtime.queue, available)
+            if "embedder" in available:
+                resumed += resume_ready_embeddings(session, runtime.queue, runtime.settings.EMBED_BATCH_SIZE)
         if resumed:
             logger.info("Resumed %s document(s) after provider recovery", len(resumed))
     except Exception:  # noqa: BLE001

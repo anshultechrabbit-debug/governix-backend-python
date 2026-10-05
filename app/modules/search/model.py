@@ -51,6 +51,8 @@ class Chunk(UUIDPrimaryKeyMixin, Base):
         Index("ix_chunks_document_index", "document_id", "chunk_index"),
         Index("ix_chunks_scope", "organization_id", "branch_id", "department_id"),
         Index("ix_chunks_version", "version_id"),
+        # Deleting a policy cascades to its chunks through policy_id.
+        Index("ix_chunks_policy", "policy_id"),
         Index("ix_chunks_section", "section_id"),
         Index("ix_chunks_tsv", "tsv", postgresql_using="gin"),
         # The exact lane and the acronym/glossary lookup match Chunk.text with a

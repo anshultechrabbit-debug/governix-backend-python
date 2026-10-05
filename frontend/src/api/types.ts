@@ -94,6 +94,9 @@ export interface DocumentDetail extends DocumentRead {
   pdf_metadata: Record<string, any>;
   duplicate_override_reason: string | null;
   progress: Progress | null;
+  /** Part of a bulk upload that files it with the rest of its group: nobody confirms it by hand. */
+  upload_batch_id: string | null;
+  filed_by_batch: boolean;
 }
 
 export interface Signal {

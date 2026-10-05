@@ -37,3 +37,13 @@ def test_a_claim_is_released_as_soon_as_it_closes():
 def test_no_claims():
     stream = ClaimStream()
     assert stream.feed(json.dumps({"claims": [], "insufficient_evidence": True, "conflicts": []})) == []
+
+
+def test_a_declared_lack_of_evidence_is_seen_before_any_claim():
+    # The schema puts insufficient_evidence first, so it is known before a claim could be shown.
+    stream = ClaimStream()
+    stream.feed('{"insufficient_evidence": true, "claims": [{"text": "Nearby fact.", "evid')
+    assert stream.declared_insufficient
+    sufficient = ClaimStream()
+    sufficient.feed('{"insufficient_evidence": false, "claims": [')
+    assert not sufficient.declared_insufficient

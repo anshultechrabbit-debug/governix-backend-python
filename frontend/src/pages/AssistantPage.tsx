@@ -372,7 +372,8 @@ function answerBasis(answer: Answer) {
     ? "Answered from an earlier version of the policy"
     : plan.query_class === "historical" && when ? `Answered from the policies in force on ${when}`
     : plan.query_class === "specific_version" ? "Answered from the version you asked about"
-    : plan.query_class === "comparison" ? "Answered by comparing the two versions"
+    : plan.query_class === "comparison" ? "Answered by comparing versions"
+    : plan.query_class === "across_versions" ? "Answered from every version of the policy"
     : when ? `Answered from the policies in force today (${when})` : "Answered from your policies";
   const match = answer.evidence_score >= 0.6 ? "strong" : answer.evidence_score >= 0.35 ? "good" : "partial";
   return `${basis} · ${match} match with the documents`;
@@ -390,6 +391,21 @@ function NoAnswer({ reason }: { reason: Answer["no_answer"] }) {
     return (
       <div className="p-5">
         <p className="flex items-start gap-2 text-[15px] leading-7 text-ink"><Sparkles className="mt-1.5 size-4 shrink-0 text-ai-600" />{reason.message}</p>
+      </div>
+    );
+  }
+  if (reason.reason === "AMBIGUOUS") {
+    // Found, but several rules match with different values: ask which one, never pick.
+    return (
+      <div className="p-5">
+        <p className="font-medium text-ink">Which one do you mean?</p>
+        <p className="mt-1 text-sm text-ink-soft">{reason.message}</p>
+        {!!reason.suggestions.length && (
+          <div className="mt-3">
+            <p className="text-xs font-medium text-muted">Matching rules:</p>
+            <ul className="mt-1 list-disc space-y-0.5 pl-4 text-xs text-ink-soft">{reason.suggestions.map((suggestion) => <li key={suggestion}>{suggestion}</li>)}</ul>
+          </div>
+        )}
       </div>
     );
   }

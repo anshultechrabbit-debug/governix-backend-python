@@ -188,6 +188,24 @@ def test_a_statement_about_what_the_documents_lack_is_not_a_claim():
     assert not result.valid and result.problems == [ABSENCE_PROBLEM]
 
 
+def test_a_hedged_statement_about_what_the_documents_lack_is_not_a_claim():
+    from app.modules.rag.validation import ABSENCE_PROBLEM
+
+    for text in ("The processing fee on a personal loan is not explicitly stated in the Unsecured Personal Loan Policy.",
+                 "The Unsecured Personal Loan Policy in Version 1.0 does not specify a processing fee."):
+        [result] = validate_claims([{"text": text, "evidence_ids": ["E2"]}], EVIDENCE)
+        assert result.problems == [ABSENCE_PROBLEM], text
+
+
+def test_a_rule_that_something_is_not_needed_is_still_a_claim():
+    from app.modules.rag.validation import ABSENCE_PROBLEM
+
+    evidence = {"E1": EvidenceText("E1", "Borrowers do not need to provide collateral for loans up to Rs. 5 lakh.")}
+    [result] = validate_claims([{"text": "Borrowers do not need to provide collateral for loans up to Rs. 5 lakh.",
+                                 "evidence_ids": ["E1"]}], evidence)
+    assert ABSENCE_PROBLEM not in result.problems and result.valid, result.problems
+
+
 def test_a_percent_sign_answers_a_question_about_a_percentage():
     from app.modules.rag.validation import TermIndex
 
@@ -242,3 +260,61 @@ def test_restating_the_other_half_of_a_sentence_with_a_negation_is_not_a_reversa
     [result] = validate_claims([{"text": "The Trade Pricing Review shall be submitted to the Credit Risk Committee by working day 6 of each month.",
                                  "evidence_ids": ["E1"]}], evidence)
     assert result.valid, result.problems
+
+
+# Definitions and tables of contents of two versions, as in a 1,000-page manual.
+DEFINITIONS_V1 = (
+    "'Reporting' means the reporting activity, measured fortnightly against threshold 17.8.\n"
+    "'Exposure' means the exposure activity, measured daily against threshold 69.7.\n"
+    "'Documentation' means the documentation activity, measured monthly against threshold 37.1.\n"
+    "'Review' means the review activity, measured monthly against threshold 44.7."
+)
+VERSIONS = {
+    "E1": EvidenceText("E1", "Table of Contents\nChapter 1 Digital Banking and Payments\nChapter 7 Vendor Onboarding",
+                       versions=frozenset({"2.0"})),
+    "E2": EvidenceText("E2", "Table of Contents\nChapter 1 Fraud Prevention and Reporting\nChapter 3 Vendor Onboarding",
+                       versions=frozenset({"1.0"})),
+    "E3": EvidenceText("E3", DEFINITIONS_V1, versions=frozenset({"1.0"})),
+}
+
+
+def check_versions(text, ids, question=""):
+    from app.modules.rag.evidence import key_terms
+
+    [result] = validate_claims([{"text": text, "evidence_ids": ids}], VERSIONS, key_terms(question), question)
+    return result
+
+
+def test_a_measured_value_must_belong_to_the_term_it_is_stated_for():
+    question = "How does the Review definition differ between versions?"
+    assert check_versions("In Version 1.0, Review is measured monthly against threshold 44.7.", ["E3"], question).valid
+    swapped = check_versions("In Version 1.0, Review is measured fortnightly against threshold 17.8.", ["E3"], question)
+    assert not swapped.valid and "17.8 is not stated for review" in swapped.problems[0]
+
+
+def test_a_claim_about_a_version_must_cite_that_version():
+    wrong = check_versions("Chapter 1 Digital Banking and Payments is in Version 1.0.", ["E1"])
+    assert not wrong.valid and "is about version 1.0 but cites only version 2.0" in wrong.problems
+    both = check_versions("Both versions have a chapter called Digital Banking and Payments.", ["E1"])
+    assert not both.valid and "is about every version" in both.problems[0]
+    assert check_versions("Vendor Onboarding appears in both versions.", ["E1", "E2"]).valid
+
+
+def test_saying_a_version_lacks_something_is_checked_against_that_version():
+    assert check_versions("Chapter 1 Fraud Prevention and Reporting is in Version 1.0 but not in Version 2.0.", ["E2"]).valid
+    wrong = check_versions("Chapter 3 Vendor Onboarding is in Version 1.0 but not in Version 2.0.", ["E2"])
+    assert not wrong.valid and "says version 2.0 lacks it, but E1 (version 2.0) has it" in wrong.problems
+
+
+def test_clause_numbers_are_whole_words():
+    from app.modules.rag.validation import TermIndex
+
+    index = TermIndex("4.25.19 The Bank shall maintain a monitoring buffer of not less than 16%.")
+    assert index.mentions("4.25.19") and index.mentions("4.25")
+    assert not index.mentions("4.25.1")  # a shared prefix joins word forms, never numbers
+
+
+def test_saying_every_version_has_something_is_checked_in_each_version():
+    assert check_versions("Chapter 3 Vendor Onboarding appears in both Version 1.0 and Version 2.0.", ["E1", "E2"]).valid
+    wrong = check_versions("Chapter 1 Digital Banking and Payments appears in both versions.", ["E1", "E2"])
+    assert not wrong.valid and "the version 1.0 passage does not" in wrong.problems[0]

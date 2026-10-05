@@ -21,7 +21,8 @@ Searcher = Annotated[Principal, Depends(require(Permission.SEARCH))]
 def get_service(
     request: Request, db: Annotated[Session, Depends(get_db)], cache: Annotated[Cache, Depends(get_cache)]
 ) -> SearchService:
-    return SearchService(db, request.app.state.session_factory, get_runtime().embedder, cache)
+    runtime = get_runtime()
+    return SearchService(db, request.app.state.session_factory, runtime.embedder, cache, llm_factory=lambda: runtime.llm)
 
 
 @router.post("", response_model=ApiResponse[SearchResponse])

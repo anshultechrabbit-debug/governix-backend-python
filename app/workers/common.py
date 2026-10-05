@@ -6,10 +6,11 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.infrastructure.queue.registry import JobContext
+from app.infrastructure.queue.registry import JobContext, RetryLater
 from app.modules.documents.model import Document, DocumentStatus
 from app.modules.documents.service import mark_failed
-from app.modules.ingestion.model import Stage
+from app.modules.ingestion import progress
+from app.modules.ingestion.model import Stage, StageStatus
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,9 @@ def failure_guard(
     except PipelineError as exc:
         session.rollback()
         _fail(session, document_id, stage, exc.code, exc.message)
+    except RetryLater:
+        session.rollback()
+        raise
     except Exception:
         if ctx.is_final_attempt:
             session.rollback()
@@ -58,6 +62,14 @@ def failure_guard(
 def _fail(session: Session, document_id: uuid.UUID, stage: Stage, code: str, message: str) -> None:
     document = session.get(Document, document_id)
     if document is None:
+        return
+    if document.status == DocumentStatus.READY:
+        # Embedding finishes after the document is searchable by keyword; it stays so, and only
+        # the stage fails (resumed by the recovery sweep, see ingestion.recovery).
+        logger.warning("Document %s: %s stage failed: %s", document_id, stage, code)
+        progress.finish(session, document_id, stage, status=StageStatus.FAILED,
+                        detail={"error": message, "code": code})
+        session.commit()
         return
     logger.warning("Document %s failed at %s: %s", document_id, stage, code)
     mark_failed(session, document, stage, code, message)

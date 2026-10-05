@@ -93,3 +93,36 @@ def test_a_named_superseded_file_answers_from_that_file(admin, home_loan):
     assert {s["version_label"] for s in answer["sources"]} == {"1"}
     assert not any(s["previous_version"] for s in answer["sources"])
     assert "fallback" not in answer["plan"]
+
+
+OLD_PREPAYMENT = Section("8", "Prepayment Charges", ["A prepayment charge of 2% applies to floating rate home loans."])
+
+
+@pytest.fixture
+def six_versions(client, app, tenant, admin):
+    """v1 and v2 cover prepayment charges (differently); v3 to v6 (in force) do not."""
+    specs = [
+        home_loan_spec("1", "01/01/2021", ltv="80%", extra_sections=[OLD_PREPAYMENT]),
+        home_loan_spec("2", "01/01/2022", ltv="78%", extra_sections=[PREPAYMENT]),
+        home_loan_spec("3", "01/01/2023", ltv="76%"),
+        home_loan_spec("4", "01/01/2024", ltv="74%"),
+        home_loan_spec("5", "01/01/2025", ltv="72%"),
+        home_loan_spec("6", "01/06/2026", ltv="70%"),
+    ]
+    policy_id = None
+    for number, spec in enumerate(specs, start=1):
+        doc, analysis = process(client, app, tenant.admin, build(spec), filename=f"home_loan_v{number}.pdf")
+        if policy_id is None:
+            policy_id = confirm_new_policy(admin, doc, analysis).json()["data"]["policy_id"]
+        else:
+            assert confirm_new_version(admin, doc, analysis, policy_id).status_code == 200
+    drain(app)
+    return policy_id
+
+
+def test_every_earlier_version_is_searched_and_the_latest_one_that_answers_is_used(admin, six_versions):
+    answer = ask(admin, "What prepayment charges apply to floating rate home loans?")
+    assert answer["status"] == "answered", answer
+    assert {s["version_label"] for s in answer["sources"]} == {"2"}  # four versions back, not v1
+    assert answer["plan"]["fallback"]["depth"] == 4
+    assert "2%" not in answer["answer"]

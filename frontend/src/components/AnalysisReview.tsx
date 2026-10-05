@@ -44,7 +44,8 @@ export function AnalysisReview({ document, analysis }: { document: DocumentRead;
   const matched = analysis.matched_policy && !analysis.matched_policy.restricted ? analysis.matched_policy : null;
   const isDuplicate = ["EXACT_DUPLICATE", "CONTENT_DUPLICATE"].includes(analysis.decision);
   // A copy of a filed document is most often its reissue: a new version of the same policy.
-  const suggestsVersion = ["EXISTING_POLICY_NEW_VERSION", "VERSION_CONFLICT", "POSSIBLE_MATCH_REQUIRES_REVIEW", "EXACT_DUPLICATE", "CONTENT_DUPLICATE"].includes(analysis.decision) && matched;
+  // A new-policy upload with a match was uploaded together with files already filed under it.
+  const suggestsVersion = ["EXISTING_POLICY_NEW_VERSION", "VERSION_CONFLICT", "POSSIBLE_MATCH_REQUIRES_REVIEW", "EXACT_DUPLICATE", "CONTENT_DUPLICATE", "NEW_POLICY"].includes(analysis.decision) && matched;
 
   const [action, setAction] = useState<Action>(suggestsVersion ? "add_version" : "create_policy");
   const [name, setName] = useState(analysis.suggested_name ?? "");
@@ -150,6 +151,8 @@ export function AnalysisReview({ document, analysis }: { document: DocumentRead;
     onError: (err) => {
       if (err instanceof ApiError && err.code === "VERSION_CONFLICT") setNewRevision(false);
       setError(err instanceof ApiError ? err.message : "Could not confirm.");
+      // Someone else (or the bulk upload) may have filed it meanwhile: show its current state.
+      queryClient.invalidateQueries({ queryKey: ["document", document.id] });
     },
   });
 

@@ -20,6 +20,7 @@ from app.modules.auth.acl import can_see
 from app.modules.auth.permissions import Principal
 from app.modules.categories.model import Category
 from app.modules.citations.numerics import extract_numeric_facts, sentence_at
+from app.modules.rag.query_plan import COMPARISON_WORDS, compares_versions, without_version_refs
 from app.modules.rag.validation import TermIndex
 from app.modules.documents.model import Document, DocumentStatus
 from app.modules.policies.model import DocumentRelationship, PolicyVersion, RelationStatus, VersionStatus
@@ -41,7 +42,8 @@ MAX_PER_DOCUMENT = 3
 # 1.0 (reranker only) was clearly worse (R@1 0.37).
 RERANK_WEIGHT = 0.5
 GENERIC_TERMS = frozenset(
-    "current currently latest policy policies bank banks rule rules document documents version "
+    "current currently latest policy policies bank banks rule rules document documents version versions "
+    "edition editions "
     "details detail say says tell explain applicable".split()
 )
 # Words that frame a question rather than name its subject ("mentioned in the
@@ -56,7 +58,11 @@ QUESTION_TERMS = frozenset(
     "agree agreed disagree did does stand stands mean means meant "
     # Greetings, politeness and how the answer should look ("in short", "a short script"):
     # they say how to answer, not what about, and no document is expected to contain them.
-    "hello hi hey dear please kindly thanks thank want wanted wants need know tell explain explanation "
+    "hello hi hey dear please kindly thanks thank want wanted wants need needs needed know tell explain explanation "
+    "whom where long old new "
+    # Fill-in-the-blank and lookup framing: "complete the missing value", "what value applies".
+    "complete missing blank fill value values applies applied "
+    "clause clauses para paragraph under must should shall "
     "short shortly brief briefly simple simply quick quickly script overview whole entire just really "
     "help understand lines words points bullet bullets "
     # How to proceed, not what about: "how should X be handled", "different variants".
@@ -69,13 +75,39 @@ QUESTION_TERMS = frozenset(
     "told tell telling yesterday today tomorrow might maybe perhaps sure much many could would "
     "some so am think thought heard said "
     "each every list category categories type types kind kinds interval intervals topic topics cover covers covered "
+    # Comparing editions: "which edition sets the higher figure".
+    "sets higher lower longer shorter larger smaller greater stricter figure figures "
+    "later earlier newer older earliest newest oldest recent "
+    # Asking for the answer and its citation: "give the answer with the exact section reference".
+    "give gives answer answers reference references cite cites citing citation citations quote "
+    # Whether a document has something: "which chapters are present", "a chapter called X".
+    "present appear appears appearing contain contains contained containing called saying but "
     # Joining words of rule-book questions: "Auto Loan extended to students", "serving exporters".
     "serving serve serves served extended extending covering segment segments".split()
+)
+# Closed word classes that never name a question's subject. Unlike the open list above, these
+# classes are finite: quantifiers and determiners ("all three versions"), number words and
+# ordinals ("first changed"), prepositions ("as per", "vs", "via"), and words that ask where an
+# answer is written rather than what it is ("on which page", "a provision on").
+CLOSED_CLASS_TERMS = frozenset(
+    # quantifiers, determiners
+    "all any both each either every neither none other another such same own whole entire several "
+    "few more most less least only also "
+    # number words and ordinals
+    "one two three four five six seven eight nine ten first second third fourth fifth last next "
+    # prepositions and comparison operators. Not those that bound a figure ("above 75 lakh", "within 7
+    # days", "before GST"): rule books separate one band from the next by them.
+    "per via vs versus upon onto into without between among amongst across against toward towards "
+    "throughout during except including regarding concerning respect "
+    # where an answer is written
+    "page pages provision provisions sentence sentences line lines word words wording text texts".split()
 )
 # Questions about the document itself: its title, publisher, date, legal basis.
 _DOCUMENT_QUESTION = re.compile(
     r"\bthis\s+(?:document|plan|policy|report|circular|manual|guideline|notification|publication)\b"
-    r"|\b(?:title|name)\s+of\b|\bpublish(?:ed|er|ing)?\b|\bpublication\b|\bissu(?:ed|ing)\s+(?:by|authority)\b"
+    # "the name of the top approval body" names a subject of a rule, not the document.
+    r"|\btitle\s+of\b|\bname\s+of\s+(?:this|the)\s+(?:document|plan|policy|report|circular|manual|guideline|file)\b"
+    r"|\bpublish(?:ed|er|ing)?\b|\bpublication\b|\bissu(?:ed|ing)\s+(?:by|authority)\b"
     r"|\blegal\s+basis\b|\bunder\s+which\s+(?:act|law|section)\b|\bwhich\s+section\s+of\b"
     r"|\b(?:type|kind|sort)\s+of\s+(?:document|policy|circular|report)\b|\bwhat\s+is\s+(?:this|the)\s+document\s+about\b",
     re.I,
@@ -109,6 +141,8 @@ class EvidenceSet:
     top_score: float
     conflicts: list[dict]
     comparison: dict | None = None  # deterministic diff for comparison questions
+    # Versions whose document is not a revision of their policy (app.modules.versions.integrity).
+    unrelated: dict = field(default_factory=dict)
 
     def by_id(self) -> dict[str, EvidenceItem]:
         return {item.id: item for item in self.items}
@@ -116,11 +150,24 @@ class EvidenceSet:
 
 def key_terms(question: str) -> list[str]:
     """Subject terms the evidence must contain. Numbers of two or more digits count:
-    "170 schemes" or "in 2050" must be in the evidence, not only nearby words."""
+    "170 schemes" or "in 2050" must be in the evidence, not only nearby words. "Version 2.0"
+    is not: it chose the versions searched, and neither is "changed" in "has it changed
+    between the versions?"."""
+    framing = COMPARISON_WORDS if compares_versions(question) else frozenset()
     return [
-        t for t in query_terms(question)
-        if t not in GENERIC_TERMS and t not in QUESTION_TERMS and (not t.isdigit() or len(t) >= 2)
+        t for t in query_terms(without_version_refs(question))
+        if t not in GENERIC_TERMS and t not in QUESTION_TERMS and t not in CLOSED_CLASS_TERMS and t not in framing
+        and (not t.isdigit() or len(t) >= 2)
     ]
+
+
+# Questions about what a document is made of: its chapters, its contents.
+_CONTENTS_QUESTION = re.compile(r"\b(?:chapters?|table\s+of\s+contents|contents)\b", re.I)
+MAX_CONTENTS_DOCUMENTS = 4
+
+
+def asks_for_contents(question: str) -> bool:
+    return bool(_CONTENTS_QUESTION.search(question))
 
 
 def is_document_question(question: str) -> bool:
@@ -175,8 +222,10 @@ def build_evidence(
 
     # Repeated boilerplate (a disclaimer on every page, a copied clause) must
     # not fill several evidence slots with the same words: keep the best-ranked
-    # copy of each distinct passage.
-    ranked = distinct_passages(ranked)
+    # copy of each distinct passage. Across versions, the same words in two versions are
+    # the answer to a comparison ("unchanged"), so each version keeps its copy.
+    ranked = distinct_passages(ranked, per_version=filters.version_scope.mode in ("all", "versions"))
+    ranked = one_copy_per_document(session, ranked)
     selected: list[Candidate] = []
     per_document: Counter = Counter()
     for candidate in ranked[:rerank_top_n]:
@@ -204,6 +253,15 @@ def build_evidence(
         for candidate in cover:
             candidate.rerank_score = candidate.rerank_score or 0.0
         selected = cover + selected
+
+    if asks_for_contents(question):
+        # "Which chapters are in Version 1.0 but not 2.0?": the contents page of each document.
+        present = {c.chunk_id for c in selected}
+        documents = list(dict.fromkeys(c.document_id for c in selected))[:MAX_CONTENTS_DOCUMENTS]
+        listed = [c for c in retriever.contents(principal, documents, filters) if c.chunk_id not in present]
+        for candidate in listed:
+            candidate.rerank_score = candidate.rerank_score or 0.0
+        selected = listed + selected
 
     selected += _amendment_candidates(session, principal, question, selected, retriever, filters)
     sources = provenance(session, selected)
@@ -246,17 +304,61 @@ def _passage_key(text: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
 
 
-def distinct_passages(candidates: list[Candidate]) -> list[Candidate]:
-    """Candidates in order, dropping any whose text repeats an earlier one's."""
-    seen: set[str] = set()
+def distinct_passages(candidates: list[Candidate], *, per_version: bool = False) -> list[Candidate]:
+    """Candidates in order, dropping any whose text repeats an earlier one's (in the same version)."""
+    seen: set[tuple] = set()
     distinct = []
     for candidate in candidates:
-        key = _passage_key(candidate.text)
+        key = (candidate.version_id if per_version else None, _passage_key(candidate.text))
         if key in seen:
             continue
         seen.add(key)
         distinct.append(candidate)
     return distinct
+
+
+# Of 64 simhash bits, copies of one document (re-uploaded, re-exported) differ in at most this many.
+DUPLICATE_SIMHASH_BITS = 3
+
+
+def one_copy_per_document(session: Session, candidates: list[Candidate]) -> list[Candidate]:
+    """Candidates from only one copy of each document uploaded more than once.
+
+    Two uploads of the same compendium are chunked a little differently, so their passages are
+    not textually identical and both copies would fill the evidence and be cited side by side.
+    The best-ranked copy is kept; versions of a policy are different documents and stay.
+    """
+    ids = list(dict.fromkeys(c.document_id for c in candidates))
+    if len(ids) < 2:
+        return candidates
+    rows = session.execute(
+        select(Document.id, Document.simhash, Document.policy_version_id).where(Document.id.in_(ids))
+    ).all()
+    info = {row.id: row for row in rows}
+    kept: list[uuid.UUID] = []
+    dropped: set[uuid.UUID] = set()
+    for document_id in ids:  # in rank order
+        row = info.get(document_id)
+        if row is None or row.simhash is None:
+            continue
+        for other in kept:
+            first = info[other]
+            if (bin((row.simhash ^ first.simhash) & (2**64 - 1)).count("1") <= DUPLICATE_SIMHASH_BITS
+                    and row.policy_version_id != first.policy_version_id
+                    and not _versions_of_one_policy(session, row.policy_version_id, first.policy_version_id)):
+                dropped.add(document_id)
+                break
+        else:
+            kept.append(document_id)
+    return [c for c in candidates if c.document_id not in dropped] if dropped else candidates
+
+
+def _versions_of_one_policy(session: Session, a: uuid.UUID | None, b: uuid.UUID | None) -> bool:
+    """Two versions of the same policy: an unchanged re-issue is still a separate version."""
+    if a is None or b is None:
+        return False
+    policies = session.execute(select(PolicyVersion.policy_id).where(PolicyVersion.id.in_([a, b]))).scalars().all()
+    return len(policies) == 2 and policies[0] == policies[1]
 
 
 def _categories(session: Session, ids) -> dict[uuid.UUID, Category]:

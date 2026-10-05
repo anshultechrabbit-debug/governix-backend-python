@@ -7,6 +7,7 @@ by fuzzy title similarity. Original text is always returned alongside the diff.
 
 import difflib
 import re
+from collections import deque
 from dataclasses import dataclass
 
 from app.modules.citations.numerics import numeric_changes
@@ -15,6 +16,11 @@ from app.modules.ingestion.analysis.metadata import normalize_title
 FUZZY_TITLE_RATIO = 0.75
 CONTENT_MATCH_RATIO = 0.6
 MAX_DIFF_TOKENS = 4000
+# Sentence-level changes kept per modified section, and the length kept of each sentence.
+MAX_CHANGED_SENTENCES = 4
+MAX_SENTENCE_CHARS = 400
+# Paragraphs, and sentences within them: a policy rule is usually one of either.
+_SENTENCE_SPLIT = re.compile(r"\n\s*\n|(?<=[.;])\s+(?=[A-Z0-9(])")
 
 
 @dataclass
@@ -49,29 +55,60 @@ def merge_continuations(sections: list[SectionView]) -> list[SectionView]:
 
 
 def _align(old: list[SectionView], new: list[SectionView]) -> tuple[list[tuple[SectionView, SectionView]], list[SectionView], list[SectionView]]:
+    """Pair sections in passes; each pass pairs every remaining old section, in order, with the
+    first remaining new section it matches. Exact passes look matches up by key: comparing every
+    pair made a 14,000-section version take 18 seconds to confirm."""
     pairs: list[tuple[SectionView, SectionView]] = []
-    old_left, new_left = list(old), list(new)
+    left = [list(old), list(new)]
+    titles = {id(s): normalize_title(s.title) for s in (*old, *new)}
+
+    def keep_unpaired(paired: set[int]) -> None:
+        left[0] = [o for o in left[0] if id(o) not in paired]
+        left[1] = [n for n in left[1] if id(n) not in paired]
+
+    def take_by_key(key) -> None:
+        """Pair sections whose key is equal (None matches nothing)."""
+        waiting: dict = {}
+        for n in left[1]:
+            if (k := key(n)) is not None:
+                waiting.setdefault(k, deque()).append(n)
+        paired: set[int] = set()
+        for o in left[0]:
+            if (k := key(o)) is not None and (queue := waiting.get(k)):
+                n = queue.popleft()
+                pairs.append((o, n))
+                paired.update((id(o), id(n)))
+        keep_unpaired(paired)
 
     def take(match) -> None:
-        for o in list(old_left):
-            for n in new_left:
-                if match(o, n):
+        """Pair sections by a similarity test: only what the exact passes left unpaired."""
+        paired: set[int] = set()
+        for o in left[0]:
+            for n in left[1]:
+                if id(n) not in paired and match(o, n):
                     pairs.append((o, n))
-                    old_left.remove(o)
-                    new_left.remove(n)
+                    paired.update((id(o), id(n)))
                     break
+        keep_unpaired(paired)
 
-    take(lambda o, n: o.number is not None and o.number == n.number)
-    take(lambda o, n: o.level == 0 and n.level == 0)  # front matter
-    take(lambda o, n: normalize_title(o.title) == normalize_title(n.title))
-    take(lambda o, n: _titles_nest(o.title, n.title) and _content_ratio(o, n) >= CONTENT_MATCH_RATIO)
-    take(lambda o, n: difflib.SequenceMatcher(None, normalize_title(o.title), normalize_title(n.title)).ratio() >= FUZZY_TITLE_RATIO)
-    return pairs, old_left, new_left
+    take_by_key(lambda s: s.number)
+    take_by_key(lambda s: True if s.level == 0 else None)  # front matter
+    take_by_key(lambda s: titles[id(s)])
+    take(lambda o, n: _titles_nest(titles[id(o)], titles[id(n)]) and _content_ratio(o, n) >= CONTENT_MATCH_RATIO)
+    take(lambda o, n: _similar(titles[id(o)], titles[id(n)], FUZZY_TITLE_RATIO))
+    return pairs, left[0], left[1]
 
 
 def _titles_nest(a: str, b: str) -> bool:
-    a, b = normalize_title(a), normalize_title(b)
+    """Whether one normalised title contains the other."""
     return bool(a and b) and (a in b or b in a)
+
+
+def _similar(a: str, b: str, threshold: float) -> bool:
+    """ratio() >= threshold, ruling pairs out first with its cheaper upper bounds."""
+    matcher = difflib.SequenceMatcher(None, a, b)
+    return (matcher.real_quick_ratio() >= threshold and matcher.quick_ratio() >= threshold
+            and matcher.ratio() >= threshold)
 
 
 def _content_ratio(o: SectionView, n: SectionView) -> float:
@@ -88,6 +125,24 @@ def word_diff(old: str, new: str) -> list[dict]:
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         ops.append({"op": tag, "old": "".join(old_tokens[i1:i2]), "new": "".join(new_tokens[j1:j2])})
     return ops
+
+
+def changed_sentences(old: str, new: str) -> list[dict]:
+    """The sentences that differ, as {"old", "new"} pairs ("old" None: added; "new" None: removed).
+
+    A section-level "Changed: 199.5" says where, not what; the numeric diff misses a change of
+    wording or of a bare figure ("score of 700" -> "725"). These say what, in the document's words."""
+    a = [" ".join(s.split()) for s in _SENTENCE_SPLIT.split(old) if s.strip()]
+    b = [" ".join(s.split()) for s in _SENTENCE_SPLIT.split(new) if s.strip()]
+    changes = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        changes.append({
+            "old": " ".join(a[i1:i2])[:MAX_SENTENCE_CHARS] or None,
+            "new": " ".join(b[j1:j2])[:MAX_SENTENCE_CHARS] or None,
+        })
+    return changes[:MAX_CHANGED_SENTENCES]
 
 
 def _section_json(section: SectionView, include_content: bool) -> dict:
@@ -118,6 +173,7 @@ def compare_sections(old: list[SectionView], new: list[SectionView], *, include_
             "title_changed": normalize_title(o.title) != normalize_title(n.title),
             "diff": word_diff(o.content, n.content) if include_content else None,
             "numeric_changes": numbers,
+            "changes": changed_sentences(o.content, n.content),
             "similarity": round(difflib.SequenceMatcher(None, o.content, n.content, autojunk=False).quick_ratio(), 3),
         })
     order = {id(s): i for i, s in enumerate(new)}

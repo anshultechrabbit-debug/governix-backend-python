@@ -144,7 +144,14 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     # Must match the vector column (see app/modules/search/model.py); changing it needs a migration + re-embed.
     EMBEDDING_DIMENSIONS: int = 1536
+    # Embedding batches writing vectors at the same time. None: half the CPU cores, so the
+    # database keeps the other half for answering questions while a large upload indexes.
+    EMBED_WRITE_SLOTS: int | None = None
     EMBED_BATCH_SIZE: int = 256  # one OpenAI request per job; chunks stay well under the per-request token limit
+    # The OpenAI account's tokens-per-minute limit for EMBEDDING_MODEL (see the 429 message or the
+    # account's limits page). All workers together stay just under it, leaving room for questions,
+    # instead of colliding on rate limits. 0 turns the throttle off.
+    EMBEDDING_TOKENS_PER_MINUTE: int = 1_000_000
     RERANKER_PROVIDER: str = "local"  # local | api | none
     RERANKER_API_URL: str | None = None  # Cohere/Jina-compatible /rerank endpoint
     RERANKER_API_KEY: SecretStr | None = None
@@ -170,12 +177,12 @@ class Settings(BaseSettings):
     # the evidence must cover most of what distinguishes the question.
     RAG_MIN_SALIENT_COVERAGE: float = 0.5
     RAG_CACHE_TTL_SECONDS: int = 600
-    # Latest version first; when it has no supported answer, search up to this
-    # many earlier versions of each policy, most recent first.
+    # Latest version first; when it has no supported answer, search the earlier versions of
+    # each policy, most recent first (at most RAG_FALLBACK_MAX_DEPTH back; None: all of them).
     RAG_PREVIOUS_VERSION_FALLBACK: bool = True
     # AI summary of each version, generated in the background once it is searchable.
     AI_SUMMARY_ENABLED: bool = True
-    RAG_FALLBACK_MAX_DEPTH: int = 3
+    RAG_FALLBACK_MAX_DEPTH: int | None = None
     # Per-principal token-bucket rate limit on /ai/ask, which is the only route
     # to a paid LLM. 0 disables the limiter (tests, single-user local runs).
     RAG_RATE_LIMIT_REQUESTS: int = 20

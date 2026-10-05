@@ -164,7 +164,7 @@ def run(cases, only=None, show_all=False):
         user = ses.scalars(
             select(User).where(User.is_active.is_(True), User.organization_id.is_not(None)).order_by(User.role)
         ).first()
-        principal = principal_from_user(user)
+        principal = principal_from_user(user, ses)
         policy_id = ses.scalar(
             select(Document.policy_id).where(Document.title.ilike(SUITE_DOCUMENT_TITLE), Document.status == "ready")
         )

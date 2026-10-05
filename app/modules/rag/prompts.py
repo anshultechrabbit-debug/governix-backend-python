@@ -11,6 +11,8 @@ Rules (non-negotiable):
 - Copy every number, percentage, amount, date and tenure exactly as written in the evidence.
 - Do not infer requirements the evidence does not state.
 - Each claim is ONE sentence and must cite the evidence id(s) that support it, e.g. ["E2"].
+- State each fact once. Never add a claim that repeats or rephrases an earlier claim; cite every
+  supporting evidence id on the one claim instead.
 - Keep each claim as close as possible to the wording of its cited evidence. Do not
   replace specific source terms with synonyms or add an unstated causal explanation.
   You may combine directly stated facts from multiple cited evidence blocks.
@@ -30,10 +32,23 @@ Rules (non-negotiable):
   answer that part (insufficient_evidence stays false); do not guess the rest.
 - Write claims about the document's content. Never mention evidence ids, "evidence
   blocks", or version/effective-date labels unless the question asks about dates or versions.
+- When the question names a section or clause number ("section 4.25.9"), answer from that
+  clause, and give the clause number in the claim when the question asks for the reference.
+- A claim about a version cites a passage from that version. A claim about several versions
+  ("in Version 1.0 but not in Version 2.0", "in both versions") cites a passage from each of them,
+  for example both tables of contents. Compare lists (chapters, sections) by their titles, not
+  their numbers: a chapter can move to another number in a later version.
+- When the question asks about each edition or version, or compares versions, give one claim
+  per version, naming its version label, then say whether it changed and answer any "which is
+  higher/lower/later" part from those figures.
 - If sources disagree, say so plainly, name both sources, and do not pick one silently.
 - Respect the effective dates given: answer for the period the question asks about.
-- If the evidence does not answer the question at all, return no claims and set
-  insufficient_evidence to true. Never fill a gap with outside knowledge.
+- Decide insufficient_evidence first. It is true when no evidence block states the rule, value or
+  fact the question asks about, even if blocks on a similar subject are present: a rule about one
+  charge, product, officer or deadline does not answer a question about another one (a rule on
+  late-payment interest does not answer a question about a cheque-return fee; a car loan limit does
+  not answer a question about an education loan). Then return no claims. Never fill a gap with
+  outside knowledge.
 - Also write "summary": the direct answer to the question in 1-2 short, plain, natural
   sentences (at most 45 words), as a knowledgeable colleague would say it (e.g. "It is the Bank's Know
   Your Customer (KYC) policy, issued under RBI's Master Direction on KYC."). Lead
@@ -72,7 +87,10 @@ SUMMARY_CHECK_SCHEMA = {
 OUTPUT_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
+    # insufficient_evidence comes first: the model decides whether the evidence answers the
+    # question before it writes any claim, and a stream that declares it shows nothing.
     "properties": {
+        "insufficient_evidence": {"type": "boolean"},
         "claims": {
             "type": "array",
             "items": {
@@ -86,7 +104,6 @@ OUTPUT_SCHEMA = {
             },
         },
         "summary": {"type": "string"},
-        "insufficient_evidence": {"type": "boolean"},
         "conflicts": {
             "type": "array",
             "items": {
@@ -100,7 +117,7 @@ OUTPUT_SCHEMA = {
             },
         },
     },
-    "required": ["claims", "summary", "insufficient_evidence", "conflicts"],
+    "required": ["insufficient_evidence", "claims", "summary", "conflicts"],
 }
 
 
@@ -133,7 +150,7 @@ def evidence_block(item) -> str:
 def build_user_prompt(question: str, plan: QueryPlan, evidence: EvidenceSet) -> str:
     parts = [f"Question: {question}", f"Answer scope: {plan.explanation}."]
     if evidence.comparison:
-        parts.append("[D1] Deterministic comparison of the two versions (authoritative diff):\n<<<\n"
+        parts.append("[D1] Deterministic comparison of the versions (authoritative diff):\n<<<\n"
                      + comparison_text(evidence.comparison) + "\n>>>")
     parts.append("Evidence:\n\n" + "\n\n".join(evidence_block(item) for item in evidence.items))
     if evidence.conflicts:
@@ -145,13 +162,43 @@ def build_user_prompt(question: str, plan: QueryPlan, evidence: EvidenceSet) -> 
     return "\n\n".join(parts)
 
 
+# Lines of the diff given to the model. Two 1,000-page versions differ in thousands of
+# sections; all of them (3 million characters) exceeds any model's request limit.
+MAX_DIFF_LINES = 40
+
+
 def comparison_text(comparison: dict) -> str:
+    stats = comparison.get("stats") or {}
     lines = [
         f"From version {comparison['from_version']['label']} (effective {comparison['from_version']['effective_from']}) "
-        f"to version {comparison['to_version']['label']} (effective {comparison['to_version']['effective_from']}):"
+        f"to version {comparison['to_version']['label']} (effective {comparison['to_version']['effective_from']}):",
     ]
-    lines += comparison["summary_lines"] or ["No differences found."]
+    summary = comparison["summary_lines"]
+    lines += summary[:MAX_DIFF_LINES] or ["No differences found."]
+    if len(summary) > MAX_DIFF_LINES:
+        lines.append(f"... and {len(summary) - MAX_DIFF_LINES} more changed, added or removed sections.")
+    changes = []
     for item in comparison["modified"]:
-        for change in item["numeric_changes"]["changed"]:
-            lines.append(f"In {item['new']['label']}: '{change['old_context']}' became '{change['new_context']}'")
+        where = f"{item['versions']}, " if item.get("versions") else ""
+        if "changes" in item:
+            # What changed, in the document's words: every changed sentence, numeric or not.
+            for change in item["changes"]:
+                if change["old"] and change["new"]:
+                    changes.append(f"{where}in {item['new']['label']}: '{change['old']}' became '{change['new']}'")
+                elif change["new"]:
+                    changes.append(f"{where}in {item['new']['label']}: added '{change['new']}'")
+                else:
+                    changes.append(f"{where}in {item['new']['label']}: removed '{change['old']}'")
+        else:  # a diff stored before sentence changes were recorded
+            changes += [f"{where}in {item['new']['label']}: '{change['old_context']}' became '{change['new_context']}'"
+                        for change in item["numeric_changes"]["changed"]]
+    changes = [c[0].upper() + c[1:] for c in changes]
+    lines += changes[:MAX_DIFF_LINES]
+    if len(changes) > MAX_DIFF_LINES:
+        lines.append(f"... and {len(changes) - MAX_DIFF_LINES} more changed figures.")
+    if stats:
+        older, newer = comparison["from_version"]["label"], comparison["to_version"]["label"]
+        lines.append(f"In all, version {newer} differs from version {older} in {stats.get('modified', 0)} sections; "
+                     f"{stats.get('added', 0)} sections were added, {stats.get('removed', 0)} removed "
+                     f"and {stats.get('unchanged', 0)} are unchanged.")
     return "\n".join(lines)

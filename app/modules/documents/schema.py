@@ -51,6 +51,9 @@ class DocumentDetail(DocumentRead):
     pdf_metadata: dict[str, Any]
     duplicate_override_reason: str | None
     progress: Progress | None = None
+    # Part of a bulk upload that will file it with the rest of its group: no one confirms it by hand.
+    upload_batch_id: uuid.UUID | None = None
+    filed_by_batch: bool = False
 
 
 class DocumentUpdate(BaseModel):

@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Archive, ArrowRight, BookOpen, CheckCircle2, Download, RotateCcw, Trash2 } from "lucide-react";
+import { AlertTriangle, Archive, ArrowRight, BookOpen, CheckCircle2, Download, Loader2, RotateCcw, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
 import { api, ApiError } from "../api/client";
@@ -9,7 +9,7 @@ import { canDelete, DeleteDocumentDialog } from "../components/DeleteDocument";
 import { StageList, useCategoryName } from "../components/domain";
 import { Button, Card, CardHeader, ErrorState, KeyValue, PageHeader, SkeletonRows, StatusBadge } from "../components/ui";
 import { formatBytes, formatDateTime, humanize } from "../lib/format";
-import { useAnalysis, useDocument } from "../hooks";
+import { semanticIndexing, useAnalysis, useDocument } from "../hooks";
 import { useAuth, useToast } from "../store/hooks";
 
 export function DocumentDetailPage() {
@@ -55,7 +55,7 @@ export function DocumentDetailPage() {
       <DeleteDocumentDialog document={document} open={deleting} onClose={() => setDeleting(false)} onDeleted={() => navigate("/documents")} />
       {justReady && <ReadyDialog document={document} category={categoryName(document.category_id)} onStay={() => setJustReady(false)} />}
       <PageHeader
-        title={<span className="flex items-center gap-3">{document.title ?? document.original_filename}<StatusBadge status={document.status} /></span>}
+        title={<span className="flex items-center gap-3">{document.title ?? document.original_filename}<StatusBadge status={document.filed_by_batch ? "processing" : document.status} /></span>}
         subtitle={document.title ? document.original_filename : "Name pending confirmation"}
         actions={<>
           {document.page_count && <Link to={`/documents/${document.id}/view`}><Button variant="secondary"><BookOpen className="size-4" />Open viewer</Button></Link>}
@@ -85,7 +85,8 @@ export function DocumentDetailPage() {
 
       <div className="grid gap-6 xl:grid-cols-3">
         <div className="space-y-6 xl:col-span-2">
-          {document.status === "awaiting_confirmation" && analysis.data && <AnalysisReview document={document} analysis={analysis.data} />}
+          {document.status === "awaiting_confirmation" && document.filed_by_batch && <FiledByBatch batchId={document.upload_batch_id} />}
+          {document.status === "awaiting_confirmation" && !document.filed_by_batch && analysis.data && <AnalysisReview document={document} analysis={analysis.data} />}
           <Card>
             <CardHeader title="Details" />
             <div className="p-5">
@@ -108,6 +109,25 @@ export function DocumentDetailPage() {
         </Card>
       </div>
     </>
+  );
+}
+
+/** The bulk upload files this document with the other files of its group as soon as they are all read. */
+function FiledByBatch({ batchId }: { batchId: string | null }) {
+  return (
+    <Card>
+      <div className="flex items-start gap-3 p-5 text-sm">
+        <Loader2 className="mt-0.5 size-4 shrink-0 animate-spin text-brand-500" />
+        <div>
+          <p className="font-medium">Filing with its bulk upload</p>
+          <p className="mt-1 text-muted">
+            This file is registered automatically, as a version of its group's policy, once the other files of the group
+            are read. Nothing to confirm here.
+            {batchId && <> <Link className="text-brand-700 hover:underline" to={`/uploads/${batchId}`}>Open the upload</Link></>}
+          </p>
+        </div>
+      </div>
+    </Card>
   );
 }
 
@@ -141,7 +161,11 @@ function ReadyDialog({ document, category, onStay }: { document: DocumentDetail;
             <CheckCircle2 className="size-8 text-ok-600" />
           </div>
           <h2 id="ready-title" className="mt-4 text-lg font-semibold tracking-tight">Upload complete</h2>
-          <p className="mt-1 text-sm text-muted">Your document is processed, indexed and ready to search and ask about.</p>
+          <p className="mt-1 text-sm text-muted">
+            {semanticIndexing(document)
+              ? "Your document is ready to search and ask about. Semantic search keeps improving in the background while embeddings finish."
+              : "Your document is processed, indexed and ready to search and ask about."}
+          </p>
 
           <div className="mt-5 rounded-lg border border-line bg-subtle/50 px-4 py-3 text-left">
             <p className="truncate text-sm font-medium text-ink" title={document.title ?? document.original_filename}>

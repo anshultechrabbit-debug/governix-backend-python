@@ -120,10 +120,8 @@ def test_a_question_about_two_subjects_is_split():
     from app.modules.rag.query_rewrite import restated_questions
 
     llm = _Rewriter("", True)
-    llm.content = {"questions": ["How should KYC information be maintained?", "How are pet-product variants handled?", "x", "y"]}
-    assert restated_questions(llm, "KYC and pet products?") == [
-        "How should KYC information be maintained?", "How are pet-product variants handled?", "x",
-    ]
+    llm.content = {"questions": [f"Question {n}?" for n in range(12)]}
+    assert restated_questions(llm, "Twelve questions") == [f"Question {n}?" for n in range(10)]
 
 
 def test_an_unchanged_or_missing_restatement_is_none():
@@ -149,3 +147,9 @@ def test_an_explicit_reference_that_cannot_be_resolved_still_asks_to_restate():
     rewrite = standalone_question(_Rewriter("How many schemes were in that discussion?", False),
                                   "How many schemes were in that discussion?", history)
     assert not rewrite.resolvable
+
+
+def test_the_same_between_things_the_question_names_is_not_a_follow_up():
+    assert not refers_to_earlier_turn("Do the two versions have the same policy owner?")
+    assert not refers_to_earlier_turn("Is the LTV the same in v1 and v2?")
+    assert refers_to_earlier_turn("What did the same policy say about prepayment?")

@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 
 from app.core.stemming import stem
 from app.modules.citations.numerics import extract_numeric_facts
+from app.modules.rag.query_plan import normal_label
 
 # Fraction of a claim's content words that must appear in the cited evidence.
 # 0.35 rather than 0.5: a faithful paraphrase shares most but not all of its
@@ -35,10 +36,13 @@ MIN_SUPPORT = 0.35
 _EVIDENCE_REF = re.compile(r"\b[EGD]\d{1,2}\b")
 # "The document does not provide the repo rate": a statement about what the evidence lacks,
 # not a fact from it. It is reported once as a note instead of cited to every passage.
+# "explicitly", "specifically", ...: "is not explicitly stated in the policy" is the same statement.
+_HEDGE = r"(?:(?:explicitly|specifically|clearly|directly|expressly)\s+)?"
 _ABSENCE = re.compile(
-    r"\b(?:document|documents|evidence|policy|policies|text|source|sources|records?)\s+(?:does|do|did)\s*n[o']t\s+"
+    r"\b(?:document|documents|evidence|policy|policies|text|source|sources|records?|version\s*[\d.]+)\s+"
+    rf"(?:does|do|did)\s*n[o']t\s+{_HEDGE}"
     r"(?:provide|mention|specify|state|contain|include|cover|say|address|give|list|define)"
-    r"|\bnot\s+(?:provided|mentioned|specified|stated|available|covered|included|addressed|defined)\s+in\s+the\b"
+    rf"|\bnot\s+{_HEDGE}(?:provided|mentioned|specified|stated|available|covered|included|addressed|defined)\s+in\s+the\b"
     r"|\bno\s+(?:information|mention|details?)\s+(?:is\s+|are\s+)?(?:provided|given|available)\b"
     r"|\bthere\s+is\s+no\s+(?:stated|specified|explicit|mentioned|defined|documented)\b"
     r"|\b(?:in|from)\s+the\s+(?:provided|available|cited|given)\s+(?:evidence|documents?|text|sources?)\b",
@@ -78,6 +82,8 @@ def qualifiers(question: str) -> dict[str, str]:
 # Evidence ids the model appended as citation marks ("... frozen (E1, E2).", "... frozen. [E3]"):
 # the citation is already in evidence_ids, so the marks are dropped rather than the claim.
 _ID = r"[EGD]\d{1,2}"
+# A citation the model started and did not finish: "... microfinance loans [".
+_DANGLING_MARK = re.compile(r"\s*[\[\(]\s*$")
 _CITATION_MARKS = re.compile(
     rf"\s*[\(\[]\s*{_ID}(?:\s*(?:,|;|and|&)\s*{_ID})*\s*[\)\]]"
     rf"|(?:\s*,?\s*\b{_ID}\b)+(?=\s*[.;!?]?\s*$)"
@@ -101,6 +107,34 @@ _FRAMING = frozenset(
 # A stem that shares this many leading characters still counts as the same term
 # ("generate"/"generation").
 TERM_PREFIX = 5
+# ... and at least this share of the shorter stem: "custo" alone does not make
+# "custodian" the same word as "customer".
+TERM_PREFIX_SHARE = 0.7
+# Words a policy uses for the same thing a question asks about in other words. A question
+# about who "owns" a policy is answered by its "Policy owner"; "preserved" by "retained".
+# Each group is matched by stem, both ways, and only decides whether a term is *mentioned*:
+# it never puts a number or a name into an answer.
+SYNONYM_GROUPS = (
+    "own owns owned owner owners ownership custodian custodians",
+    "retain retains retained retaining retention preserve preserves preserved preservation keep keeps kept",
+    "threshold thresholds benchmark benchmarks cutoff",
+    "maximum max cap caps capped ceiling exceed exceeds exceeding upto",
+    "minimum min floor least",
+    "approval approvals approve approves approved authorization authorisation authorize authorise "
+    "authorized authorised sanction sanctioned",
+    "staff employee employees personnel",
+    "customer customers borrower borrowers client clients",
+    "branch branches office offices",
+    "review reviews reviewed verification verify verified",
+    "frequency frequent often periodicity daily weekly fortnightly monthly quarterly annually yearly",
+    "penalty penalties penal fine fines",
+    "period periods duration tenure",
+)
+_SYNONYMS: dict[str, frozenset[str]] = {}
+for _group in SYNONYM_GROUPS:
+    _stems = frozenset(stem(_w) for _w in _group.split())
+    for _s in _stems:
+        _SYNONYMS[_s] = _SYNONYMS.get(_s, frozenset()) | _stems
 # Characters either side of a figure that count as "beside" it: about one table row.
 NUMBER_WINDOW = 200
 # A subject term beside at most this share of the evidence's figures identifies a row;
@@ -110,7 +144,28 @@ SPECIFIC_SHARE = 0.5
 MIN_FIGURES_FOR_ROWS = 3
 # A claim this close to one source sentence is a restatement, so its negation must match.
 RESTATEMENT_OVERLAP = 0.7
-_TERM_WORD = re.compile(r"[a-z0-9]+(?:\.[0-9]+)?")
+_TERM_WORD = re.compile(r"[a-z0-9]+(?:\.[0-9]+)*")
+_HAS_DIGIT = re.compile(r"\d")
+# A version a claim is about ("Version 1.0", "v2", "edition 3"), and a claim about all of them.
+_CLAIM_VERSION = re.compile(r"\b(?:version|v|edition)\s*(\d{1,3}(?:\.\d{1,3})?)\b", re.I)
+# "... but not in Version 2.0": a version the claim says lacks something. A citation cannot show
+# an absence; that version's passages are searched for the subject instead.
+_NOT_IN_VERSION = re.compile(
+    r"\b(?:not|never|neither|nor|absent|missing|omitted|dropped|removed)\b[^.;:]{0,40}?"
+    r"\b(?:version|v|edition)\s*(\d{1,3}(?:\.\d{1,3})?)\b",
+    re.I,
+)
+# Words of a presence claim that are not its subject ("... is present in Version 1.0 but").
+_PRESENCE_WORDS = frozenset(
+    "chapter chapters section sections present appears appear included includes include listed lists list "
+    "contains contain version versions edition editions only but and also while whereas however although "
+    "both each every all either neither two".split()
+)
+_EVERY_VERSION = re.compile(
+    r"\b(?:both|each|every|all|either|neither)\s+(?:of\s+the\s+)?(?:two\s+)?(?:versions?|editions?)\b"
+    r"|\bthe\s+two\s+(?:versions|editions)\b",
+    re.I,
+)
 _NEGATION = re.compile(r"\b(?:not|no|never|cannot|nor|neither|none|without)\b|n[\u2019']t\b", re.I)
 # "Sl. No.: 65", "No. of accounts", "No Change": the word "no" that negates nothing.
 _NOT_NEGATION = re.compile(r"\b(?:sl|s)\.?\s*no\b\.?|\bno\.?\s*[:#]?\s*\d|\bno\.\s*of\b|\bno\s+change\b", re.I)
@@ -122,36 +177,152 @@ def term_parts(term: str) -> list[str]:
     return [p for p in re.split(r"[-/]", term.lower()) if p]
 
 
+# An abbreviation is answered by the words it abbreviates: "NPA" by "Non-Performing Asset", "FIU"
+# by "Financial Intelligence Unit", "LTV" by "Loan-to-Value". Only runs of capitalised words count
+# (an expansion is a name), so three ordinary words that happen to start with S, T and R are not
+# "STR". Connectors may sit inside a run; numbers and punctuation end it.
+MIN_ABBREVIATION, MAX_ABBREVIATION = 2, 6
+_INITIAL_CONNECTORS = frozenset("of and to for the in on &".split())
+_RUN_BREAK = re.compile(r"[.,;:()\[\]|/\n]")
+_RUN_TOKEN = re.compile(r"[A-Za-z][A-Za-z'’]*|\d+")
+
+
+def capitalised_initials(text: str) -> set[str]:
+    """Initials (lower case) of every run of 2-6 capitalised words: "Non-Performing Asset" -> {"np", "pa", "npa"}.
+
+    Both with and without the connectors inside the run: "Loan-to-Value" is LTV, "Fixed Obligation
+    to Income Ratio" is FOIR."""
+    found: set[str] = set()
+
+    def add(letters: list[str]) -> None:
+        for start in range(len(letters)):
+            for end in range(start + MIN_ABBREVIATION, min(len(letters), start + MAX_ABBREVIATION) + 1):
+                found.add("".join(letters[start:end]))
+
+    def flush(run: list[tuple[str, bool]]) -> None:
+        while run and run[-1][1]:
+            run = run[:-1]  # "Officer and staff": the run ends at "Officer"
+        add([letter for letter, _ in run])
+        add([letter for letter, connector in run if not connector])
+
+    for segment in _RUN_BREAK.split(text):
+        run: list[tuple[str, bool]] = []
+        for token in _RUN_TOKEN.findall(segment.replace("-", " ")):
+            if token[0].isupper():
+                run.append((token[0].lower(), False))
+            elif run and token.lower() in _INITIAL_CONNECTORS:
+                run.append((token[0].lower(), True))
+            else:
+                flush(run)
+                run = []
+        flush(run)
+    return found
+
+
+def _looks_abbreviated(part: str) -> bool:
+    return part.isalpha() and MIN_ABBREVIATION <= len(part) <= MAX_ABBREVIATION
+
+
 class TermIndex:
     """Stemmed words of a text, for asking whether it mentions a term."""
 
     def __init__(self, text: str) -> None:
+        self._source = text  # as written: capitalisation marks the expansions of abbreviations
+        self._initials: set[str] | None = None
         # "FIU- IND" (a line broken at the hyphen) is the word "FIU-IND"; "75%" says "percent".
         text = re.sub(r"(?<=\w)-\s+(?=\w)", "-", text.lower()).replace("%", " percent ")
-        words = _TERM_WORD.findall(text)
+        # Clause "4.25.9" is one word; it also counts for its section, "4.25".
+        words = [part for word in _TERM_WORD.findall(text) for part in _dotted(word)]
         self.counts: dict[str, int] = {}
         for word in words:
             reduced = stem(word)
             self.counts[reduced] = self.counts.get(reduced, 0) + 1
-        self.prefixes: dict[str, int] = {}
-        for reduced, count in self.counts.items():
-            if len(reduced) >= TERM_PREFIX:
-                self.prefixes[reduced[:TERM_PREFIX]] = self.prefixes.get(reduced[:TERM_PREFIX], 0) + count
+        self.prefixes: dict[str, list[str]] = {}
+        for reduced in self.counts:
+            if len(reduced) >= TERM_PREFIX and not _HAS_DIGIT.search(reduced):
+                self.prefixes.setdefault(reduced[:TERM_PREFIX], []).append(reduced)
 
-    def _count_part(self, part: str) -> int:
-        reduced = stem(part)
+    def _count_stem(self, reduced: str) -> int:
         if reduced in self.counts:
             return self.counts[reduced]
-        if len(reduced) >= TERM_PREFIX:
-            return self.prefixes.get(reduced[:TERM_PREFIX], 0)
+        # A shared prefix joins word forms ("generate"/"generation"), never numbers: 4.25.1 is not 4.25.19.
+        if len(reduced) >= TERM_PREFIX and not _HAS_DIGIT.search(reduced):
+            return sum(self.counts[other] for other in self.prefixes.get(reduced[:TERM_PREFIX], [])
+                       if _same_word_form(reduced, other))
         return 0
+
+    def _count_part(self, part: str) -> int:
+        return self._count_stem(stem(part))
 
     def count(self, term: str) -> int:
         """How often the term occurs; a multi-part term counts as its rarest part."""
         return min((self._count_part(p) for p in term_parts(term)), default=0)
 
     def mentions(self, term: str) -> bool:
-        return self.count(term) > 0
+        """The text uses the term, a form of it, a word the policy uses for the same thing, or (for an
+        abbreviation) the capitalised words it abbreviates."""
+        if self.count(term) > 0:
+            return True
+        parts = term_parts(term)
+        return bool(parts) and all(
+            self._count_part(part) > 0
+            or any(self._count_stem(other) for other in _SYNONYMS.get(stem(part), ()))
+            or (_looks_abbreviated(part) and part in self.initials)
+            for part in parts
+        )
+
+    @property
+    def initials(self) -> set[str]:
+        if self._initials is None:
+            self._initials = capitalised_initials(self._source)
+        return self._initials
+
+
+def _same_word_form(a: str, b: str) -> bool:
+    """Two stems with a long enough shared beginning are forms of one word."""
+    shared = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        shared += 1
+    return shared >= max(TERM_PREFIX, round(TERM_PREFIX_SHARE * min(len(a), len(b)) + 0.49))
+
+
+def _dotted(word: str) -> list[str]:
+    """ "4.25.9" -> ["4.25.9", "4.25"]; any other word as it is."""
+    parts = word.split(".")
+    return [".".join(parts[:n]) for n in range(len(parts), 1, -1)] if len(parts) > 2 else [word]
+
+
+def _unsupported_versions(
+    text: str, cited_versions: set[str], cited_text: str, evidence: dict, cited_passages: list,
+) -> str | None:
+    """A claim about "Version 1.0" must cite Version 1.0 (or a passage that names it); one about
+    "both versions" must cite more than one. One that says a version lacks something ("in
+    Version 1.0 but not in Version 2.0") is checked against that version's passages instead."""
+    cited = {normal_label(v) for v in cited_versions}
+    lacking = {normal_label(v): v for v in _NOT_IN_VERSION.findall(text)}
+    positive = _NOT_IN_VERSION.sub(" ", text)
+    named = {normal_label(v): v for v in _CLAIM_VERSION.findall(positive)}
+    stated = {normal_label(v) for v in _CLAIM_VERSION.findall(cited_text)}
+    shown = ", ".join(sorted(cited_versions))
+    if missing := [named[v] for v in named if v not in cited and v not in stated]:
+        return f"is about version {', '.join(missing)} but cites only version {shown}"
+    every = _EVERY_VERSION.search(positive)
+    if len(cited) < 2 and every:
+        return f"is about every version but cites only version {shown}"
+    subject = {w for w in _content_words(positive) if w not in _PRESENCE_WORDS and not w.isdigit()}
+    if every and subject:
+        # "Capital Adequacy appears in both versions": each version's cited passage must have it.
+        for version in sorted(cited_versions):
+            own = [e for e in cited_passages if normal_label(version) in {normal_label(v) for v in e.versions}]
+            if own and not any(all(TermIndex(e.text).mentions(w) for w in subject) for e in own):
+                return f"says every version has it, but the version {version} passage does not"
+    for version, label in lacking.items():
+        passages = [e for e in evidence.values() if version in {normal_label(v) for v in e.versions} and len(e.versions) == 1]
+        if subject and (found := next((e for e in passages if all(TermIndex(e.text).mentions(w) for w in subject)), None)):
+            return f"says version {label} lacks it, but {found.id} (version {label}) has it"
+    return None
 
 
 @dataclass
@@ -162,6 +333,8 @@ class EvidenceText:
     # The policy name, document title and section heading: a passage is about its policy even
     # where it does not repeat the name ("This policy is applicable to all employees").
     label: str = ""
+    # The version(s) the passage is from (both, for a diff of two versions).
+    versions: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -258,6 +431,16 @@ def _window(text: str, start: int, end: int) -> str:
     return text[max(line_start, min(sentence_start, start - NUMBER_WINDOW)):min(line_end, max(sentence_end, end + NUMBER_WINDOW))]
 
 
+# A bare number that is a measured value rather than a clause reference: "against threshold 17.8".
+_MEASURE = re.compile(r"\b(?:threshold|ratio|score|index|rating|factor|weight|multiple|coefficient)\s+(?:of\s+)?$", re.I)
+
+
+def _values(text: str) -> list:
+    """Figures a subject can own: rates, amounts, dates, tenures, and measured values. Other
+    bare numbers are section and clause references."""
+    return [f for f in extract_numeric_facts(text) if f.kind != "number" or _MEASURE.search(text[max(0, f.start - 30):f.start])]
+
+
 def _unbound_numbers(text: str, cited_text: str, subjects: list[str], skip: set[tuple[str, str]]) -> list[str]:
     """Figures in the claim that the evidence never states beside the claim's subject.
 
@@ -267,7 +450,7 @@ def _unbound_numbers(text: str, cited_text: str, subjects: list[str], skip: set[
     row, "Proposed retention period"). A figure taken from another row is then caught.
     """
     present = [t for t in subjects if TermIndex(cited_text).mentions(t)]
-    figures = [o for o in extract_numeric_facts(cited_text) if o.kind != "number"]
+    figures = _values(cited_text)
     if not present or len(figures) < MIN_FIGURES_FOR_ROWS:
         return []  # a clause with one or two figures has no rows to confuse
     windows = [TermIndex(_window(cited_text, o.start, o.end)) for o in figures]
@@ -276,9 +459,9 @@ def _unbound_numbers(text: str, cited_text: str, subjects: list[str], skip: set[
     if not specific:
         return []  # every subject term sits beside most figures: nothing to tell rows apart by
     unbound = []
-    for fact in extract_numeric_facts(text):
-        if fact.kind == "number" or fact.key in skip:
-            continue  # bare numbers are section/clause references; provenance numbers are metadata
+    for fact in _values(text):
+        if fact.key in skip:
+            continue  # provenance numbers (version, pages) are metadata
         near = [w for o, w in zip(figures, windows, strict=True) if o.value == fact.value]
         if near and not any(w.mentions(t) for w in near for t in specific):
             unbound.append(fact.raw)
@@ -294,7 +477,7 @@ def validate_claims(
     asked = qualifiers(question)
     results = []
     for raw in raw_claims:
-        text = " ".join(_CITATION_MARKS.sub("", str(raw.get("text", ""))).split())
+        text = _DANGLING_MARK.sub("", " ".join(_CITATION_MARKS.sub("", str(raw.get("text", ""))).split()))
         cited = [e for e in dict.fromkeys(raw.get("evidence_ids") or []) if isinstance(e, str)]
         result = ClaimResult(text=text, evidence_ids=[], valid=True)
         if not text:
@@ -330,7 +513,12 @@ def validate_claims(
         # in another unit or with a unit attached ("75" for "75%" or "75 lakh"),
         # so any kind of fact also matches on value alone.
         available_values = {value for _kind, value in available | allowed}
+        # "Version 2.0" names a version of the evidence; it is a reference, not a figure.
+        versions = {normal_label(v) for e in evidence.values() for v in e.versions}
+        references = [m.span(1) for m in _CLAIM_VERSION.finditer(text) if normal_label(m.group(1)) in versions]
         for fact in extract_numeric_facts(text):
+            if any(start <= fact.start and fact.end <= end for start, end in references):
+                continue
             result.numbers_checked += 1
             if fact.key in available or fact.key in allowed or fact.value in available_values:
                 continue
@@ -360,6 +548,11 @@ def validate_claims(
             result.valid = False
             wanted = ", ".join(dict.fromkeys(_variant_name(w, asked[w]) for w, _v in mismatched))
             result.problems.append(f"is about {', '.join(dict.fromkeys(other))}, not {wanted}")
+        cited_versions = set().union(*(evidence[e].versions for e in known))
+        if cited_versions and (wrong := _unsupported_versions(
+                text, cited_versions, cited_text, evidence, [evidence[e] for e in known])):
+            result.valid = False
+            result.problems.append(wrong)
         if _flips_polarity(text, cited_text):
             result.valid = False
             result.problems.append("reverses the negation of the source sentence")

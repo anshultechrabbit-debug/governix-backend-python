@@ -19,6 +19,18 @@ class JobContext:
         return self.attempt >= self.max_attempts
 
 
+class RetryLater(Exception):
+    """Run the job again after `delay_seconds` without spending an attempt.
+
+    For waits that are expected to pass, such as a provider rate limit: many jobs
+    hitting the limit at once must queue up behind it, not fail after max_attempts.
+    """
+
+    def __init__(self, delay_seconds: float, reason: str) -> None:
+        super().__init__(reason)
+        self.delay_seconds = delay_seconds
+
+
 TaskHandler = Callable[[dict[str, Any], JobContext], None]
 
 _handlers: dict[str, TaskHandler] = {}

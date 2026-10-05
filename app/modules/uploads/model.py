@@ -87,4 +87,7 @@ class UploadBatchItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("policy_versions.id", ondelete="SET NULL")
     )
 
-    __table_args__ = (Index("ix_upload_batch_items_group", "group_id", "position"),)
+    __table_args__ = (
+        Index("ix_upload_batch_items_group", "group_id", "position"),
+        Index("ix_upload_batch_items_batch", "batch_id"),  # ON DELETE CASCADE lookup
+    )

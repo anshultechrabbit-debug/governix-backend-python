@@ -10,8 +10,16 @@ export function useDocument(id: string | undefined) {
     queryKey: ["document", id],
     queryFn: () => api.get<DocumentDetail>(`/documents/${id}`),
     enabled: Boolean(id),
-    refetchInterval: (query) => (query.state.data && ACTIVE.includes(query.state.data.status) ? 1500 : false),
+    refetchInterval: (query) => {
+      const data = query.state.data;
+      return data && (ACTIVE.includes(data.status) || data.filed_by_batch || semanticIndexing(data)) ? 1500 : false;
+    },
   });
+}
+
+/** A READY document is searchable by keyword while its embeddings are still being written. */
+export function semanticIndexing(document: DocumentDetail): boolean {
+  return Boolean(document.progress?.stages.some((s) => (s.stage === "embedding" || s.stage === "indexing") && s.status === "running"));
 }
 
 export function useAnalysis(id: string | undefined, enabled: boolean) {

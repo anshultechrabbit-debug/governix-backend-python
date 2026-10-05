@@ -54,3 +54,12 @@ def test_a_figure_set_off_with_hyphens_in_a_scan_keeps_its_unit():
 
     facts = extract_numeric_facts("a minimum period of -7- days and maximum period of 10 Years")
     assert [(f.kind, f.value) for f in facts] == [("duration", "7 day"), ("duration", "10 year")]
+
+
+def test_a_word_ending_in_rs_is_not_a_rupee_amount():
+    from app.modules.citations.numerics import extract_numeric_facts
+
+    assert [(f.kind, f.raw) for f in extract_numeric_facts("retained for 9 years 5 months")] == [
+        ("duration", "9 years"), ("duration", "5 months")]
+    assert all(f.kind == "number" for f in extract_numeric_facts("the Officers 3 and 4"))
+    assert [f.kind for f in extract_numeric_facts("above Rs. 174 lakh, or INR588")] == ["amount", "amount"]

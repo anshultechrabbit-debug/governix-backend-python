@@ -17,9 +17,10 @@ class ScriptedLLM(LLMProvider):
 
     model_id = "scripted"
 
-    def __init__(self, claims=None, fail=False):
+    def __init__(self, claims=None, fail=False, insufficient=False):
         self.claims = claims or []
         self.fail = fail
+        self.insufficient = insufficient
         self.calls = 0
         self.systems: list[str] = []
 
@@ -32,7 +33,7 @@ class ScriptedLLM(LLMProvider):
             content={
                 "claims": self.claims,
                 "summary": "",  # v15: _summary() reads this field; empty = no summary produced
-                "insufficient_evidence": False,
+                "insufficient_evidence": self.insufficient,
                 "conflicts": [],
             },
             model=self.model_id, input_tokens=100, output_tokens=20,
@@ -130,6 +131,16 @@ def test_hallucinated_number_is_removed(admin, home_loan):
     assert answer["no_answer"]["reason"] == "ANSWER_FAILED_VALIDATION"
 
 
+def test_the_model_saying_the_evidence_does_not_answer_wins_over_its_claims(admin, home_loan):
+    # Q245 of the policy evaluation: asked about gold loans, the model flagged the evidence as
+    # insufficient but also stated the (true) home loan LTV. That is not an answer.
+    _use(ScriptedLLM([{"text": "For loans above Rs. 75 lakh the LTV shall not exceed 70%.", "evidence_ids": ["E1"]}],
+                     insufficient=True))
+    answer = ask(admin, "What is the LTV for loans above 75 lakh?")
+    assert answer["status"] == "no_answer"
+    assert answer["no_answer"]["reason"] == "INSUFFICIENT_EVIDENCE"
+
+
 def test_invalid_claims_are_dropped_and_reported(admin, home_loan):
     _use(ScriptedLLM([
         {"text": "For loans above Rs. 75 lakh the LTV shall not exceed 70%.", "evidence_ids": ["E1"]},
@@ -138,10 +149,27 @@ def test_invalid_claims_are_dropped_and_reported(admin, home_loan):
     ]))
     answer = ask(admin, "What is the LTV for loans above 75 lakh?")
     assert answer["status"] == "answered"
-    assert [c["text"] for c in answer["claims"]] == ["For loans above Rs. 75 lakh the LTV shall not exceed 70%."]
+    model_claims = [c["text"] for c in answer["claims"] if "said instead" not in c["text"]]
+    assert model_claims == ["For loans above Rs. 75 lakh the LTV shall not exceed 70%."]
     assert "90%" not in answer["answer"] and "waived" not in answer["answer"]
     assert len([c for c in answer["plan"]["checks"] if c.startswith("Removed")]) == 2
     assert not any(w.startswith("Removed") for w in answer["warnings"])
+
+
+def test_a_rule_that_changed_since_the_previous_version_shows_both(admin, home_loan):
+    # The version in force caps the LTV at 70%; the one before it said 75%. A question about the
+    # current rule is answered from the version in force and also shows, cited, what changed.
+    _use(ScriptedLLM([
+        {"text": "For loans above Rs. 75 lakh the LTV shall not exceed 70%.", "evidence_ids": ["E1"]},
+    ]))
+    answer = ask(admin, "What is the LTV for loans above 75 lakh?")
+    assert answer["status"] == "answered"
+    current, earlier = answer["claims"]
+    assert "70%" in current["text"]
+    assert "said instead" in earlier["text"] and "75%" in earlier["text"]
+    [cited] = [s for s in answer["sources"] if s["number"] in earlier["citations"]]
+    assert cited["previous_version"] is True and cited["version_label"] != answer["sources"][0]["version_label"]
+    assert any("earlier version" in w for w in answer["warnings"])
 
 
 def test_llm_outage_degrades_to_no_answer(admin, home_loan):
@@ -293,3 +321,42 @@ def test_greetings_and_questions_without_a_subject_are_never_answered_from_docum
     from app.modules.rag.prompts import SYSTEM_PROMPT
     assert SYSTEM_PROMPT not in scripted.systems
     assert answer["no_answer"]["suggestions"] == []
+
+
+def test_several_questions_in_one_message_are_all_answered(admin, home_loan, monkeypatch):
+    from app.modules.rag import service as rag_service
+
+    questions = ["What is the LTV for loans above 75 lakh?", "What is the interest rate spread?",
+                 "What is the LTV for loans above 75 lakh in the home loan policy?", "What is the spread on the repo rate?"]
+    monkeypatch.setattr(rag_service, "restated_questions", lambda llm, q: questions)
+    answer = ask(admin, "\n".join(questions))
+    assert answer["status"] == "answered"
+    assert answer["plan"]["parts"] == questions
+
+
+def test_a_check_on_the_same_question_is_not_a_second_question():
+    from app.modules.rag.service import asks_several
+
+    assert not asks_several("What is the audit cycle limit? Is it 15 months?")
+    assert asks_several("What is the LTV? Who approves it?")
+
+
+@pytest.mark.parametrize("question", [
+    "Compare the LTV for loans above 75 lakh in v3 and v4",
+    "What is the LTV for loans above 75 lakh in version 3 and version 4?",
+    "Has the LTV for loans above 75 lakh changed between the versions?",
+])
+def test_comparing_a_rule_answers_from_each_version(admin, home_loan, question):
+    answer = ask(admin, question)
+    assert answer["status"] == "answered", answer
+    assert answer["plan"]["query_class"] == "comparison"
+    assert {s["version_label"] for s in answer["sources"]} == {"3", "4"}
+    assert not any(s["kind"] == "comparison" for s in answer["sources"])  # the rule, not the whole diff
+    assert "75%" in answer["answer"] and "70%" in answer["answer"]
+
+
+@pytest.mark.parametrize("question", ["What changed in v4?", "What changed in version 3.0?"])
+def test_what_changed_in_one_version_compares_it_with_its_neighbour(admin, home_loan, question):
+    answer = ask(admin, question)
+    assert answer["status"] == "answered", answer
+    assert any(s["kind"] == "comparison" and s["version_label"] == "3 → 4" for s in answer["sources"])

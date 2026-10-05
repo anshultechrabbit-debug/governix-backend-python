@@ -34,7 +34,8 @@ def _runtime():
     return factory
 
 
-@celery.task(bind=True, name="governix.execute_job")
+# Attempts are counted on the durable job (max_attempts); a rate-limit deferral spends none.
+@celery.task(bind=True, name="governix.execute_job", max_retries=None)
 def execute_job(self, job_id: str):
     factory = _runtime()
     worker = LocalWorker(factory, lease_seconds=settings.JOB_LEASE_SECONDS, poll_interval_seconds=0)

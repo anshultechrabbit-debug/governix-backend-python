@@ -20,7 +20,10 @@ class Conversation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # When the last question was asked: the history is listed by it.
     last_message_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    __table_args__ = (Index("ix_ai_conversations_user_recent", "user_id", "last_message_at"),)
+    __table_args__ = (
+        Index("ix_ai_conversations_user_recent", "user_id", "last_message_at"),
+        Index("ix_ai_conversations_organization", "organization_id"),  # ON DELETE CASCADE lookup
+    )
 
 
 class ConversationMessage(UUIDPrimaryKeyMixin, TimestampMixin, Base):

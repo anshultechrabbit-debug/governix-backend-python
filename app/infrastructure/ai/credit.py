@@ -6,6 +6,7 @@ local fallback at once.
 """
 
 import logging
+import re
 import time
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,32 @@ def transient(exc: Exception) -> bool:
     return isinstance(exc, APIConnectionError | InternalServerError) or (
         isinstance(exc, RateLimitError) and not out_of_credit(exc)
     )
+
+
+DEFAULT_RATE_LIMIT_WAIT = 10.0
+_TRY_AGAIN = re.compile(r"try again in (?:(\d+)m(?!s))?(?:([\d.]+)(ms|s))?")
+
+
+def rate_limit_wait(exc: Exception) -> float | None:
+    """Seconds OpenAI asks a rate-limited caller to wait, or None if `exc` is not a passing rate limit."""
+    from openai import RateLimitError
+
+    if not isinstance(exc, RateLimitError) or out_of_credit(exc):
+        return None
+    headers = getattr(getattr(exc, "response", None), "headers", None) or {}
+    try:
+        if "retry-after-ms" in headers:
+            return float(headers["retry-after-ms"]) / 1000
+        if "retry-after" in headers:
+            return float(headers["retry-after"])
+    except ValueError:
+        pass
+    match = _TRY_AGAIN.search(str(exc))
+    if match and (match.group(1) or match.group(2)):
+        minutes, amount, unit = match.groups()
+        seconds = float(amount or 0) / (1000 if unit == "ms" else 1)
+        return int(minutes or 0) * 60 + seconds
+    return DEFAULT_RATE_LIMIT_WAIT
 
 
 def out_of_credit(exc: Exception) -> bool:

@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.logging import redact
 from app.infrastructure.queue.base import Queue
 from app.infrastructure.queue.models import JobStatus, QueueJob
-from app.infrastructure.queue.registry import JobContext, get_handler
+from app.infrastructure.queue.registry import JobContext, RetryLater, get_handler
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +158,8 @@ class LocalWorker:
                 # Retryable: during a rolling deploy an older worker may not know a new task yet.
                 raise LookupError(f"No handler registered for task {task_name!r}")
             handler(payload, context)
+        except RetryLater as exc:
+            self._defer(job_id, exc)
         except Exception as exc:
             self._record_failure(job_id, attempt, max_attempts, exc)
         else:
@@ -239,6 +241,22 @@ class LocalWorker:
                     locked_at=None,
                     locked_by=None,
                     last_error=None,
+                )
+            )
+
+    def _defer(self, job_id: uuid.UUID, exc: RetryLater) -> None:
+        # The claim counted an attempt; give it back, as the job did not fail.
+        with self.session_factory() as session, session.begin():
+            session.execute(
+                update(QueueJob)
+                .where(*self._owned(job_id))
+                .values(
+                    status=JobStatus.QUEUED,
+                    attempts=QueueJob.attempts - 1,
+                    run_after=func.now() + timedelta(seconds=max(exc.delay_seconds, 0)),
+                    locked_at=None,
+                    locked_by=None,
+                    last_error=redact(f"Deferred: {exc}")[:MAX_ERROR_LENGTH],
                 )
             )
 

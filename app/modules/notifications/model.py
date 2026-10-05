@@ -43,6 +43,7 @@ class Notification(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     __table_args__ = (
         Index("ix_notifications_user_created", "user_id", "created_at"),
+        Index("ix_notifications_organization", "organization_id"),  # ON DELETE CASCADE lookup
         Index("ix_notifications_user_unread", "user_id", postgresql_where=sql("read_at IS NULL")),
         Index("uq_notifications_dedupe", "user_id", "dedupe_key", unique=True,
               postgresql_where=sql("dedupe_key IS NOT NULL")),

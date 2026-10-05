@@ -33,7 +33,8 @@ _MULT = r"(?:thousand|lakhs?|lacs?|million|mn|crores?|cr|billion|bn|k)\b"
 PATTERNS = [
     ("date", re.compile(DATE_FRAGMENT, re.I)),
     ("amount", re.compile(
-        rf"(?:₹|rs\.?|inr|rupees)\s*(?P<num>{_NUM})\s*(?P<mult>{_MULT})?"
+        # "Rs" starts a word: "years 5" and "Officers 3" are not rupee amounts.
+        rf"(?:₹|\b(?:rs\.?|inr|rupees))\s*(?P<num>{_NUM})\s*(?P<mult>{_MULT})?"
         rf"|(?P<num2>{_NUM})\s*(?P<mult2>{_MULT})?\s*(?:rupees|inr)\b",
         re.I,
     )),

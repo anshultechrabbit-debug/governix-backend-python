@@ -58,3 +58,58 @@ def test_a_difference_that_is_the_subject_of_a_rule_is_not_a_version_comparison(
     assert plan_query(question).query_class is QueryClass.CURRENT
     assert plan_query("What are the KYC requirements on changes in address?").query_class is QueryClass.CURRENT
     assert plan_query("What is the difference between the current and the previous version?").query_class is QueryClass.COMPARISON
+
+
+@pytest.mark.parametrize("question", [
+    "For Collection Agency Conduct, what is the days past due limit in each edition, and which edition sets the higher figure?",
+    "Compare the exposure level above which the top approval body applies in each edition.",
+    "What is the quorum of the Model Governance Committee in both versions?",
+    "Which edition sets the higher provisioning rate for substandard assets?",
+    "Which version has the later effective date?",
+    "Which edition requires earlier submission?",
+    # Evaluation Q319-Q330: a count of versions, or "the", between the quantifier and "versions".
+    "Give the maximum ltv ratio in all three versions of the Home Loan Policy.",
+    "Give the minimum credit score in all 3 versions of the Personal Loan Policy.",
+    "What did each of the three versions say about the STR filing deadline?",
+    "List the processing fee in all the versions.",
+])
+def test_a_question_about_every_edition_searches_every_version(question):
+    plan = plan_query(question, today=TODAY)
+    assert plan.query_class is QueryClass.ACROSS_VERSIONS
+    assert plan.mode == "all" and plan.as_of is None
+
+
+def test_naming_versions_still_compares_them():
+    assert plan_query("Compare the LTV in v1 and v2", today=TODAY).query_class is QueryClass.COMPARISON
+    assert plan_query("Which version is in force?", today=TODAY).query_class is QueryClass.CURRENT
+
+
+@pytest.mark.parametrize("question, labels", [
+    ("Compare the policy owner in Version 1.0 and Version 2.0", ["1.0", "2.0"]),
+    ("Who is the policy owner in Version 1.0 and Version 2.0?", ["1.0", "2.0"]),
+    ("What is the difference between version 1 and version 2?", ["1", "2"]),
+    ("What changed in version 2.0?", ["2.0"]),
+    ("How does edition 3 differ from the current one?", ["3"]),
+])
+def test_naming_versions_to_compare_reads_each_of_them(question, labels):
+    plan = plan_query(question, today=TODAY)
+    assert plan.query_class is QueryClass.COMPARISON and plan.mode == "versions"
+    assert plan.version_labels == labels
+
+
+def test_a_comparison_without_versions_is_resolved_against_the_documents():
+    plan = plan_query("Has the policy owner changed between the versions?", today=TODAY)
+    assert plan.query_class is QueryClass.COMPARISON and plan.version_labels == [] and not plan.diff
+
+
+@pytest.mark.parametrize("a, b", [("v1", "1.0"), ("1", "01.00"), ("Version 3", "3.0"), ("2.10", "2.10")])
+def test_version_labels_written_differently_are_the_same_version(a, b):
+    from app.modules.rag.query_plan import normal_label
+
+    assert normal_label(a) == normal_label(b)
+
+
+def test_minor_versions_stay_distinct():
+    from app.modules.rag.query_plan import normal_label
+
+    assert normal_label("2.1") != normal_label("2.10")

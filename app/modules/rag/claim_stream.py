@@ -1,6 +1,6 @@
 """Pull finished claims out of a streamed structured answer.
 
-The model streams one JSON object: {"claims": [{...}, {...}], "insufficient_evidence": ..., "conflicts": [...]}.
+The model streams one JSON object: {"insufficient_evidence": ..., "claims": [{...}, {...}], "conflicts": [...]}.
 `ClaimStream.feed` returns each claim object as soon as its closing brace has
 arrived, so it can be validated and shown while later claims are still being
 written. Braces and brackets inside strings (and escaped quotes) are ignored.
@@ -12,6 +12,7 @@ import json
 import re
 
 _CLAIMS_START = re.compile(r'"claims"\s*:\s*\[')
+_INSUFFICIENT = re.compile(r'"insufficient_evidence"\s*:\s*true')
 
 
 class ClaimStream:
@@ -24,6 +25,11 @@ class ClaimStream:
         self._in_string = False
         self._escaped = False
         self._object_start = -1
+
+    @property
+    def declared_insufficient(self) -> bool:
+        """The model said the evidence does not answer the question (it writes this before the claims)."""
+        return bool(_INSUFFICIENT.search(self._text))
 
     def feed(self, delta: str) -> list[dict]:
         """Add streamed text; return the claims that became complete."""

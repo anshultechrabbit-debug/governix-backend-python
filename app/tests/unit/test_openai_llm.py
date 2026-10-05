@@ -1,6 +1,7 @@
 import httpx2 as httpx
 from openai import RateLimitError
 
+from app.infrastructure.ai.llm import openai as openai_llm
 from app.infrastructure.ai.llm.openai import OpenAILLM
 
 
@@ -33,8 +34,38 @@ def test_an_account_out_of_credit_is_not_asked_again_for_a_while():
     assert completions.calls == 1
 
 
-def test_a_passing_rate_limit_is_retried_on_the_next_call():
+def test_a_passing_rate_limit_is_retried_on_the_next_call(monkeypatch):
+    monkeypatch.setattr(openai_llm.time, "sleep", lambda _seconds: None)
     llm, completions = llm_failing_with({"type": "requests", "code": "rate_limit_exceeded"})
     ask(llm)
     ask(llm)
-    assert completions.calls == 2
+    # Each call waits and tries again before quoting the documents, and is not paused afterwards.
+    assert completions.calls == 2 * (1 + len(openai_llm.TRANSIENT_WAITS))
+
+
+def test_a_rate_limit_that_passes_still_gets_a_model_answer(monkeypatch):
+    waits = []
+    monkeypatch.setattr(openai_llm.time, "sleep", waits.append)
+    llm, completions = llm_failing_with({"type": "requests", "code": "rate_limit_exceeded"})
+    completions.error = RateLimitError(
+        "Rate limit reached. Please try again in 2.172s.",
+        response=httpx.Response(429, request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions")),
+        body={"type": "tokens", "code": "rate_limit_exceeded"},
+    )
+    answer = type("Response", (), {
+        "model": "gpt-5-mini", "usage": None,
+        "choices": [type("Choice", (), {"finish_reason": "stop",
+                                        "message": type("Message", (), {"content": '{"name": "From the model"}'})()})()],
+    })()
+    calls = iter([completions.error, answer])
+
+    def create(**_kwargs):
+        completions.calls += 1
+        outcome = next(calls)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    completions.create = create
+    assert ask(llm).content["name"] == "From the model"
+    assert waits == [2.672]  # the provider's "try again in 2.172s", plus a margin

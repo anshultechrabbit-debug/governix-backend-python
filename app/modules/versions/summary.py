@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.infrastructure.ai.llm.base import LLMProvider
+from app.modules.versions.integrity import unrelated_to_previous
 from app.modules.documents.model import DocumentSection
 from app.modules.policies.model import Policy, PolicyVersion
 
@@ -141,7 +142,14 @@ def summarize_version(session: Session, llm: LLMProvider, version: PolicyVersion
     version.ai_summary_generated_at = datetime.now(UTC)
 
     lines = (version.change_summary or {}).get("summary_lines") or []
-    if lines:
+    if (unrelated := unrelated_to_previous(session, version)) is not None:
+        # Another document filed as this version: its differences are not "changes" to the policy.
+        version.ai_change_summary = (
+            f"Check this version: its text is unrelated to Version {unrelated.previous_label} "
+            f"(this document is titled \u201c{unrelated.heading}\u201d), so it may not be a revision of this policy. "
+            "No change summary was written."
+        )
+    elif lines:
         listed = "\n".join(f"- {line}" for line in lines[:20])
         change = llm.generate_json(CHANGE_PROMPT, listed, CHANGE_SCHEMA, context={"task": "change_summary", "lines": lines})
         version.ai_change_summary = _grounded((change.content or {}).get("summary"), _numbers(listed))

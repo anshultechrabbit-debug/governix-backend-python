@@ -1,9 +1,10 @@
 """Builds the upload analysis from the database: detections, duplicates, matches, decision."""
 
+import re
 import uuid
 from collections.abc import Callable
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from sqlalchemy import cast, func, literal, or_, select
 from sqlalchemy.dialects.postgresql import BIT, insert
@@ -63,7 +64,71 @@ def _opening(session: Session, document: Document) -> tuple[list[list], str, str
     return first_lines, first_text, opening, naming
 
 
-def _duplicates(session: Session, document: Document, settings: Settings) -> tuple[Decision, Document, dict] | None:
+# Near-duplicates looked at for one that is not a different version of the same document.
+NEAR_DUPLICATE_CANDIDATES = 5
+
+
+def _read_metadata(session: Session, document: Document, settings: Settings, body_font_size: float):
+    """What the document's opening states, and the texts that naming and classification read."""
+    first_lines, first_text, opening, naming_text = _opening(session, document)
+    front = session.scalar(
+        select(DocumentSection.content).where(
+            DocumentSection.document_id == document.id, DocumentSection.level == 0
+        ).order_by(DocumentSection.order_index).limit(1)
+    )
+    opening_text = f"{front or ''}\n{opening}"[:OPENING_CHARS]
+    pdf_title = (document.pdf_metadata or {}).get("title")
+    meta = extract_metadata(first_lines, opening_text, body_font_size, pdf_title, settings.DATE_ORDER)
+    return meta, first_text, opening_text, naming_text, pdf_title
+
+
+def _stated(session: Session, document: Document, settings: Settings, body_font_size: float) -> tuple[str | None, date | None]:
+    """The version label and effective date a document states (read again if not analysed yet)."""
+    analysis = session.get(DocumentAnalysis, document.id)
+    if analysis is not None:
+        detected = analysis.detected or {}
+        effective = detected.get("effective_date")
+        return ((detected.get("version_label") or {}).get("value"),
+                date.fromisoformat(effective) if effective else None)
+    meta = _read_metadata(session, document, settings, body_font_size)[0]
+    return meta.version_label.value, meta.effective_date
+
+
+def _version_key(label: str | None) -> tuple | str | None:
+    """"v2.0", "2", "Version 2.0.0" -> (2,); a label without numbers compares as text."""
+    if not label:
+        return None
+    numbers = [int(n) for n in re.findall(r"\d+", label)]
+    while len(numbers) > 1 and numbers[-1] == 0:
+        numbers.pop()
+    return tuple(numbers) if numbers else " ".join(label.lower().split())
+
+
+def _same_batch_group(session: Session, a: Document, b: Document) -> bool:
+    from app.modules.uploads.model import UploadBatchItem
+
+    groups = session.scalars(
+        select(UploadBatchItem.group_id).where(UploadBatchItem.document_id.in_([a.id, b.id]))
+    ).all()
+    return len(groups) == 2 and groups[0] == groups[1]
+
+
+def _another_version(session: Session, document: Document, meta: DocumentMetadata, existing: Document,
+                     settings: Settings, body_font_size: float) -> bool:
+    """Near-identical text is what consecutive versions of a policy look like. It is not a copy when
+    the two state different versions or effective dates, or a person uploaded them together as
+    versions of one policy (one group of a bulk upload)."""
+    if _same_batch_group(session, document, existing):
+        return True
+    label, effective = _stated(session, existing, settings, body_font_size)
+    ours, theirs = _version_key(meta.version_label.value), _version_key(label)
+    if ours is not None and theirs is not None and ours != theirs:
+        return True
+    return meta.effective_date is not None and effective is not None and meta.effective_date != effective
+
+
+def _duplicates(session: Session, document: Document, settings: Settings, meta: DocumentMetadata,
+                body_font_size: float) -> tuple[Decision, Document, dict] | None:
     base = (
         Document.organization_id == document.organization_id,
         Document.id != document.id,
@@ -84,15 +149,16 @@ def _duplicates(session: Session, document: Document, settings: Settings) -> tup
         distance = func.bit_count(
             cast(Document.simhash, BIT(64)).op("#")(cast(literal(document.simhash), BIT(64)))
         )
-        row = session.execute(
+        rows = session.execute(
             select(Document, distance.label("distance"))
             .where(*base, Document.simhash.is_not(None), distance <= settings.SIMHASH_DUPLICATE_DISTANCE)
-            .order_by(distance).limit(1)
-        ).first()
-        if row is not None:
-            return Decision.CONTENT_DUPLICATE, row[0], {
-                "match": "near_duplicate", "similarity": round(1 - row[1] / 64, 3),
-            }
+            .order_by(distance).limit(NEAR_DUPLICATE_CANDIDATES)
+        ).all()
+        for existing, bits in rows:
+            if not _another_version(session, document, meta, existing, settings, body_font_size):
+                return Decision.CONTENT_DUPLICATE, existing, {
+                    "match": "near_duplicate", "similarity": round(1 - bits / 64, 3),
+                }
     return None
 
 
@@ -190,15 +256,7 @@ def analyze_document(
     session: Session, document: Document, settings: Settings, body_font_size: float,
     llm_factory: Callable[[], LLMProvider] | None = None,
 ) -> DocumentAnalysis:
-    first_lines, first_text, opening, naming_text = _opening(session, document)
-    front = session.scalar(
-        select(DocumentSection.content).where(
-            DocumentSection.document_id == document.id, DocumentSection.level == 0
-        ).order_by(DocumentSection.order_index).limit(1)
-    )
-    opening_text = f"{front or ''}\n{opening}"[:OPENING_CHARS]
-    pdf_title = (document.pdf_metadata or {}).get("title")
-    meta = extract_metadata(first_lines, opening_text, body_font_size, pdf_title, settings.DATE_ORDER)
+    meta, first_text, opening_text, naming_text, pdf_title = _read_metadata(session, document, settings, body_font_size)
     named = read_content(llm_factory, naming_text, meta.title.value, pdf_title).name if llm_factory else None
 
     categories = session.scalars(
@@ -238,7 +296,7 @@ def analyze_document(
 
     decision, confidence, conflict = result.decision, result.confidence, result.conflict
     duplicate_of = None
-    if duplicate := _duplicates(session, document, settings):
+    if duplicate := _duplicates(session, document, settings, meta, body_font_size):
         decision, existing, detail = duplicate
         duplicate_of = existing.id
         confidence = detail.get("similarity", 1.0)

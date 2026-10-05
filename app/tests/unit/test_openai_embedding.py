@@ -49,3 +49,29 @@ def test_a_passing_rate_limit_is_raised_so_the_job_retries_with_openai():
     embedder, _ = embedder_failing_with({"type": "requests", "code": "rate_limit_exceeded"})
     with pytest.raises(RateLimitError):
         embedder.embed(["text"])
+
+
+def rate_limit(message: str, headers: dict | None = None) -> RateLimitError:
+    request = httpx.Request("POST", "https://api.openai.com/v1/embeddings")
+    response = httpx.Response(429, request=request, headers=headers or {})
+    return RateLimitError(message, response=response, body={"type": "tokens", "code": "rate_limit_exceeded"})
+
+
+def test_the_wait_a_rate_limit_asks_for_is_read():
+    from app.infrastructure.ai.credit import DEFAULT_RATE_LIMIT_WAIT, rate_limit_wait
+
+    assert rate_limit_wait(rate_limit("429", {"retry-after-ms": "1500"})) == 1.5
+    assert rate_limit_wait(rate_limit("429", {"retry-after": "7"})) == 7
+    assert rate_limit_wait(rate_limit("Limit 1000000 ... Please try again in 4.848s. Visit")) == 4.848
+    assert rate_limit_wait(rate_limit("Please try again in 1m2.5s.")) == 62.5
+    assert rate_limit_wait(rate_limit("Please try again in 120ms.")) == 0.12
+    assert rate_limit_wait(rate_limit("Rate limit reached.")) == DEFAULT_RATE_LIMIT_WAIT
+
+
+def test_only_a_passing_rate_limit_has_a_wait():
+    from app.infrastructure.ai.credit import rate_limit_wait
+
+    request = httpx.Request("POST", "https://api.openai.com/v1/embeddings")
+    out_of_credit = RateLimitError("429", response=httpx.Response(429, request=request), body=OUT_OF_CREDIT)
+    assert rate_limit_wait(out_of_credit) is None
+    assert rate_limit_wait(RuntimeError("boom")) is None

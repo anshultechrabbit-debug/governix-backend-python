@@ -38,13 +38,17 @@ from app.infrastructure.ai.embeddings.base import EmbeddingProvider
 from app.modules.auth.acl import visible_clause
 from app.modules.auth.permissions import Principal
 from app.modules.documents.model import Document, DocumentSection, DocumentStatus
+from app.modules.ingestion.model import IngestionStage, Stage, StageStatus
 from app.modules.policies.model import Policy, PolicyStatus, PolicyVersion, VersionStatus
 from app.modules.search.model import Chunk
+from app.modules.search.policy_names import Mention, PolicyNames, build_names, cached_catalogue, find_mentions
 from app.modules.versions.timeline import effective_on
 
 logger = logging.getLogger(__name__)
 
 RRF_K = 60
+# Documents still being embedded that the reworded keyword pass covers at once.
+STILL_EMBEDDING_LIMIT = 50
 LANE_WEIGHTS = {"exact": 1.5, "keyword": 1.0, "vector": 1.0, "section": 0.6}
 LANE_LIMITS = {"exact": 20, "keyword": 50, "vector": 50, "section": 30}
 POLICY_BOOST = 1.3
@@ -65,16 +69,22 @@ _CLAUSE = re.compile(r"\b(?:clause|section|para(?:graph)?|point)\s+(\d{1,2}(?:\.
 # "Chapter 5", "Annexure II": a named division, found by its heading or contents row.
 _DIVISION = re.compile(r"\b(chapter|annexure|annex|appendix|schedule|part)\s+(\d{1,3}|[ivxlcdm]{1,6})\b", re.I)
 FRONT_MATTER_CHUNKS = 3
+# A table of contents is among a document's first chunks.
+CONTENTS_SEARCH_CHUNKS = 12
 # Document frequency of a term the full-text index drops as a stop word.
 NOT_INDEXED = -1
 # Chunks kept per clause/division in the batched exact lane: enough to cover a
 # short section without letting one clause monopolise the lane's budget.
 EXACT_PER_CLAUSE = 10
+# How a section number is stored: "5.2", or with its kind ("Section 5.2", "Clause 5.2").
+_SECTION_KINDS = ("", "Section ", "Clause ", "Para ", "Paragraph ", "Article ", "Rule ")
 EXACT_PER_DIVISION = 8
 _IDENTIFIER = re.compile(r"\b[A-Za-z]{1,10}[-/][A-Za-z0-9]{1,10}(?:[-/][A-Za-z0-9]{1,10}){0,4}\b")
-# A code that carries a number: "BNK-126", "HL-2025-01", "RBI/2025-26/12".
+# A code that carries a number: "BNK-126", "HL-2025-01", "RBI/2025-26/12", and with several
+# lettered parts or dotted numbers, "KAP-KEY-01", "HLP-4.2.1" (as a whole: "KEY-01" alone
+# would also name HLP-KEY-01 and PLP-KEY-01).
 # Found in chunk text as written (FTS splits "BNK-126" into 'bnk' and '-126').
-_CODE = re.compile(r"\b[A-Za-z]{1,10}[-/]?\d[A-Za-z0-9]*(?:[-/][A-Za-z0-9]+){0,4}\b")
+_CODE = re.compile(r"\b[A-Za-z]{1,10}(?:[-/][A-Za-z]{1,10}){0,3}[-/]?\d[A-Za-z0-9]*(?:[-/.][A-Za-z0-9]+){0,4}\b")
 # "page 500", "pages 12-14", "p. 7", "pg 30"
 _PAGE = re.compile(
     r"\b(?:pages?|pg\.?|p\.)\s*(?:no\.?\s*|number\s*|#\s*)?(\d{1,6})(?:\s*(?:-|–|to)\s*(\d{1,6}))?\b", re.I
@@ -345,13 +355,16 @@ class HybridRetriever:
         cached = _DF_CACHE.get((principal.organization_id, "__total__"))
         if not weights or cached is None or cached[1] < SELECTIVE_MIN_CHUNKS:
             return terms
-        floor = math.log(1 + (1 - MAX_TERM_SHARE) / MAX_TERM_SHARE)
         org = principal.organization_id
-        # A word in no chunk at all (a stop word such as "if", or a typo) matches nothing.
-        occurring = [t for t in dict.fromkeys(terms) if (_DF_CACHE.get((org, t)) or (0, 1))[1] > 0]
-        ranked = sorted(occurring, key=lambda t: weights.get(t, 0.0), reverse=True)
-        kept = [t for t in ranked if weights.get(t, 0.0) >= floor][:MAX_RANKED_TERMS]
-        return kept or ranked[:3]
+        total = cached[1]
+        frequency = {t: (_DF_CACHE.get((org, t)) or (0, 0))[1] for t in dict.fromkeys(terms)}
+        # A word in no chunk at all (a stop word such as "if", or a typo) matches nothing. Counts
+        # stop at DF_CAP, so a word that reached it is common however large the collection:
+        # treated as rare, it would make the lane scan and rank most of the table.
+        limit = min(DF_CAP, MAX_TERM_SHARE * total)
+        occurring = sorted((t for t, n in frequency.items() if n > 0), key=lambda t: frequency[t])
+        kept = [t for t in occurring if frequency[t] < limit][:MAX_RANKED_TERMS]
+        return kept or occurring[:3]
 
     def visible_term_weights(self, principal: Principal, terms: list[str]) -> dict[str, float]:
         """IDF of each term over the searchable chunks the caller can see.
@@ -493,6 +506,8 @@ class HybridRetriever:
         if not terms:
             return []
         terms = self.selective_terms(principal, terms)
+        if not terms:  # none of the words occurs in any passage
+            return []
         or_query = _or_of(terms)
         # Two steps: one cheap rank picks the best matches, the weighted rank (one ts_rank_cd
         # per term) orders only those. Weighting every match is what made the lane slow.
@@ -551,7 +566,7 @@ class HybridRetriever:
                 .where(Chunk.tsv.op("@@")(tsquery)).order_by(rank.desc()).limit(10)
             )
             results += [(_candidate(r), 2.0 + float(r.score)) for r in self._read(statement)]
-        results += self._exact_clauses(principal, filters, referenced, _CLAUSE.findall(query), 1.5)
+        results += self._exact_clauses(principal, filters, referenced, requested_clauses(query), 1.5)
         results += self._exact_divisions(principal, filters, _DIVISION.findall(query))
         results += self._exact_pages(principal, filters, requested_pages(query))
         results += self._exact_codes(principal, filters, requested_codes(query))
@@ -564,14 +579,23 @@ class HybridRetriever:
         return unique[: LANE_LIMITS["exact"]]
 
     def _exact_clauses(self, principal, filters, referenced, clauses, score: float) -> list[tuple[Candidate, float]]:
-        """Every referenced clause ("5.2", "para 12") in one statement."""
+        """Every referenced clause ("5.2", "section 4.25.9", "para 12") in one statement: the
+        section itself (stored as "5.2" or "Section 5.2"), a section inside it, or a numbered
+        clause inside its parent section's text ("4.25.9 The Bank shall ..." in Section 4.25)."""
         clauses = list(dict.fromkeys(clauses))
         if not clauses:
             return []
-        condition = or_(*[
-            or_(Chunk.section_number == clause, Chunk.section_number.like(f"{clause}.%"))
-            for clause in clauses
-        ])
+        conditions = []
+        for clause in clauses:
+            for kind in _SECTION_KINDS:
+                conditions += [Chunk.section_number == f"{kind}{clause}", Chunk.section_number.like(f"{kind}{clause}.%")]
+            if "." in clause:
+                parent = clause.rsplit(".", 1)[0]
+                conditions.append(and_(
+                    Chunk.section_number.in_([f"{kind}{parent}" for kind in _SECTION_KINDS]),
+                    Chunk.text.op("~")(rf"(^|[^0-9.]){re.escape(clause)}([^0-9]|$)"),
+                ))
+        condition = or_(*conditions)
         if referenced:
             condition = and_(condition, Chunk.policy_id.in_(referenced))
         # One ranked window per clause, not one global top-N: a question naming
@@ -650,6 +674,8 @@ class HybridRetriever:
         if not terms:
             return []
         terms = self.selective_terms(principal, terms)
+        if not terms:  # none of the words occurs in any passage
+            return []
         tsquery = _or_of(terms)
         weights = self.term_weights(principal, terms)
         # Two steps: the best-matching sections first (their own short text, from the index),
@@ -727,21 +753,69 @@ class HybridRetriever:
         ).order_by(numbered.c.document_id, numbered.c.chunk_index)
         return [_candidate(r) for r in self._read(statement)]
 
+    def contents(self, principal: Principal, document_ids: list[uuid.UUID], filters: SearchFilters) -> list[Candidate]:
+        """Each document's table of contents: an opening chunk that lists its chapters."""
+        if not document_ids:
+            return []
+        statement = (
+            _base(CHUNK_COLUMNS, principal, filters)
+            .where(
+                Chunk.document_id.in_(document_ids),
+                Chunk.chunk_index < CONTENTS_SEARCH_CHUNKS,
+                or_(Chunk.text.op("~*")(r"table\s+of\s+contents"),
+                    Chunk.text.op("~*")(r"(chapter\s+[0-9ivxlc]+\M.*){4}")),
+            )
+            .order_by(Chunk.document_id, Chunk.chunk_index)
+        )
+        return [_candidate(r) for r in self._read(statement)]
+
     def referenced_policies(self, principal: Principal, query: str) -> list[uuid.UUID]:
-        """Policies the question names explicitly (by number, or by name inside the question)."""
+        """Policies the question names: by number, by (almost) the full name, or by a name a reader
+        would use for it ("the KYC/AML policy", "home loan policy"; see policy_names)."""
         identifiers = [i.upper() for i in _IDENTIFIER.findall(query)]
         normalized = " ".join(query_terms(query))
         conditions = [func.word_similarity(Policy.normalized_name, normalized) >= 0.8] if normalized else []
         if identifiers:
             conditions += [func.upper(Policy.policy_number).in_(identifiers), func.upper(Policy.document_number).in_(identifiers)]
-        if not conditions:
+        found = []
+        if conditions:
+            statement = select(Policy.id).where(
+                visible_clause(principal, Policy.organization_id, Policy.branch_id, Policy.department_id, Policy.id),
+                Policy.status == PolicyStatus.ACTIVE,
+                or_(*conditions),
+            ).limit(10)
+            found = [row[0] for row in self._read(statement)]
+        return list(dict.fromkeys(found + [m.policy_id for m in self.policy_mentions(principal, query)]))
+
+    def policy_mentions(self, principal: Principal, query: str) -> list[Mention]:
+        """The spans of the question that name one of the caller's policies."""
+        if principal.organization_id is None:
             return []
-        statement = select(Policy.id).where(
+        organization_id = principal.organization_id
+        catalogue = cached_catalogue(organization_id, lambda: self._policy_catalogue(organization_id))
+        if not catalogue:
+            return []
+        visible = {row[0] for row in self._read(select(Policy.id).where(
             visible_clause(principal, Policy.organization_id, Policy.branch_id, Policy.department_id, Policy.id),
             Policy.status == PolicyStatus.ACTIVE,
-            or_(*conditions),
-        ).limit(10)
-        return [row[0] for row in self._read(statement)]
+        ))}
+        return find_mentions(query, [p for p in catalogue if p.policy_id in visible])
+
+    def _policy_catalogue(self, organization_id: uuid.UUID) -> list[PolicyNames]:
+        """Every active policy of the organisation with the names its own data gives it."""
+        policies = self._read(select(Policy.id, Policy.name, Policy.policy_number, Policy.document_number).where(
+            Policy.organization_id == organization_id, Policy.status == PolicyStatus.ACTIVE,
+        ))
+        covers: dict[uuid.UUID, list[str]] = {}
+        for policy_id, cover in self._read(
+            select(Document.policy_id, Chunk.text)
+            .join(Chunk, and_(Chunk.document_id == Document.id, Chunk.chunk_index == 0))
+            .where(Document.organization_id == organization_id, Document.status == DocumentStatus.READY,
+                   Document.policy_id.is_not(None))
+        ):
+            covers.setdefault(policy_id, []).append(cover[:2000])
+        return [build_names(policy_id, name, numbers=[policy_number, document_number], front_matter=covers.get(policy_id, []))
+                for policy_id, name, policy_number, document_number in policies]
 
     def referenced_documents(self, principal: Principal, query: str) -> list[NamedDocument]:
         """Documents the question names by their uploaded file name."""
@@ -754,6 +828,28 @@ class HybridRetriever:
         ).limit(20)
         return [NamedDocument(*row) for row in self._read(statement) if names_file(query, row[2])]
 
+    def documents_still_embedding(self, principal: Principal, filters: SearchFilters) -> list[uuid.UUID]:
+        """READY documents in scope whose vectors are not all written: only keyword lanes reach them yet.
+
+        Only narrows the reworded keyword pass; every lane still applies the full scope predicate.
+        """
+        if principal.organization_id is None:
+            return []
+        statement = (
+            select(Document.id)
+            .join(IngestionStage, IngestionStage.document_id == Document.id)
+            .where(
+                Document.organization_id == principal.organization_id,
+                Document.status == DocumentStatus.READY,
+                IngestionStage.stage == Stage.EMBEDDING,
+                IngestionStage.status.in_([StageStatus.RUNNING, StageStatus.FAILED]),
+            )
+            .limit(STILL_EMBEDDING_LIMIT)
+        )
+        if filters.document_ids:
+            statement = statement.where(Document.id.in_(filters.document_ids))
+        return [row[0] for row in self._read(statement)]
+
     def retrieve(
         self,
         principal: Principal,
@@ -762,7 +858,9 @@ class HybridRetriever:
         *,
         limit: int = 60,
         query_vector: list[float] | None = None,
+        semantic: bool = True,
     ) -> RetrievalResult:
+        """`semantic=False` runs only the lexical lanes (no query embedding, no vector lane)."""
         timings: dict[str, float] = {}
 
         def timed(name, fn, *args):
@@ -773,7 +871,9 @@ class HybridRetriever:
                 timings[name] = round((time.perf_counter() - started) * 1000, 1)
 
         referenced = timed("policy_lookup", self.referenced_policies, principal, query)
-        if query_vector is None and self.embedder is not None:
+        if not semantic:
+            query_vector = None
+        elif query_vector is None and self.embedder is not None:
             # Embed before fanning out: the network round trip is the longest
             # step and there is nothing for it to overlap with.
             query_vector = timed("embed_query", self.embedder.query_vector, query)
@@ -856,6 +956,11 @@ def names_file(query: str, filename: str) -> bool:
     return re.search(rf"(?<![\w.-]){re.escape(filename)}(?![\w-])", query, re.I) is not None
 
 
+def requested_clauses(query: str) -> list[str]:
+    """Clause numbers the question names: "section 4.25.9", "clause 5.2", "para 12"."""
+    return list(dict.fromkeys(_CLAUSE.findall(query)))
+
+
 def requested_pages(query: str) -> list[int]:
     pages: list[int] = []
     for start, end in _PAGE.findall(query):
@@ -873,6 +978,11 @@ def requested_codes(query: str) -> list[str]:
         code for code in _CODE.findall(query)
         if not re.fullmatch(r"v(?:ersion)?\d+(?:\.\d+)*", code, re.I) and not code.isdigit()
     ))
+
+
+def names_code(text: str, code: str) -> bool:
+    """The text states the identifier itself: "KAP-KEY-01", not "KAP-KEY-011" or "XKAP-KEY-01"."""
+    return re.search(rf"(?<![A-Za-z0-9]){re.escape(code)}(?![A-Za-z0-9])", text, re.I) is not None
 
 
 def expand_context(session: Session, candidates: list[Candidate], window: int = 1) -> dict[uuid.UUID, list[Candidate]]:

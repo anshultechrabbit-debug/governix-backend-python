@@ -5,7 +5,9 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 from sqlalchemy import select
 
+from app.core.config import get_settings
 from app.modules.categories.model import Category
+from app.modules.documents.model import Document
 from app.modules.policies.model import PolicyVersion
 from app.tests.factories import login, make_tenant
 from app.tests.flows import V3, V4, build, confirm_new_policy, process
@@ -308,3 +310,67 @@ def test_an_unidentified_category_is_suggested_as_policies_for_review(db, app, c
     _document_id, analysis = process(client, app, tenant.admin, unclassifiable())
     assert analysis["suggested_category_id"] == category_id(db, tenant)
     assert "category" not in analysis["missing_fields"]
+
+
+def reissue(version: str, effective: str, extra: str) -> bytes:
+    """One policy reissued: the same text, a new version line and date, one sentence changed."""
+    spec = PolicySpec(header_lines=["Owner: Chief Risk Officer", f"Version: {version}", f"Effective date: {effective}"])
+    spec.title = "UNSECURED PERSONAL LOAN POLICY"
+    spec.sections[3].paragraphs = [f"For loans above Rs. 75 lakh the LTV shall not exceed 70%. {extra}"]
+    spec.sections.extend(Section(str(n), f"Credit Standard {n}", [
+        f"Clause {n}: the branch shall verify income, employment and repayment capacity of every applicant "
+        f"before sanctioning a personal loan, and record the assessment in the credit file under standard {n}.",
+    ]) for n in range(10, 40))
+    return build(spec)
+
+
+def test_near_identical_versions_uploaded_together_become_one_policy(db, app, tenant, admin):
+    files = [reissue("1.0", "01-Apr-2024", "Reviewed annually."),
+             reissue("2.0", "01-Jan-2025", "Reviewed every six months."),
+             reissue("3.0", "01-Oct-2025", "Reviewed every quarter.")]
+    batch = run_batch(admin, app, [{
+        "category_id": category_id(db, tenant),
+        "items": [{"filename": "v1.pdf"}, {"filename": "v2.pdf"}, {"filename": "v3.pdf"}],
+    }], [files])
+
+    documents = [db.get(Document, i["document_id"]) for i in batch["groups"][0]["items"]]
+    distance = max(bin(a.simhash ^ b.simhash).count("1") for a in documents for b in documents)
+    assert distance <= get_settings().SIMHASH_DUPLICATE_DISTANCE  # what the analysis called "duplicates"
+    assert batch["status"] == "completed", batch
+    history = versions(db, batch["groups"][0]["policy_id"])
+    assert [v.version_label for v in history] == ["1.0", "2.0", "3.0"]
+    assert [v.effective_from for v in history] == [date(2024, 4, 1), date(2025, 1, 1), date(2025, 10, 1)]
+
+
+def test_a_near_identical_file_stating_another_version_is_a_new_version(db, app, tenant, admin, client):
+    first, analysis = process(client, app, tenant.admin, reissue("1.0", "01-Apr-2024", "Reviewed annually."))
+    policy_id = confirm_new_policy(admin, first, analysis).json()["data"]["policy_id"]
+    drain(app)
+    _second, analysis = process(client, app, tenant.admin, reissue("2.0", "01-Jan-2025", "Reviewed quarterly."))
+    assert analysis["decision"] in ("EXISTING_POLICY_NEW_VERSION", "POSSIBLE_MATCH_REQUIRES_REVIEW"), analysis["decision"]
+    assert analysis["matched_policy"]["policy_id"] == policy_id
+
+
+def test_a_document_the_upload_will_file_is_not_offered_for_review(db, app, tenant, admin):
+    created = admin.post("/uploads/batches", json={"groups": [{
+        "new_policy_name": "Home Loan Credit Policy", "category_id": category_id(db, tenant),
+        "items": [{"filename": "v3.pdf"}, {"filename": "v4.pdf"}],
+    }]}).json()["data"]
+    first, second = created["groups"][0]["items"]
+
+    def send(item, content):
+        sent = admin.post(f"/uploads/batches/{created['id']}/items/{item['id']}/file",
+                          files={"file": (item["original_filename"], io.BytesIO(content), "application/pdf")})
+        assert sent.status_code == 200, sent.text
+        drain(app)
+        return sent.json()["data"]["document_id"]
+
+    # Read, but its group still waits for the other file: the upload files it, not the person.
+    document_id = send(first, build(V3))
+    waiting = admin.get(f"/documents/{document_id}").json()["data"]
+    assert waiting["status"] == "awaiting_confirmation"
+    assert waiting["filed_by_batch"] is True and waiting["upload_batch_id"] == created["id"]
+
+    send(second, build(V4))
+    filed = admin.get(f"/documents/{document_id}").json()["data"]
+    assert filed["status"] == "ready" and filed["filed_by_batch"] is False

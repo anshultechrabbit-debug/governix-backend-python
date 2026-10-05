@@ -92,14 +92,11 @@ def chunk_document(payload: dict, ctx: JobContext) -> None:
             if rt.settings.EMBEDDING_PROVIDER.lower() == "none":
                 progress.finish(session, document.id, Stage.EMBEDDING, status=StageStatus.SKIPPED,
                                 detail={"reason": "EMBEDDING_PROVIDER=none"})
-                pipeline.enqueue_step(rt.queue, session, document, pipeline.VERIFY, "verify")
             else:
                 progress.start(session, document.id, Stage.EMBEDDING, total_units=index)
-                batch = rt.settings.EMBED_BATCH_SIZE
-                for start in range(0, index, batch):
-                    pipeline.enqueue_step(
-                        rt.queue, session, document, pipeline.EMBED_BATCH, f"embed:{start}",
-                        {"start": start, "end": min(start + batch, index) - 1},
-                    )
+                progress.start(session, document.id, Stage.INDEXING)
+                pipeline.enqueue_embedding(rt.queue, session, document, index, rt.settings.EMBED_BATCH_SIZE)
+            # Searchable now by keyword; vectors are added as the embedding batches finish.
+            pipeline.enqueue_step(rt.queue, session, document, pipeline.VERIFY, "verify")
             session.commit()
             logger.info("Document %s: %s chunks", document.id, index)

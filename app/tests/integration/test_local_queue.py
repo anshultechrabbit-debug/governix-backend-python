@@ -107,6 +107,31 @@ def test_retries_with_backoff_then_fails(queue, session_factory, task_name):
     assert job.status == JobStatus.FAILED and job.attempts == 2
 
 
+def test_retry_later_waits_without_spending_attempts(queue, session_factory, task_name):
+    calls = []
+
+    def rate_limited(payload, ctx):
+        calls.append(ctx.attempt)
+        if len(calls) <= 3:
+            raise registry.RetryLater(3600, "rate limit")
+
+    registry.task(task_name)(rate_limited)
+    job_id = queue.enqueue(task_name, {}, max_attempts=1)
+    worker = make_worker(session_factory)
+
+    for _ in range(3):
+        make_due(session_factory, job_id)
+        worker.run_once()
+        job = load(session_factory, job_id)
+        assert job.status == JobStatus.QUEUED and job.attempts == 0
+        assert worker.run_once() is False  # deferred: not due yet
+
+    make_due(session_factory, job_id)
+    worker.run_once()
+    assert load(session_factory, job_id).status == JobStatus.SUCCEEDED
+    assert calls == [1, 1, 1, 1]
+
+
 def test_unknown_task_is_retried_not_dropped(queue, session_factory):
     job_id = queue.enqueue("not.registered", {})
     make_worker(session_factory).run_once()

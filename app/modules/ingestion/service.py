@@ -8,6 +8,7 @@ from app.core.exceptions import NotFoundError
 from app.modules.auth.acl import can_see
 from app.modules.auth.permissions import Principal
 from app.modules.categories.model import Category
+from app.modules.documents.model import Document
 from app.modules.documents.repository import DocumentRepository
 from app.modules.ingestion.model import Decision, DocumentAnalysis
 from app.modules.ingestion.schema import AnalysisRead
@@ -43,10 +44,8 @@ class AnalysisService:
         if analysis.matched_policy_id:
             policy = self._visible_policy(principal, analysis.matched_policy_id)
             matched = self._policy_summary(policy) if policy else RESTRICTED
-        elif analysis.decision in DUPLICATE_DECISIONS and (existing := (analysis.conflict or {}).get("existing_policy_id")):
-            # A (near-)copy of a filed document: the natural choice is a new version of that
-            # document's policy (a reissue), so offer it as the match.
-            policy = self._visible_policy(principal, existing)
+        elif related := self._related_policy_id(analysis):
+            policy = self._visible_policy(principal, related)
             matched = self._policy_summary(policy) if policy else None
 
         candidates = [
@@ -88,6 +87,37 @@ class AnalysisService:
             resolution=analysis.resolution,
             suggested_initial_version=self._suggested_version(analysis),
         )
+
+    def _related_policy_id(self, analysis: DocumentAnalysis) -> uuid.UUID | str | None:
+        """The policy an upload most likely belongs to when its analysis matched none, read now:
+        files analysed together cannot see each other's policies, which are created later.
+
+        * the policy its bulk-upload group was filed under (the person arranged the files as
+          versions of one policy), or the policy a file of the group was confirmed into;
+        * for a (near-)copy of another document, that document's policy (a reissue).
+        """
+        from app.modules.uploads.model import UploadBatchGroup, UploadBatchItem
+
+        item = self.session.scalar(select(UploadBatchItem).where(UploadBatchItem.document_id == analysis.document_id))
+        if item is not None:
+            group = self.session.get(UploadBatchGroup, item.group_id)
+            if group is not None and group.policy_id:
+                return group.policy_id
+            sibling_policy = self.session.scalar(
+                select(Document.policy_id)
+                .join(UploadBatchItem, UploadBatchItem.document_id == Document.id)
+                .where(UploadBatchItem.group_id == item.group_id, Document.policy_id.is_not(None))
+                .order_by(UploadBatchItem.position).limit(1)
+            )
+            if sibling_policy:
+                return sibling_policy
+        if analysis.decision in DUPLICATE_DECISIONS:
+            if analysis.duplicate_of_document_id:
+                existing = self.session.get(Document, analysis.duplicate_of_document_id)
+                if existing is not None and existing.policy_id:
+                    return existing.policy_id
+            return (analysis.conflict or {}).get("existing_policy_id")
+        return None
 
     def _policy_summary(self, policy: Policy) -> dict[str, Any]:
         versions = self.session.scalars(

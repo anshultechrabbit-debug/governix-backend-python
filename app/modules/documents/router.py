@@ -4,6 +4,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
 from fastapi.responses import Response, StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
@@ -53,8 +54,14 @@ Service = Annotated[DocumentService, Depends(get_service)]
 
 
 def _detail(service: DocumentService, document) -> DocumentDetail:
+    from app.modules.uploads.model import ItemStatus, UploadBatchItem
+
     detail = DocumentDetail.model_validate(document)
     detail.progress = Progress.model_validate(progress_module.snapshot(service.session, document.id))
+    item = service.session.scalar(select(UploadBatchItem).where(UploadBatchItem.document_id == document.id))
+    if item is not None:
+        detail.upload_batch_id = item.batch_id
+        detail.filed_by_batch = item.status == ItemStatus.PROCESSING
     return detail
 
 

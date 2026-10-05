@@ -94,4 +94,7 @@ class TicketAttachment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     storage_key: Mapped[str] = mapped_column(String(500))
     uploaded_by_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
 
-    __table_args__ = (Index("ix_ticket_attachments_ticket", "ticket_id"),)
+    __table_args__ = (
+        Index("ix_ticket_attachments_ticket", "ticket_id"),
+        Index("ix_ticket_attachments_message", "message_id"),  # ON DELETE CASCADE lookup
+    )
