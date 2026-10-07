@@ -212,6 +212,44 @@ def test_a_percent_sign_answers_a_question_about_a_percentage():
     assert TermIndex("The maximum LTV for gold loans is 75%.").mentions("percentage")
 
 
+def test_a_limit_written_as_a_phrase_states_the_limit():
+    from app.modules.rag.validation import TermIndex
+
+    index = TermIndex("The tenure is up to 15 years. Income shall be not less than Rs. 25,000 a month.")
+    assert index.mentions("maximum") and index.mentions("minimum")
+    assert not TermIndex("Set up tomorrow.").mentions("maximum")
+
+
+def test_the_readers_word_for_the_documents_word_is_the_same_subject():
+    evidence = {"E1": EvidenceText("E1", "We fund up to 65% of the agreed property value.")}
+    [result] = validate_claims([{"text": "The lender finances a maximum of 65% of the property value.",
+                                 "evidence_ids": ["E1"]}], evidence)
+    assert result.valid, result.problems
+
+
+def test_the_first_figure_of_a_range_takes_its_unit():
+    evidence = {"E1": EvidenceText("E1", "Applicant age: 28 to 65 years (70 for business owners). Fee: 2-3% of the amount.")}
+    for claim in ("The minimum applicant age is 28 years.", "The fee is at least 2% of the amount."):
+        [result] = validate_claims([{"text": claim, "evidence_ids": ["E1"]}], evidence)
+        assert result.valid, result.problems
+    [wrong] = validate_claims([{"text": "The minimum applicant age is 70 years.", "evidence_ids": ["E1"]}],
+                              {"E1": EvidenceText("E1", "Applicant age: 28 to 65 years.")})
+    assert not wrong.valid
+
+
+def test_a_figure_in_a_table_column_is_stated_for_the_columns_heading():
+    evidence = {"E1": EvidenceText("E1", (
+        "A nominal fee applies for duplicate statements.\n\nCredit score | Interest rate (p.a.) | Processing fee\n\n"
+        "750 and above | 10.05% | 1.75% + GST\n\n700 - 749 | 10.45% | 1.75% + GST\n\n650 - 699 | 11.15% | 2.00% + GST"))}
+    subjects = ["processing", "fee"]
+    ok = validate_claims([{"text": "The processing fee is 1.75% + GST for scores of 750 and above.", "evidence_ids": ["E1"]}],
+                         evidence, subjects)
+    wrong = validate_claims([{"text": "The processing fee is 10.45% for scores of 700 - 749.", "evidence_ids": ["E1"]}],
+                            evidence, subjects)
+    assert ok[0].valid, ok[0].problems
+    assert not wrong[0].valid
+
+
 def test_a_claim_about_another_variant_than_the_one_asked_is_rejected():
     evidence = {"E1": EvidenceText("E1", (
         "Tier 2 / Islands Zone | Single-borrower exposure | Max | INR 180 lakh\n"
@@ -318,3 +356,56 @@ def test_saying_every_version_has_something_is_checked_in_each_version():
     assert check_versions("Chapter 3 Vendor Onboarding appears in both Version 1.0 and Version 2.0.", ["E1", "E2"]).valid
     wrong = check_versions("Chapter 1 Digital Banking and Payments appears in both versions.", ["E1", "E2"])
     assert not wrong.valid and "the version 1.0 passage does not" in wrong.problems[0]
+
+
+# --- the reader's own figures and checked arithmetic ------------------------------------
+
+def _one(text, evidence, question):
+    [result] = validate_claims([{"text": text, "evidence_ids": ["E1"]}], {"E1": EvidenceText("E1", evidence)},
+                               question=question)
+    return result
+
+
+FEE = "A processing fee of 2% of the sanctioned amount (minimum Rs. 5,000) is charged on every car loan."
+LIMIT = "Disputes about a returned cheque must be raised within 60 days of the return."
+
+
+def test_a_rule_applied_to_the_readers_figures_is_kept_when_the_arithmetic_checks_out():
+    question = "A customer takes a Rs. 5 lakh car loan. What processing fee applies?"
+    assert _one("For a Rs. 5 lakh car loan, the processing fee of 2% is Rs. 10,000.", FEE, question).valid
+    wrong = _one("For a Rs. 5 lakh car loan, the processing fee of 2% is Rs. 12,000.", FEE, question)
+    assert not wrong.valid and "'Rs. 12,000' is not in the cited evidence" in wrong.problems
+
+
+def test_the_readers_figure_is_never_stated_as_the_rule():
+    question = "A customer's cheque was returned 75 days ago. Can they still raise a dispute?"
+    assert _one("A dispute after 75 days is beyond the 60-day limit, so it cannot be raised.", LIMIT, question).valid
+    assert not _one("Disputes must be raised within 75 days of the return.", LIMIT, question).valid
+
+
+def test_a_false_premise_is_corrected_and_never_confirmed():
+    question = "The cheque dispute limit is 90 days, right?"
+    assert _one("Disputes must be raised within 60 days of the return, not 90 days.", LIMIT, question).valid
+    assert not _one("Disputes must be raised within 90 days of the return.", LIMIT, question).valid
+    negated = _one("Disputes must not be raised within 60 days of the return.", LIMIT, question)
+    assert not negated.valid  # a "not" on the rule's own figure reverses the rule
+
+
+def test_a_figure_in_another_unit_of_time_is_the_same_figure():
+    evidence = "The maximum repayment tenure for a car loan is 84 months."
+    assert _one("The maximum repayment tenure for a car loan is 7 years.", evidence, "How many years?").valid
+    assert not _one("The maximum repayment tenure for a car loan is 8 years.", evidence, "How many years?").valid
+    # The reader's own figure is not "converted" into support for itself.
+    assert not _one("The maximum repayment tenure for a car loan is 10 years.", evidence,
+                    "Is the tenure 120 months?").valid
+
+
+def test_the_readers_rate_on_the_readers_amount_is_not_the_documents_figure():
+    evidence = {"E1": EvidenceText("E1", "We fund up to 65% of the agreed property value.")}
+    question = "The latest version finances up to 80% of the property. How much loan can I get on a Rs. 1 crore property?"
+    [premise] = validate_claims([{"text": "Financing of up to 80% permits a loan of up to Rs. 80 lakh.", "evidence_ids": ["E1"]}],
+                                evidence, question=question)
+    [applied] = validate_claims([{"text": "Up to 65% of the property value is funded: up to Rs. 65 lakh on a Rs. 1 crore property.", "evidence_ids": ["E1"]}],
+                                evidence, question=question)
+    assert not premise.valid
+    assert applied.valid, applied.problems

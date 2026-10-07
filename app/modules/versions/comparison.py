@@ -20,7 +20,8 @@ MAX_DIFF_TOKENS = 4000
 MAX_CHANGED_SENTENCES = 4
 MAX_SENTENCE_CHARS = 400
 # Paragraphs, and sentences within them: a policy rule is usually one of either.
-_SENTENCE_SPLIT = re.compile(r"\n\s*\n|(?<=[.;])\s+(?=[A-Z0-9(])")
+# Not before a figure: "Rs. 30 lakh" is one sentence.
+_SENTENCE_SPLIT = re.compile(r"\n\s*\n|(?<=[.;])(?<!\bRs\.)(?<!\bNo\.)(?<!\bvs\.)\s+(?=[A-Z(]|\d{1,3}(?:\.\d{1,3}){1,3}\s)")
 
 
 @dataclass

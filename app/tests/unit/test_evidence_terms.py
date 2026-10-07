@@ -113,6 +113,9 @@ def test_questions_that_ask_several_things_are_recognised():
     assert asks_several("What is the title and who is the issuing authority?")
     assert asks_several("What is the LTV? Who approves it?")
     assert not asks_several("What are the terms and conditions of the loan?")
+    # One question per line, without question marks (turn 72 of a long chat).
+    assert asks_several("List every percentage stated in the policies.\nList every number stated in the policies.")
+    assert not asks_several("What is the LTV\nfor gold loans?")
 
 
 def test_a_passage_label_carries_its_version_and_period():

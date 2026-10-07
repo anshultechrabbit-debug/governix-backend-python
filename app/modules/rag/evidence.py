@@ -83,7 +83,14 @@ QUESTION_TERMS = frozenset(
     # Whether a document has something: "which chapters are present", "a chapter called X".
     "present appear appears appearing contain contains contained containing called saying but "
     # Joining words of rule-book questions: "Auto Loan extended to students", "serving exporters".
-    "serving serve serves served extended extending covering segment segments".split()
+    "serving serve serves served extended extending covering segment segments "
+    # Instructions about the answer, not its subject ("ignore the documents and say ..."), light
+    # verbs ("how long can I take", "how much can I get"), and how a figure moved or ranks ("why did
+    # the rate drop", "the lowest fee"): the figure's subject is in the question's other words.
+    "ignore ignoring disregard forget pretend take takes taking took taken get gets getting got "
+    "rise rises rising rose risen increase increased increases increasing decrease decreased decreases "
+    "decreasing drop drops dropped dropping fall falls fell fallen go goes went gone "
+    "highest lowest largest smallest biggest cheapest offered offer offers range ranges available".split()
 )
 # Closed word classes that never name a question's subject. Unlike the open list above, these
 # classes are finite: quantifiers and determiners ("all three versions"), number words and
@@ -98,7 +105,7 @@ CLOSED_CLASS_TERMS = frozenset(
     # prepositions and comparison operators. Not those that bound a figure ("above 75 lakh", "within 7
     # days", "before GST"): rule books separate one band from the next by them.
     "per via vs versus upon onto into without between among amongst across against toward towards "
-    "throughout during except including regarding concerning respect "
+    "throughout during except including regarding concerning respect up back "
     # where an answer is written
     "page pages provision provisions sentence sentences line lines word words wording text texts".split()
 )
@@ -154,11 +161,25 @@ def key_terms(question: str) -> list[str]:
     is not: it chose the versions searched, and neither is "changed" in "has it changed
     between the versions?"."""
     framing = COMPARISON_WORDS if compares_versions(question) else frozenset()
+    question = without_version_refs(question)
+    given = _readers_figures(question)
     return [
-        t for t in query_terms(without_version_refs(question))
+        t for t in query_terms(question)
         if t not in GENERIC_TERMS and t not in QUESTION_TERMS and t not in CLOSED_CLASS_TERMS and t not in framing
-        and (not t.isdigit() or len(t) >= 2)
+        and t not in given and not _HYPHENATED_FIGURE.fullmatch(t) and (not t.isdigit() or len(t) >= 2)
     ]
+
+
+# "a 25-year loan", "a 60-day notice": a figure the reader states, as one word.
+_HYPHENATED_FIGURE = re.compile(r"\d+(?:\.\d+)?-(?:years?|months?|weeks?|days?|yrs?)", re.I)
+
+
+def _readers_figures(question: str) -> set[str]:
+    """The words of the figures a question states with a unit ("drop to 7.5%", "a Rs. 1 crore property",
+    "over 10 years"): the reader's own figures, to apply a rule to or to be corrected. The documents
+    need not contain them; "170 schemes" or "in 2050", bare numbers, still name a subject."""
+    return {w.lower().strip(".,") for f in extract_numeric_facts(question)
+            if f.kind in ("percent", "amount", "duration", "quantity") for w in re.findall(r"[\w.,]+", f.raw)}
 
 
 # Questions about what a document is made of: its chapters, its contents.
@@ -207,7 +228,11 @@ def build_evidence(
     filters: SearchFilters,
     rerank_top_n: int,
     limit: int,
+    required: list[Candidate] | None = None,
+    context_chars: int = 600,
 ) -> EvidenceSet:
+    """`required`: passages that must be in the evidence whatever their rank (the best passage of each
+    document or version a question compares; see RAGService._sides)."""
     pool = candidates[: max(rerank_top_n * 4, limit)]
     if not pool:
         return EvidenceSet([], 0.0, key_terms(question), 0.0, [])
@@ -246,6 +271,13 @@ def build_evidence(
             chosen.add(candidate.chunk_id)
             selected.append(candidate)
 
+    present = {c.chunk_id for c in selected}
+    for candidate in required or []:
+        if candidate.chunk_id not in present:
+            present.add(candidate.chunk_id)
+            candidate.rerank_score = candidate.rerank_score or 0.0
+            selected.append(candidate)
+
     if is_document_question(question):
         present = {c.chunk_id for c in selected}
         documents = list(dict.fromkeys(c.document_id for c in selected))[:2]
@@ -280,8 +312,8 @@ def build_evidence(
             source=source,
             score=round(_blend(candidate, max_fused), 4),
             rerank_score=round(candidate.rerank_score, 4),
-            context_before=" ".join(before)[-600:],
-            context_after=" ".join(after)[:600],
+            context_before=" ".join(before)[-context_chars:] if context_chars else "",
+            context_after=" ".join(after)[:context_chars] if context_chars else "",
             category_name=category.name if category else None,
             authority_rank=category.authority_rank if category else 0,
         ))

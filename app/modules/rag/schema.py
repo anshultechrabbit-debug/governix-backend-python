@@ -2,14 +2,24 @@ import uuid
 from datetime import date, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ConversationTurn(BaseModel):
-    """An earlier turn, used only to resolve references in a follow-up question."""
+    """An earlier turn, used only to resolve references in a follow-up question.
+
+    A long earlier answer (a list of every requirement) is cut, not refused: refusing it would
+    fail every question asked after it in the same chat. Only its opening is ever read.
+    """
 
     question: str = Field(max_length=2000)
     answer: str | None = Field(default=None, max_length=8000)
+
+    @field_validator("question", "answer", mode="before")
+    @classmethod
+    def _cut(cls, value, info):
+        limit = 2000 if info.field_name == "question" else 8000
+        return value[:limit] if isinstance(value, str) else value
 
 
 class AskRequest(BaseModel):

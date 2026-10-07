@@ -44,9 +44,12 @@ _ACROSS = re.compile(
     r"\b(?:each|every|both|all|either|the\s+two)\s+(?:of\s+)?(?:the\s+)?(?:(?:two|three|four|five|six|\d{1,2})\s+)?"
     r"(?:editions?|versions?)\b"
     r"|\bacross\s+(?:the\s+|all\s+)?(?:editions|versions)\b"
-    r"|\bwhich\s+(?:edition|version)\s+(?:sets|has|gives|allows|requires|is)\s+(?:the\s+|a\s+)?"
+    r"|\bwhich\s+(?:edition|version)\s+(?:sets|has|gives|allows|requires|is|offers|charges)\s+(?:the\s+|a\s+)?"
     r"(?:higher|lower|larger|smaller|greater|stricter|longer|shorter|more|less|"
-    r"later|earlier|newer|older|latest|earliest|newest|oldest|more\s+recent)\b",
+    r"highest|lowest|largest|smallest|greatest|longest|shortest|most|least|cheapest|"
+    r"later|earlier|newer|older|latest|earliest|newest|oldest|more\s+recent)\b"
+    # "In which versions is the maximum tenure 30 years?"
+    r"|\bwhich\s+(?:editions|versions)\b",
     re.I,
 )
 # Words that ask for a comparison, or say which versions, rather than name what to compare.
@@ -79,9 +82,6 @@ class QueryPlan:
     explanation: str = ""
     # A comparison with no subject ("what changed in v2?") is answered from the section diff.
     diff: bool = False
-    # A comparison of one subject ("how did the LTV change?", "which version first changed it?"):
-    # one policy's versions, oldest first, whose consecutive diffs are searched for that subject.
-    diff_versions: list[uuid.UUID] = field(default_factory=list)
 
     def describe(self) -> dict:
         return {

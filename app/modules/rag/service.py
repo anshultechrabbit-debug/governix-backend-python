@@ -19,6 +19,7 @@ never decides permissions; its output is discarded unless it validates.
 
 import dataclasses
 from decimal import Decimal, InvalidOperation
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 import re
@@ -35,7 +36,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import Settings
 from app.infrastructure.ai.embeddings.base import EmbeddingProvider
-from app.infrastructure.ai.llm.base import LLMProvider, LLMResult, LLMUnavailableError
+from app.infrastructure.ai.llm.base import LLMProvider, LLMResult, LLMUnavailableError, TimedLLM
 from app.infrastructure.ai.reranker.base import RerankerProvider
 from app.infrastructure.cache.base import Cache, build_cache_key
 from app.modules.audit.service import record_event
@@ -50,10 +51,18 @@ from app.modules.rag.evidence import (
 )
 from app.infrastructure.ai.llm.local import LocalLLM
 from app.modules.rag.prompts import (
-    OUTPUT_SCHEMA, SUMMARY_CHECK_PROMPT, SUMMARY_CHECK_SCHEMA, SYSTEM_PROMPT, build_user_prompt, comparison_text,
+    OUTPUT_SCHEMA, SUMMARY_CHECK_PROMPT, SUMMARY_CHECK_SCHEMA, SYSTEM_PROMPT, TRANSLATE_PROMPT, TRANSLATE_SCHEMA,
+    build_user_prompt, comparison_text,
 )
 from app.modules.rag.query_plan import COMPARISON_WORDS, QueryClass, QueryPlan, normal_label, plan_query, version_mentions, without_version_refs
-from app.modules.rag.query_rewrite import Rewrite, restated_questions, standalone_question
+from app.modules.rag.select import (
+    MAX_PICKS, SELECT_PROMPT, VERIFY_PROMPT, VERIFY_SCHEMA, claims_from_selection, named_picks, numbered_sentences,
+    level_claims, newest_version_picks, percent_claims, version_claims, with_other_versions,
+    premise_claim, selection_prompt, selection_schema, verification_prompt,
+)
+from app.modules.rag.query_rewrite import (
+    HISTORY_TURNS, Rewrite, depends_on_history, question_lines, restated_questions, standalone_question,
+)
 from app.modules.rag.schema import AnswerResponse, AskRequest, Claim, NoAnswer, Source
 from app.modules.rag.validation import ABSENCE_PROBLEM, EvidenceText, TermIndex, validate_claims
 from app.modules.search.model import Chunk
@@ -63,7 +72,7 @@ from app.modules.search.retrieval import (
 from app.modules.search.policy_names import without_references
 from app.modules.search.schema import Provenance
 from app.modules.search.rephrase import rephraser
-from app.modules.search.service import cache_scope, provenance, retrieve_with_variants
+from app.modules.search.service import cache_scope, embed_query_cached, provenance, retrieve_with_variants
 from app.modules.versions.integrity import newer_versions, unrelated_versions
 from app.modules.versions.timeline import compare_versions, effective_on
 
@@ -75,6 +84,12 @@ SUGGESTIONS = [
     "Ask about one specific rule or topic",
 ]
 NO_ANSWER_MESSAGE = "None of the documents you can access answer this, so I won't guess."
+# No-answers that say nothing about the question, only about this attempt: never cached.
+TRANSIENT_REASONS = frozenset({"DEADLINE_EXCEEDED", "LLM_UNAVAILABLE", "NEEDS_CONTEXT"})
+# No-answers decided by checking what the model wrote against the documents.
+VALIDATION_REASONS = frozenset({"INSUFFICIENT_EVIDENCE", "ANSWER_FAILED_VALIDATION", "ANSWER_OFF_TOPIC"})
+# Characters of each earlier answer that key a follow-up's cached answer.
+HISTORY_KEY_CHARS = 300
 # Bump when the answer-generation or validation contract changes so cached
 # answers (including cached no-answers) are recomputed under the new contract.
 #
@@ -94,11 +109,17 @@ NO_ANSWER_MESSAGE = "None of the documents you can access answer this, so I won'
 #          version-register corrections, computed comparisons
 #   v36    the model's insufficient_evidence is honoured; identifier clauses (KAP-KEY-01) count as named;
 #          policies named by alias leave the term checks; abbreviations match their expansions
-ANSWER_CACHE_VERSION = "v36"
+#   v37    follow-ups keyed on the conversation; temporary failures not cached
+#   v38    the reader's figures and checked arithmetic allowed; each compared document/version searched
+#          on its own; answers in the reader's language
+#   v40    a timeout or model failure is reported as such, never as "not found"
+ANSWER_CACHE_VERSION = "v40"
 # No supported answer in the version in force: worth looking one version back.
+# Earlier versions answer only what the version in force does not cover. An answer it gave that the
+# checks then withheld (ANSWER_FAILED_VALIDATION, ANSWER_OFF_TOPIC) means it covers the subject:
+# an earlier version's figure for it would be out of date.
 FALLBACK_REASONS = frozenset({
     "NO_RELEVANT_DOCUMENTS", "LOW_RELEVANCE", "KEY_TERMS_NOT_FOUND", "INSUFFICIENT_EVIDENCE",
-    "ANSWER_FAILED_VALIDATION", "ANSWER_OFF_TOPIC",
 })
 _TERM = r"([A-Za-z][A-Za-z0-9-]{1,20})"
 _ACRONYM_QUESTION = re.compile(
@@ -232,10 +253,10 @@ _CONFIRMATION = re.compile(
 
 
 def asks_several(question: str) -> bool:
-    """ "What is X and who issued it?", or two questions in one message."""
+    """ "What is X and who issued it?", two questions in one message, or one per line."""
     if question.count("?") == 2 and _CONFIRMATION.search(question):
         return False
-    return bool(_SEVERAL.search(question))
+    return bool(_SEVERAL.search(question)) or question_lines(question) >= 2
 
 
 # A summary is a plain restatement of the claims when at least this share of its content words,
@@ -270,6 +291,13 @@ def is_greeting(question: str) -> bool:
 PART_WORKERS = 5
 _PART_POOL = ThreadPoolExecutor(max_workers=PART_WORKERS, thread_name_prefix="rag-part")
 
+# Sentences quoted for a question about one thing (a small model's picks; see select.py).
+SINGLE_SUBJECT_PICKS = 2
+# A question that sets documents or versions side by side is searched once per side, for at most
+# this many sides, keeping this many candidates of each.
+MAX_SIDES = 8
+PER_SIDE_CANDIDATES = 10
+
 # Version diffs computed for questions (a stored one predates sentence-level changes, or the two
 # versions are not consecutive). A 14,000-section diff takes about two seconds; the documents of a
 # version do not change while it exists, so a diff is kept for a while, keyed by both documents.
@@ -277,28 +305,7 @@ _DIFF_CACHE: dict[tuple, tuple[float, dict]] = {}
 _DIFF_CACHE_MAX = 64
 _DIFF_TTL_SECONDS = 3600
 _DIFF_LOCK = threading.Lock()
-# Changes about one subject given to the model: enough for every version of a long-lived policy.
-MAX_SUBJECT_CHANGES = 12
 
-
-def _change_chain(versions: list[tuple[PolicyVersion, str]], named: list[uuid.UUID],
-                  referenced: list[uuid.UUID]) -> list[uuid.UUID]:
-    """One policy's versions to diff for a subject comparison, oldest first: from the earliest to the
-    latest version the question names (and every version between, so "first changed" is exact), or
-    all versions of the one policy the question names when it names no version. Empty when the
-    question does not single out one policy."""
-    by_policy: dict[uuid.UUID, list[PolicyVersion]] = {}
-    for version, _ in versions:
-        by_policy.setdefault(version.policy_id, []).append(version)
-    if named:
-        chosen = [v for v, _ in versions if v.id in set(named)]
-        policies = {v.policy_id for v in chosen}
-        if len(policies) != 1 or len(chosen) < 2:
-            return []
-        start, end = min(v.effective_from for v in chosen), max(v.effective_from for v in chosen)
-        return [v.id for v in by_policy[policies.pop()] if start <= v.effective_from <= end]
-    targets = [p for p in dict.fromkeys(referenced) if len(by_policy.get(p, [])) >= 2]
-    return [v.id for v in by_policy[targets[0]]] if len(targets) == 1 else []
 
 
 def _result_of(run: Generator[tuple[str, Any], None, Any]) -> Any:
@@ -348,7 +355,11 @@ def _combine(parts: list[tuple[str, AnswerResponse]]) -> AnswerResponse | None:
         conflicts += [{**c, "citations": [remap[n] for n in c.get("citations", []) if n in remap]} for c in response.conflicts]
         warnings += [w for w in response.warnings if w not in warnings]
         checks += response.plan.get("checks", [])
-    warnings += [f'Not found in your documents: "{q}"' for q, r in parts if r.status != "answered"]
+    warnings += [
+        f'Not answered in time, please ask again: "{q}"' if r.no_answer and r.no_answer.reason in TRANSIENT_REASONS
+        else f'Not found in your documents: "{q}"'
+        for q, r in parts if r.status != "answered"
+    ]
     summaries = [r.summary for _, r in answered if r.summary]
     first = answered[0][1]
     return AnswerResponse(
@@ -423,13 +434,17 @@ class RAGService:
         self.cache = cache
         self.embedder: EmbeddingProvider | None = embedder
         self.reranker: RerankerProvider | None = reranker
-        self._llm_factory: Callable[[], LLMProvider] = llm_factory
-        self._rephrase = rephraser(llm_factory)
+        # Every model call of an answer ends by its time limit (see _calls_end), retries included.
+        self._calls_end: float | None = None
+        self._llm_factory: Callable[[], LLMProvider] = lambda: TimedLLM(llm_factory(), lambda: self._calls_end)
+        self._rephrase = rephraser(self._llm_factory)
         self._session_factory = session_factory
         self.retriever = HybridRetriever(session_factory, embedder)
         # Each question as asked -> what it asks about, without the policies it names
         # ("in the KYC/AML Policy"): see _subject.
         self._subjects: dict[str, str] = {}
+        # Each question as asked -> the policies it names, in order (see _sides).
+        self._named_policies: dict[str, list[uuid.UUID]] = {}
 
     # --- public -----------------------------------------------------------------
 
@@ -462,9 +477,16 @@ class RAGService:
 
         timings: dict[str, float] = {}
         deadline = started + self.settings.RAG_DEADLINE_SECONDS
+        # The deadline is checked before each model call; a call started just before it may still
+        # take its timeout, and no longer.
+        self._calls_end = deadline + self.settings.LLM_TIMEOUT_SECONDS
         yield "stage", {"stage": "searching"}
 
         prepared_request, rewrite, named, plan = self._prepare_request(principal, request, timings)
+        # The reader's language, when it is not English: the answer is checked in English, against the
+        # documents, and translated last.
+        language = rewrite.language if rewrite and rewrite.language and rewrite.language.lower() not in (
+            "english", "en") else None
         # A question that asks several things ("the title and who issued it") is split first:
         # answered as one, it tends to answer only the first thing.
         restated = self._clarify(prepared_request.question, timings) if asks_several(prepared_request.question) else None
@@ -479,11 +501,11 @@ class RAGService:
                 principal, prepared_request, plan, rewrite, named, timings, deadline, started
             )
         if restated or (self._worth_clarifying(response, deadline)
-                        and (restated := _with_versions(prepared_request.question,
-                                                        self._clarify(prepared_request.question, timings)))):
-            # The words as typed found nothing ("pokucy", "hello ... in short", or two subjects
-            # in one question): search again for the question(s) as the person meant them.
-            # Nothing was shown yet.
+                        and (restated := _with_versions(prepared_request.question, self._clarify(
+                            prepared_request.question, timings, history=request.history)))):
+            # The words as typed found nothing ("pokucy", "hello ... in short", two subjects in one
+            # question, or a short follow-up such as "What is the limit?" that only the earlier turns
+            # explain): search again for the question(s) as the person meant them. Nothing was shown yet.
             parts = []
             if len(restated) == 1:
                 question = restated[0]
@@ -500,7 +522,8 @@ class RAGService:
                 # Several questions: each is answered on its own, in parallel, with its own session
                 # and time limit; their claims are shown once combined (numbering differs per part).
                 yield "stage", {"stage": "searching", "parts": len(restated)}
-                futures = [_PART_POOL.submit(self._answer_part, principal, prepared_request, q) for q in restated]
+                futures = [_PART_POOL.submit(self._answer_part, principal, prepared_request, q, deadline)
+                           for q in restated]
                 for question, future in zip(restated, futures, strict=True):
                     part_request, part_plan, part, part_retrieved = future.result()
                     retrieved += part_retrieved
@@ -518,38 +541,52 @@ class RAGService:
                     principal, prepared_request, plan, rewrite, named, timings, deadline, started
                 )
                 retrieved += more
+            if response.status != "answered" and (timed_out := next(
+                    (r for *_, r in parts if r.no_answer and r.no_answer.reason in TRANSIENT_REASONS), None)):
+                # The words as typed found nothing and the restated search ran out of time: whether the
+                # documents answer it is unknown, so say that, not "not found".
+                response = timed_out
+        if language:
+            response = self._in_language(response, language, timings)
         response = self._decorate_and_persist(
             principal, request, prepared_request, response, plan, rewrite, retrieved, timings, started, key
         )
         yield "done", response
 
-    def _answer_part(self, principal: Principal, request: AskRequest, question: str):
-        """One part of a several-question message, answered in a worker thread with its own session."""
+    def _answer_part(self, principal: Principal, request: AskRequest, question: str, deadline: float):
+        """One part of a several-question message, answered in a worker thread with its own session,
+        within the time limit of the whole question."""
         with self._session_factory() as session:
             service = RAGService(session, self._session_factory, self.settings, self.cache,
                                  self.embedder, self.reranker, self._llm_factory)
+            service._calls_end = self._calls_end
             timings: dict[str, float] = {}
             part_request, _, named, plan = service._prepare_request(
                 principal, request.model_copy(update={"question": question, "history": []}), timings,
             )
             started = time.perf_counter()
             response, retrieved = _result_of(service._run_pipeline(
-                principal, part_request, plan, Rewrite(question), named, timings,
-                started + self.settings.RAG_DEADLINE_SECONDS, started,
+                principal, part_request, plan, Rewrite(question), named, timings, deadline, started,
             ))
             session.rollback()
         return part_request, plan, response, retrieved
 
     def _answer_cache_key(self, principal: Principal, request: AskRequest) -> str:
-        """Key on the (normalised) rewritten question plus the explicit filter parameters.
+        """Key on the (normalised) question plus the explicit filter parameters.
 
-        Raw history is excluded: once resolved into a standalone question, two turns
-        with identical rewrites but different history must share the same cache entry.
+        A question that may lean on the earlier turns ("What about mortgage?", "What is the limit?")
+        is also keyed on them: the same words after another conversation are another question.
+        A standalone question is not, so it is shared across conversations.
         """
         scope = cache_scope(self.session, principal)
+        context = None
+        if depends_on_history(request.question, request.history):
+            context = [(" ".join(t.question.lower().split()), " ".join((t.answer or "").split())[:HISTORY_KEY_CHARS])
+                       for t in request.history[-HISTORY_TURNS:]]
         return build_cache_key(
             "rag", scope, ANSWER_CACHE_VERSION,
             " ".join(request.question.lower().split()),
+            context,
             request.mode,
             request.as_of.isoformat() if request.as_of else None,
             sorted(str(v) for v in request.version_ids),
@@ -600,8 +637,9 @@ class RAGService:
                 # anyway lets any passage pass the term checks, which have nothing to check.
                 raise _NoAnswer("GREETING" if is_greeting(request.question) else "NO_SUBJECT", suggestions=[])
             referenced = request.policy_ids or self.retriever.referenced_policies(principal, request.question)
-            self._subjects[request.question] = without_references(
-                request.question, self.retriever.policy_mentions(principal, request.question))
+            mentions = self.retriever.policy_mentions(principal, request.question)
+            self._subjects[request.question] = without_references(request.question, mentions)
+            self._named_policies[request.question] = list(dict.fromkeys(m.policy_id for m in mentions))
             filters = self._filters(principal, plan, request, referenced, named)
             try:
                 response = yield from self._attempt(principal, request, plan, filters, attempt, timings, deadline, started)
@@ -643,7 +681,9 @@ class RAGService:
         timings["total"] = round((time.perf_counter() - started) * 1000, 1)
         response.timings_ms = timings
         response.query_id = self._audit(principal, original, response, retrieved=retrieved, cache_hit=False)
-        self.cache.set(key, response.model_dump(mode="json"), ttl_seconds=self.settings.RAG_CACHE_TTL_SECONDS)
+        if not (response.no_answer and response.no_answer.reason in TRANSIENT_REASONS):
+            # A timeout or an outage says nothing about the question: asking again must try again.
+            self.cache.set(key, response.model_dump(mode="json"), ttl_seconds=self.settings.RAG_CACHE_TTL_SECONDS)
         return response
 
     # Nothing matched the words as typed: a rewording may. Not for an outage, a deadline,
@@ -657,13 +697,47 @@ class RAGService:
             and time.perf_counter() < deadline
         )
 
-    def _clarify(self, question: str, timings: dict[str, float]) -> list[str] | None:
+    def _in_language(self, response: AnswerResponse, language: str, timings: dict[str, float]) -> AnswerResponse:
+        """The finished answer in the reader's language. Every claim was checked against the documents
+        in English; a translation that loses or changes a figure is not used for that claim. The English
+        claims stay in the plan for the audit trail."""
+        step = time.perf_counter()
+        statements = [c.text for c in response.claims]
+        message = response.no_answer.message if response.no_answer else ""
+        try:
+            result = self._llm_factory().generate_json(
+                TRANSLATE_PROMPT,
+                f"Language: {language}\n\n" + json.dumps(
+                    {"statements": statements, "summary": response.summary or "", "message": message}, ensure_ascii=False),
+                TRANSLATE_SCHEMA,
+            )
+        except LLMUnavailableError:
+            return response
+        content = result.content or {}
+        translated = content.get("statements") if isinstance(content.get("statements"), list) else []
+        if len(translated) == len(statements):
+            response.plan["original_claims"] = statements
+            for claim, text in zip(response.claims, translated):
+                if isinstance(text, str) and text.strip() and _same_figures(claim.text, text):
+                    claim.text = " ".join(text.split())
+            response.answer = " ".join(f"{c.text} [{', '.join(map(str, c.citations))}]" for c in response.claims) or None
+        summary = content.get("summary")
+        if response.summary and isinstance(summary, str) and summary.strip() and _same_figures(response.summary, summary):
+            response.summary = summary.strip()
+        translated_message = content.get("message")
+        if response.no_answer and isinstance(translated_message, str) and translated_message.strip():
+            response.no_answer.message = translated_message.strip()
+        response.plan["answer_language"] = language
+        timings["translate"] = round((time.perf_counter() - step) * 1000, 1)
+        return response
+
+    def _clarify(self, question: str, timings: dict[str, float], history: list | None = None) -> list[str] | None:
         step = time.perf_counter()
         try:
             llm = self._llm_factory()
         except LLMUnavailableError:
             return None
-        clarified = restated_questions(llm, question)
+        clarified = restated_questions(llm, question, history)
         timings["clarify"] = round((time.perf_counter() - step) * 1000, 1)
         return clarified
 
@@ -679,6 +753,7 @@ class RAGService:
             limit=self.settings.RAG_RETRIEVAL_CANDIDATES, rephrase=self._rephrase,
         )
         timings.update({f"{prefix}retrieval_{k}": v for k, v in result.timings_ms.items()})
+        required = self._each_side(principal, plan, filters, request.question, result.candidates, timings, prefix)
         attempt.retrieved += [c.chunk_id for c in result.candidates]
 
         step = time.perf_counter()
@@ -686,11 +761,10 @@ class RAGService:
             self.session, principal, request.question, result.candidates,
             reranker=self.reranker, retriever=self.retriever, filters=filters,
             rerank_top_n=self.settings.RAG_RERANK_TOP_N, limit=self.settings.RAG_EVIDENCE_LIMIT,
+            required=required, context_chars=self.settings.RAG_CONTEXT_CHARS,
         )
         if plan.diff:
             evidence.comparison = self._comparison(principal, plan)
-        elif plan.diff_versions:
-            evidence.comparison = self._subject_changes(principal, plan, request.question)
         evidence.unrelated = unrelated_versions(self.session, [i.source.version_id for i in evidence.items])
         self._true_periods(evidence)
         timings[f"{prefix}evidence"] = round((time.perf_counter() - step) * 1000, 1)
@@ -706,8 +780,15 @@ class RAGService:
             self._check_deadline(deadline, evidence)
             yield "stage", {"stage": "writing"}
             try:
-                response = yield from self._write(principal, request, plan, evidence, attempt, timings, started)
+                try:
+                    response = yield from self._write(principal, request, plan, evidence, attempt, timings, started)
+                finally:
+                    timings[f"{prefix}llm"] = round((time.perf_counter() - step) * 1000, 1)
             except _NoAnswer as no_answer:
+                if self._fell_back(attempt) and no_answer.reason in VALIDATION_REASONS:
+                    # The model did not answer (timeout, outage) and the stand-in that quotes the
+                    # documents found no sentence to quote: nothing was decided about the documents.
+                    raise _NoAnswer("LLM_UNAVAILABLE") from None
                 # True statements about something else ("pricing proposals above Rs. 104 lakh"
                 # for "the Pricing threshold") while a passage names everything asked: once more,
                 # from those passages only. Nothing was shown: off-topic claims are held back.
@@ -780,7 +861,14 @@ class RAGService:
         self, principal, request, plan: QueryPlan, first: _NoAnswer, attempt: _Attempt,
         timings: dict[str, float], deadline: float, started: float,
     ) -> Generator[tuple[str, Any], None, AnswerResponse]:
-        for depth, version_ids in enumerate(self._previous_version_sets(principal, request, plan.as_of), start=1):
+        sets = self._previous_version_sets(principal, request, plan.as_of)
+        depth_of = {version: depth for depth, depth_set in enumerate(sets, start=1) for version in depth_set}
+        if len(sets) > 1:
+            # One pass over every earlier version, each searched on its own (see _sides); the newest
+            # version with an answer wins (newest_version_picks, _newest_claims). A pass per version
+            # costs a model call each, which with eight versions outlasts any reasonable wait.
+            sets = [[version for depth_set in sets for version in depth_set]]
+        for depth, version_ids in enumerate(sets, start=1):
             # Refuse to start another full pipeline pass if the deadline is already
             # exhausted: the LLM call would immediately time out anyway, and the
             # _check_deadline inside _attempt fires *before* the call, not after.
@@ -794,9 +882,13 @@ class RAGService:
                 policy_ids=list(request.policy_ids), category_ids=list(request.category_ids),
             )
             fallback = _Attempt()
+            # Told it answers about the version in force, a model rightly finds nothing in earlier ones.
+            earlier = dataclasses.replace(plan, explanation=(
+                "The version in force today does not cover this question; the evidence is from earlier "
+                "versions. Answer from the newest version that covers it, and say which version that is"))
             try:
                 response = yield from self._attempt(
-                    principal, request, plan, filters, fallback, timings, deadline, started, prefix=f"previous_{depth}_",
+                    principal, request, earlier, filters, fallback, timings, deadline, started, prefix=f"previous_{depth}_",
                 )
             except _NoAnswer as no_answer:
                 attempt.retrieved += fallback.retrieved
@@ -805,6 +897,8 @@ class RAGService:
                 continue
             attempt.retrieved += fallback.retrieved
             attempt.llm_result = fallback.llm_result
+            # How far back the answer is: the versions it cites, not the pass that found them.
+            depth = min((depth_of[s.version_id] for s in response.sources if s.version_id in depth_of), default=depth)
             self._mark_previous_version(response, set(version_ids), depth, first.reason)
             return response
         raise first
@@ -970,7 +1064,6 @@ class RAGService:
         if comparison_subject(question, names):
             if not plan.version_ids:
                 plan.mode, plan.explanation = "all", "Question compares versions; each passage is labelled with its version"
-            plan.diff_versions = _change_chain(versions, plan.version_ids, referenced)
             return
         # Every change between two versions of one policy.
         if not plan.version_ids:
@@ -1041,52 +1134,53 @@ class RAGService:
             _DIFF_CACHE[key] = (time.monotonic() + _DIFF_TTL_SECONDS, diff)
         return diff
 
-    def _subject_changes(self, principal: Principal, plan: QueryPlan, question: str) -> dict | None:
-        """What changed about the question's subject across a policy's versions, from the version diffs.
-
-        "How did the STR filing deadline change from v1.0 to v3.0?", "Which version first changed the
-        LTV?", "In which version was the top-up clause removed?": the consecutive diffs of the versions
-        hold every changed sentence; those that carry most of the subject's distinguishing weight are
-        the answer's evidence. Unlike passage search, this cannot miss a version or a removed clause.
-        None when no changed sentence is about the subject (it may simply not have changed)."""
-        versions = sorted(self.session.scalars(
-            select(PolicyVersion).where(PolicyVersion.id.in_(plan.diff_versions))
-        ).all(), key=lambda v: v.effective_from)
-        if len(versions) < 2:
-            return None
-        policy_name = self.session.scalar(select(Policy.name).where(Policy.id == versions[0].policy_id)) or ""
-        terms = [t for t in comparison_subject(self._subject(question), [policy_name]) if not t.isdigit()]
-        weights = self.retriever.visible_term_weights(principal, terms)
-        total = sum(weights.values())
-        if total <= 0:
-            return None
-        matched = []
-        for older, newer in zip(versions, versions[1:]):
-            diff = self._version_diff(older, newer)
-            for item in diff.get("modified", []):
-                for change in item.get("changes", []):
-                    said = TermIndex(" ".join(filter(None, [change["old"], change["new"]])))
-                    if sum(w for t, w in weights.items() if said.mentions(t)) / total >= self.settings.RAG_MIN_SALIENT_COVERAGE:
-                        matched.append({
-                            "versions": f"From Version {older.version_label} to Version {newer.version_label}",
-                            "new": item["new"], "old": item["old"], "changes": [change],
-                            "numeric_changes": {"changed": []},
-                        })
-        if not matched:
-            return None
-        first, last = versions[0], versions[-1]
-        return {
-            "from_version": {"id": str(first.id), "label": first.version_label, "effective_from": first.effective_from.isoformat()},
-            "to_version": {"id": str(last.id), "label": last.version_label, "effective_from": last.effective_from.isoformat()},
-            "summary_lines": [
-                "Every version in between was compared with the next; only the changes about the question's subject "
-                "are listed. A version not listed did not change it.",
-            ],
-            "modified": matched[:MAX_SUBJECT_CHANGES],
-            "added": [], "removed": [],
-        }
-
     # --- gate, generation, validation ------------------------------------------------
+
+    def _sides(self, principal: Principal, plan: QueryPlan, filters: SearchFilters, question: str) -> list[SearchFilters]:
+        """The documents or versions a question sets side by side, each as its own search scope.
+
+        "Compare the gold loan and mortgage LTV": each policy it names. "... in all three versions",
+        "how did it change from v1 to v3": each version. One search over all of them ranks the
+        sides against each other, and the side worded closer to the question can take every slot.
+        Empty for a question about one thing, or about more sides than MAX_SIDES."""
+        named = self._named_policies.get(question, [])
+        if len(named) >= 2 and not filters.policy_ids:
+            return [dataclasses.replace(filters, policy_ids=[p]) for p in named[:MAX_SIDES]]
+        if plan.query_class is QueryClass.COMPARISON and filters.version_scope.mode == "versions":
+            versions = filters.version_scope.version_ids
+        elif (plan.query_class in (QueryClass.CURRENT, QueryClass.HISTORICAL)
+              and filters.version_scope.mode == "versions" and len(filters.version_scope.version_ids) > 1):
+            versions = filters.version_scope.version_ids  # earlier versions searched together (fallback)
+        elif plan.query_class is QueryClass.ACROSS_VERSIONS and len(named) == 1:
+            versions = [v.id for v, _ in self._searchable_versions(principal, named)]
+        else:
+            return []
+        if not 2 <= len(versions) <= MAX_SIDES:
+            return []
+        return [dataclasses.replace(filters, version_scope=VersionScope("versions", version_ids=[v])) for v in versions]
+
+    def _each_side(self, principal, plan, filters, question, candidates: list[Candidate], timings, prefix) -> list[Candidate]:
+        """Search each side on its own; return the best passage of each (it must be in the evidence),
+        and add each side's leading passages to the candidates."""
+        sides = self._sides(principal, plan, filters, question)
+        if not sides:
+            return []
+        step = time.perf_counter()
+        vector = embed_query_cached(self.embedder, self.cache, question)
+        with ThreadPoolExecutor(max_workers=len(sides), thread_name_prefix="rag-side") as pool:
+            found = list(pool.map(lambda scope: self.retriever.retrieve(
+                principal, question, scope, limit=PER_SIDE_CANDIDATES, query_vector=vector).candidates, sides))
+        seen = {c.chunk_id for c in candidates}
+        required = []
+        for side in found:
+            if side:
+                required.append(side[0])
+            for candidate in side:
+                if candidate.chunk_id not in seen:
+                    seen.add(candidate.chunk_id)
+                    candidates.append(candidate)
+        timings[f"{prefix}retrieval_sides"] = round((time.perf_counter() - step) * 1000, 1)
+        return required
 
     def _subject(self, question: str) -> str:
         """What the question asks about: without the policies it names explicitly ("in the KYC/AML
@@ -1119,11 +1213,18 @@ class RAGService:
         if (subject := self._subject(question)) != question:
             evidence.coverage, evidence.missing_terms = coverage_of(
                 subject, [i.full_text + " " + i.source.section_path for i in evidence.items])
+        if self._close_in_meaning(evidence.items):
+            return  # worded differently, but a passage means what was asked: the model judges it
         if evidence.coverage < self.settings.RAG_MIN_TERM_COVERAGE:
             raise _NoAnswer("KEY_TERMS_NOT_FOUND", evidence.missing_terms)
         salient, missing = self._salient_coverage(principal, question, evidence)
         if salient < self.settings.RAG_MIN_SALIENT_COVERAGE:
             raise _NoAnswer("KEY_TERMS_NOT_FOUND", missing)
+
+    def _close_in_meaning(self, items) -> bool:
+        """A passage the vector lane found at least RAG_SEMANTIC_MIN_SIMILARITY close to the question."""
+        threshold = self.settings.RAG_SEMANTIC_MIN_SIMILARITY
+        return threshold is not None and any(i.candidate.scores.get("vector", 0.0) >= threshold for i in items)
 
     def _salient_coverage(self, principal: Principal, question: str, evidence: EvidenceSet) -> tuple[float, list[str]]:
         """Share of the question's distinguishing weight (IDF) that the evidence covers.
@@ -1187,6 +1288,11 @@ class RAGService:
             return missing
         return None
 
+    def _fell_back(self, attempt: _Attempt) -> bool:
+        """The answer was written by the local stand-in because the configured model failed."""
+        result = attempt.llm_result
+        return bool(result and result.model == LocalLLM.model_id and self.settings.LLM_PROVIDER != "local")
+
     def _check_deadline(self, deadline: float, evidence: EvidenceSet) -> None:
         """Abandon an answer that has already spent its whole budget.
 
@@ -1202,6 +1308,9 @@ class RAGService:
 
     def _generate_stream(self, principal, request, plan: QueryPlan, evidence: EvidenceSet) -> Iterator[dict | LLMResult]:
         """Yield each claim that validates, as the model finishes it, then the LLMResult."""
+        if self.settings.RAG_ANSWER_MODE == "select" and evidence.comparison is None:
+            yield from self._select_stream(principal, request, plan, evidence)
+            return
         question = request.question
         items = evidence.by_id()
         texts = _evidence_texts(evidence)
@@ -1227,6 +1336,71 @@ class RAGService:
         except LLMUnavailableError as exc:
             logger.error("LLM unavailable: %s", exc)
             raise _NoAnswer("LLM_UNAVAILABLE") from None
+
+    def _select_stream(self, principal, request, plan: QueryPlan, evidence: EvidenceSet) -> Iterator[dict | LLMResult]:
+        """A small model picks the evidence sentences that answer; they are the claims, as written."""
+        items = evidence.by_id()
+        texts = _evidence_texts(evidence)
+        numbering: dict[str, int] = {}
+        sentences = numbered_sentences(evidence.items)
+        if named := named_picks(request.question, sentences, requested_codes(request.question)):
+            # The question names the clause; the sentence stating it is the answer, no model needed.
+            claims = claims_from_selection({"ids": named}, sentences, items)
+            for raw in claims:
+                if (claim := self._streamed_claim(principal, request, plan, evidence, raw, texts, items, numbering)):
+                    yield claim
+            yield LLMResult(content={"insufficient_evidence": False, "claims": claims, "summary": "", "conflicts": []},
+                            model="select-named")
+            return
+        try:
+            llm: LLMProvider = self._llm_factory()
+            result = llm.generate_json(
+                SELECT_PROMPT, selection_prompt(request.question, plan.explanation, sentences), selection_schema(sentences),
+                context={"question": request.question, "conflicts": evidence.conflicts,
+                         "evidence": [{"id": i.id, "text": i.candidate.text} for i in evidence.items]},
+            ) if sentences else LLMResult(content={"insufficient_evidence": True, "ids": []}, model="select")
+        except LLMUnavailableError as exc:
+            logger.error("LLM unavailable: %s", exc)
+            raise _NoAnswer("LLM_UNAVAILABLE") from None
+        content = dict(result.content or {})
+        if "ids" in content:
+            content["ids"] = self._verified_picks(llm, request.question, content["ids"], sentences)
+            if plan.query_class in (QueryClass.CURRENT, QueryClass.HISTORICAL):
+                # Several versions searched together (the earlier-version fallback): the newest that
+                # answers is the answer; older wordings of the rule are not current.
+                content["ids"] = newest_version_picks(content["ids"], sentences, items)
+            if plan.query_class in (QueryClass.COMPARISON, QueryClass.ACROSS_VERSIONS):
+                content["ids"] = with_other_versions(content["ids"], sentences, items)
+            elif len(self._named_policies.get(request.question, [])) < 2 and not _WANTS_ALL.search(request.question):
+                # One subject has one answering rule, two at most (a rule and its exception): more are the
+                # neighbours a lenient check let through. "Tell me about the fees" wants them all.
+                content["ids"] = content["ids"][:SINGLE_SUBJECT_PICKS]
+        # The quoting stand-in (no model server) answers with claims of its own instead of ids.
+        claims = content["claims"] if "claims" in content else claims_from_selection(content, sentences, items)
+        # The model saying none answers wins over sentences it picked anyway, as in the generating mode.
+        insufficient = not claims or ("ids" in content and content.get("insufficient_evidence") is True)
+        answer = {"insufficient_evidence": insufficient, "claims": claims, "summary": "", "conflicts": []}
+        if not answer["insufficient_evidence"]:
+            for raw in claims:
+                if (claim := self._streamed_claim(principal, request, plan, evidence, raw, texts, items, numbering)):
+                    yield claim
+        yield dataclasses.replace(result, content=answer)
+
+    @staticmethod
+    def _verified_picks(llm: LLMProvider, question: str, ids: list, sentences: list) -> list[str]:
+        """The picked sentences that, checked one at a time, answer the question for the same subject."""
+        by_id = {s.id: s for s in sentences}
+        kept = []
+        for sentence_id in [i for i in dict.fromkeys(ids) if i in by_id][:MAX_PICKS]:
+            try:
+                verdict = llm.generate_json(VERIFY_PROMPT, verification_prompt(question, by_id[sentence_id]), VERIFY_SCHEMA,
+                                            context={"task": "verify"}).content or {}
+            except LLMUnavailableError:
+                return kept
+            # A stand-in without a model cannot judge: it gives no verdict, and the pick stands.
+            if verdict.get("answers", True) is not False:
+                kept.append(sentence_id)
+        return kept
 
     def _streamed_claim(self, principal, request, plan, evidence, raw, texts, items, numbering) -> dict | None:
         """One claim checked exactly as the final answer checks it, or None if it fails."""
@@ -1327,12 +1501,20 @@ class RAGService:
             if content.get("insufficient_evidence") or not results:
                 raise _NoAnswer("INSUFFICIENT_EVIDENCE")
             raise _NoAnswer("ANSWER_FAILED_VALIDATION")
-        if evidence.comparison is None and not is_document_question(request.question):
-            cited = [e for e in dict.fromkeys(e for r in valid for e in r.evidence_ids) if e in texts]
+        cited = [e for e in dict.fromkeys(e for r in valid for e in r.evidence_ids) if e in texts]
+        # A small model's picks were each checked against the question; when they are also close in
+        # meaning, words the question uses and the documents do not ("close early" for "foreclosure")
+        # are no reason to withhold them.
+        verified = self.settings.RAG_ANSWER_MODE == "select" and self._close_in_meaning([items[e] for e in cited if e in items])
+        if evidence.comparison is None and not is_document_question(request.question) and not verified:
             named = [" ".join(filter(None, [items[e].source.policy_name, items[e].source.document_title]))
                      for e in cited if e in items and items[e].source.version_id not in evidence.unrelated]
             self._check_on_topic(principal, request.question, [r.text for r in valid] + named, [texts[e].text for e in cited])
 
+        if plan.query_class in (QueryClass.CURRENT, QueryClass.HISTORICAL) and evidence.comparison is None:
+            # Several versions read together (the earlier-version fallback): the newest one that states
+            # the rule answers; an older wording of it is not the current rule.
+            valid = _newest_claims(valid, items, key_terms(self._subject(request.question)))
         numbering: dict[str, int] = {}
         for result in valid:
             for evidence_id in result.evidence_ids:
@@ -1342,6 +1524,12 @@ class RAGService:
         if computed := _magnitude_comparison(request.question, valid, items, numbering):
             claims.append(computed)
             checks.append("Computed the difference from the two cited figures")
+        if self.settings.RAG_ANSWER_MODE == "select":
+            # What a writing model would have said around the quoted rules.
+            if premise := premise_claim(request.question, claims):
+                claims.append(premise)
+            claims += percent_claims(request.question, claims) or level_claims(request.question, claims)
+            claims += version_claims(request.question, claims)
         sources = [self._source(n, e, items, evidence) for e, n in numbering.items()]
         if request.mode == "auto" and plan.query_class is QueryClass.CURRENT and evidence.comparison is None:
             for claim, source in self._earlier_version_notes(principal, request.question, valid, items, len(sources)):
@@ -1685,7 +1873,7 @@ class RAGService:
                 "with a citation for every point. What would you like to know?"
             ),
             "NO_SUBJECT": "What would you like to know? Please name the policy or topic you are asking about.",
-            "LLM_UNAVAILABLE": "The answering service is currently unavailable. Please try again later.",
+            "LLM_UNAVAILABLE": "The AI service did not respond in time, so the documents were not checked. Please ask again.",
             "COMPARISON_TARGET_UNCLEAR": "Please name the policy (and versions) you want to compare.",
             "NEEDS_CONTEXT": (
                 "This question refers to an earlier part of the conversation that is not available. "
@@ -1693,7 +1881,8 @@ class RAGService:
             ),
             "VERSION_NOT_FOUND": "That version could not be found among the documents you can access.",
             "DEADLINE_EXCEEDED": (
-                "This took too long to answer. Try narrowing the question or naming a policy."
+                "The time limit ran out before the documents were fully checked. Please ask again, or name the "
+                "policy to make it quicker."
             ),
         }
         return AnswerResponse(
@@ -1702,7 +1891,8 @@ class RAGService:
             no_answer=NoAnswer(
                 reason=no_answer.reason,
                 message=no_answer.message or messages.get(no_answer.reason, NO_ANSWER_MESSAGE),
-                suggestions=no_answer.suggestions if no_answer.suggestions is not None else SUGGESTIONS,
+                suggestions=(no_answer.suggestions if no_answer.suggestions is not None
+                             else [] if no_answer.reason in TRANSIENT_REASONS else SUGGESTIONS),
                 # An off-topic answer leaves out words the documents do contain; listing
                 # them as "not mentioned in your documents" would mislead.
                 missing_terms=[] if no_answer.reason == "ANSWER_OFF_TOPIC" else no_answer.missing_terms,
@@ -1758,6 +1948,50 @@ class RAGService:
         # exits cleanly via the `with session_factory() as session` context.
         self.session.flush()
         return event.id
+
+
+def _newest_claims(valid: list, items: dict, terms: list[str]) -> list:
+    """Claims from one version of each policy: the newest of the versions whose claims answer best.
+
+    Several versions are read together in the earlier-version fallback. Mixing their claims would set
+    an out-of-date figure beside the one that replaced it ("2.0% per month" in version 1, "3.0%" in
+    version 5), or a newer passage that only shares words with the question beside the answer."""
+    def order(evidence_id):
+        source = items[evidence_id].source
+        try:
+            label = tuple(int(p) for p in str(source.version_label or "0").split("."))
+        except ValueError:
+            label = (0,)
+        return (source.effective_from or date.min, label)
+
+    def coverage(result) -> float:
+        index = TermIndex(result.text)
+        return sum(index.mentions(t) for t in terms) / len(terms) if terms else 1.0
+
+    scored = [(r, coverage(r), [e for e in r.evidence_ids if e in items]) for r in valid]
+    best: dict = {}
+    for _result, score, cited in scored:
+        for e in cited:
+            best[items[e].source.policy_id] = max(best.get(items[e].source.policy_id, 0.0), score)
+    # Within one of the question's terms of the best is as good an answer: a newer version may word
+    # the rule differently ("overdue instalments" for "late EMIs").
+    slack = 1 / len(terms) if terms else 0.0
+    answering: dict = {}  # policy -> order of the version that answers
+    for _result, score, cited in scored:
+        for e in cited:
+            policy = items[e].source.policy_id
+            if score >= best[policy] - slack - 1e-9:
+                answering[policy] = max(answering.get(policy, order(e)), order(e))
+    kept = [r for r, _score, cited in scored
+            if all(any(items[e].source.policy_id == policy and order(e) == answering.get(policy) for e in cited)
+                   for policy in {items[e].source.policy_id for e in cited})]
+    return kept or valid
+
+
+def _same_figures(original: str, translated: str) -> bool:
+    """Every number of the original is in the translation, and no other: a translation may reword, never refigure."""
+    digits = re.compile(r"\d+(?:[.,]\d+)*")
+    return sorted(digits.findall(original)) == sorted(digits.findall(translated))
 
 
 def _names_clause(text: str, clause: str) -> bool:

@@ -60,6 +60,8 @@ export const openConversation = createAsyncThunk(
 // scheme?") can be resolved. The server uses them only to restate the
 // question, never as evidence.
 const HISTORY_TURNS = 4;
+// The server reads only the opening of an earlier answer; a long one is cut here.
+const HISTORY_ANSWER_CHARS = 2000;
 
 export const ask = createAsyncThunk(
   "assistant/ask",
@@ -68,7 +70,12 @@ export const ask = createAsyncThunk(
     const history = assistant.turns
       .filter((turn) => turn.id !== id && turn.status === "done")
       .slice(-HISTORY_TURNS)
-      .map((turn) => ({ question: turn.question, answer: turn.answer?.answer ?? null }));
+      .map((turn) => ({
+        // The question as the server understood it ("What is the LTV for mortgages?" for "What
+        // about mortgage?"), so a follow-up to a follow-up still knows its subject.
+        question: (turn.answer?.plan?.rewritten_question ?? turn.question).slice(0, 2000),
+        answer: turn.answer?.answer?.slice(0, HISTORY_ANSWER_CHARS) ?? null,
+      }));
     const body = { question, history, conversation_id: assistant.conversationId, ...options };
     // Streamed: progress and each validated claim appear as soon as they exist;
     // the final "done" event is the same answer /ai/ask would return.

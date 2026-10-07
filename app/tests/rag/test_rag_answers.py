@@ -141,6 +141,109 @@ def test_the_model_saying_the_evidence_does_not_answer_wins_over_its_claims(admi
     assert answer["no_answer"]["reason"] == "INSUFFICIENT_EVIDENCE"
 
 
+def test_a_temporary_failure_is_tried_again_not_served_from_the_cache(admin, home_loan):
+    # A long chat (turns 10 and 12): a timed-out question asked again returned the same failure from the cache.
+    down = ScriptedLLM(fail=True)
+    _use(down)
+    first = ask(admin, "What is the LTV for loans above 75 lakh?")
+    assert first["status"] == "no_answer" and first["no_answer"]["reason"] == "LLM_UNAVAILABLE"
+    _use(ScriptedLLM([{"text": "For loans above Rs. 75 lakh the LTV shall not exceed 70%.", "evidence_ids": ["E1"]}]))
+    again = ask(admin, "What is the LTV for loans above 75 lakh?")
+    assert not again["cache_hit"] and again["status"] == "answered"
+
+
+def test_a_short_follow_up_is_cached_per_conversation(admin, home_loan):
+    # "What about mortgage?" after one conversation is not the same question after another.
+    _use(ScriptedLLM([{"text": "For loans above Rs. 75 lakh the LTV shall not exceed 70%.", "evidence_ids": ["E1"]}]))
+    one = [{"question": "What is the LTV for loans above 75 lakh?", "answer": "70%."}]
+    other = [{"question": "Who approves home loans?", "answer": "The credit committee."}]
+    first = ask(admin, "What is the limit?", history=one)
+    assert not ask(admin, "What is the limit?", history=other)["cache_hit"]
+    if first["status"] == "answered":
+        assert ask(admin, "What is the limit?", history=one)["cache_hit"]
+
+
+def test_every_version_a_question_asks_about_is_searched_on_its_own(admin, home_loan, monkeypatch):
+    from app.modules.rag import service as rag_service
+
+    seen = []
+    original = rag_service.build_evidence
+
+    def capture(*args, **kwargs):
+        evidence = original(*args, **kwargs)
+        seen.append({item.source.version_label for item in evidence.items})
+        return evidence
+
+    monkeypatch.setattr(rag_service, "build_evidence", capture)
+    _use(ScriptedLLM([{"text": "For loans above Rs. 75 lakh the LTV shall not exceed 70%.", "evidence_ids": ["E1"]}]))
+    ask(admin, "What is the LTV for loans above 75 lakh in all versions of the Home Loan Credit Policy?")
+    assert seen and {"3", "4"} <= seen[0]
+
+
+class _Spanish(ScriptedLLM):
+    """Answers in English from the evidence; reads Spanish; translates by marking each statement."""
+
+    def generate_json(self, system, user, schema, *, context=None):
+        properties = schema.get("properties", {})
+        if "standalone_question" in properties:
+            return LLMResult(content={"standalone_question": "What is the LTV for loans above 75 lakh?",
+                                      "resolvable": True, "language": "Spanish"}, model=self.model_id)
+        if "statements" in properties:
+            data = __import__("json").loads(user.split("\n\n", 1)[1])
+            return LLMResult(content={"statements": [f"ES: {t}" for t in data["statements"]],
+                                      "summary": "", "message": ""}, model=self.model_id)
+        return super().generate_json(system, user, schema, context=context)
+
+
+def test_a_question_in_another_language_is_answered_in_it(admin, home_loan):
+    _use(_Spanish([{"text": "For loans above Rs. 75 lakh the LTV shall not exceed 70%.", "evidence_ids": ["E1"]}]))
+    answer = ask(admin, "¿Cuál es el LTV para préstamos de más de 75 lakh?")
+    assert answer["status"] == "answered", answer
+    assert answer["claims"][0]["text"].startswith("ES: ") and "70%" in answer["claims"][0]["text"]
+    assert answer["plan"]["answer_language"] == "Spanish"
+    assert answer["plan"]["original_claims"][0].startswith("For loans above")
+
+
+class _Picker(ScriptedLLM):
+    """A small model in "select" mode: picks the numbered sentence about the LTV above 75 lakh; its
+    one-sentence check answers `verdict`."""
+
+    def __init__(self, verdict=True):
+        super().__init__()
+        self.verdict = verdict
+
+    def generate_json(self, system, user, schema, *, context=None):
+        import re
+
+        properties = schema.get("properties", {})
+        if "ids" in properties:
+            lines = dict(re.findall(r"^\[(S\d+)\] \(.*?\) (.*)$", user, re.M))
+            picked = [i for i, text in lines.items() if "75 lakh" in text and "%" in text][:1]
+            return LLMResult(content={"ids": picked, "insufficient_evidence": not picked}, model=self.model_id)
+        if "answers" in properties:
+            return LLMResult(content={"subject_asked": "LTV", "subject_of_sentence": "LTV", "answers": self.verdict},
+                             model=self.model_id)
+        return super().generate_json(system, user, schema, context=context)
+
+
+def test_a_small_model_answers_by_picking_sentences_that_are_quoted_as_written(admin, home_loan, settings):
+    settings.RAG_ANSWER_MODE = "select"
+    _use(_Picker())
+    answer = ask(admin, "What is the LTV for loans above 75 lakh?")
+    assert answer["status"] == "answered", answer
+    quoted = answer["claims"][0]
+    assert "70%" in quoted["text"]
+    [source] = [s for s in answer["sources"] if s["number"] in quoted["citations"]]
+    assert quoted["text"] in " ".join(source["excerpt"].split())  # word for word, from the passage it cites
+
+
+def test_a_pick_its_own_check_rejects_is_no_answer(admin, home_loan, settings):
+    settings.RAG_ANSWER_MODE = "select"
+    _use(_Picker(verdict=False))
+    answer = ask(admin, "What is the LTV for loans above 75 lakh?")
+    assert answer["status"] == "no_answer" and answer["no_answer"]["reason"] == "INSUFFICIENT_EVIDENCE"
+
+
 def test_invalid_claims_are_dropped_and_reported(admin, home_loan):
     _use(ScriptedLLM([
         {"text": "For loans above Rs. 75 lakh the LTV shall not exceed 70%.", "evidence_ids": ["E1"]},
@@ -328,7 +431,7 @@ def test_several_questions_in_one_message_are_all_answered(admin, home_loan, mon
 
     questions = ["What is the LTV for loans above 75 lakh?", "What is the interest rate spread?",
                  "What is the LTV for loans above 75 lakh in the home loan policy?", "What is the spread on the repo rate?"]
-    monkeypatch.setattr(rag_service, "restated_questions", lambda llm, q: questions)
+    monkeypatch.setattr(rag_service, "restated_questions", lambda llm, q, history=None: questions)
     answer = ask(admin, "\n".join(questions))
     assert answer["status"] == "answered"
     assert answer["plan"]["parts"] == questions
@@ -360,3 +463,24 @@ def test_what_changed_in_one_version_compares_it_with_its_neighbour(admin, home_
     answer = ask(admin, question)
     assert answer["status"] == "answered", answer
     assert any(s["kind"] == "comparison" and s["version_label"] == "3 → 4" for s in answer["sources"])
+
+
+class _TimedOut(ScriptedLLM):
+    """The configured model timed out; the local stand-in answered and found nothing to quote."""
+
+    def generate_json(self, system, user, schema, *, context=None):
+        from app.infrastructure.ai.llm.local import LocalLLM
+
+        result = super().generate_json(system, user, schema, context=context)
+        if "claims" in schema.get("properties", {}):
+            result.model = LocalLLM.model_id
+            result.content["insufficient_evidence"] = True
+        return result
+
+
+def test_a_timed_out_model_is_reported_as_such_not_as_not_found(admin, home_loan):
+    _use(_TimedOut([]))
+    answer = ask(admin, "What is the LTV for loans above 75 lakh?")
+    assert answer["status"] == "no_answer"
+    assert answer["no_answer"]["reason"] == "LLM_UNAVAILABLE"
+    assert answer["no_answer"]["suggestions"] == []  # no "name the policy" advice for an outage

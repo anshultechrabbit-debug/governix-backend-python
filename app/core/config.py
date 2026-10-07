@@ -123,9 +123,29 @@ class Settings(BaseSettings):
     CORS_ORIGINS: list[str] = ["http://localhost:5173"]
 
     # AI providers. "openai" is the configured default; "local" providers are
-    # deterministic stand-ins for development/tests without an API key.
+    # deterministic stand-ins for development/tests without an API key; "ollama"
+    # is a model running on this machine behind an OpenAI-compatible API (Ollama,
+    # LM Studio, a llama.cpp server), at LLM_BASE_URL.
     LLM_PROVIDER: str = "openai"
     LLM_MODEL: str = "gpt-4o-mini"
+    # How the model answers. "generate": it writes cited claims (an OpenAI-class model). "select": it
+    # only picks the evidence sentences that answer, which are quoted as written, and the code adds
+    # yes/no and percentage arithmetic (a small local model; see app/modules/rag/select.py).
+    RAG_ANSWER_MODE: str = "generate"
+    # Meaning before wording: a passage at least this similar to the question (cosine, vector lane) lets
+    # the model judge a question whose words the documents do not use ("close my loan early" for
+    # "foreclosure"), instead of the key-term check refusing it. With RAG_ANSWER_MODE=select the model's
+    # pick, checked sentence by sentence, then stands in for the word-overlap topic check. None: off.
+    # Calibrate per embedding model (similarities differ between models).
+    RAG_SEMANTIC_MIN_SIMILARITY: float | None = None
+    # The LLM's own server, when it is not OpenAI's. Separate from OPENAI_BASE_URL, which the
+    # OpenAI embeddings also use: a local answering model leaves the embeddings where they are.
+    LLM_BASE_URL: str | None = None
+    # LLM_PROVIDER=openai_compatible: any OpenAI-compatible API at LLM_BASE_URL with this key: Google
+    # Gemini (https://generativelanguage.googleapis.com/v1beta/openai/), Groq, Cerebras, OpenRouter.
+    # LLM_SCHEMA_IN_PROMPT: for a server that ignores JSON schemas, put the schema in the prompt instead.
+    LLM_API_KEY: SecretStr | None = None
+    LLM_SCHEMA_IN_PROMPT: bool = False
     # Per-call bound on the model. A request thread blocked in a synchronous
     # provider call cannot be interrupted from outside, so this -- not the RAG
     # deadline -- is what actually caps latency.
@@ -143,7 +163,17 @@ class Settings(BaseSettings):
     EMBEDDING_PROVIDER: str = "openai"
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     # Must match the vector column (see app/modules/search/model.py); changing it needs a migration + re-embed.
+    # A smaller local model's vectors are zero-padded to it (EMBEDDING_PROVIDER=ollama).
     EMBEDDING_DIMENSIONS: int = 1536
+    # EMBEDDING_PROVIDER=ollama: the server (default LLM_BASE_URL, then http://localhost:11434), and the task
+    # prefixes the model was trained with (nomic-embed-text: "search_query: " / "search_document: ").
+    # Changing the provider or model needs `python -m app.cli reembed`: vectors of different models never mix.
+    EMBEDDING_BASE_URL: str | None = None
+    # EMBEDDING_PROVIDER=openai_compatible: an OpenAI-compatible embeddings API (Gemini's gemini-embedding-001
+    # at 1536 dimensions) at EMBEDDING_BASE_URL (default LLM_BASE_URL), with this key (default LLM_API_KEY).
+    EMBEDDING_API_KEY: SecretStr | None = None
+    EMBEDDING_QUERY_PREFIX: str = ""
+    EMBEDDING_DOCUMENT_PREFIX: str = ""
     # Embedding batches writing vectors at the same time. None: half the CPU cores, so the
     # database keeps the other half for answering questions while a large upload indexes.
     EMBED_WRITE_SLOTS: int | None = None
@@ -171,6 +201,9 @@ class Settings(BaseSettings):
     RAG_RETRIEVAL_CANDIDATES: int = 80
     RAG_RERANK_TOP_N: int = 24
     RAG_EVIDENCE_LIMIT: int = 14
+    # Text taken from the passages either side of each evidence passage, per side. A small local
+    # model reads a shorter prompt faster and with less to confuse it.
+    RAG_CONTEXT_CHARS: int = 600
     RAG_MIN_EVIDENCE_SCORE: float = 0.18
     RAG_MIN_TERM_COVERAGE: float = 0.4
     # The same, weighted by how rare each term is in what the caller can see:
@@ -194,6 +227,11 @@ class Settings(BaseSettings):
     RAG_DEADLINE_SECONDS: float = 20.0
     OPENAI_API_KEY: SecretStr | None = None
     OPENAI_BASE_URL: str | None = None
+    # LLM_PROVIDER=opencode: OpenCode Zen, an OpenAI-compatible gateway to many models. Its free models
+    # only work inside the OpenCode app (403 FreeTierError); the others need funds on the account.
+    OPENCODE_API_KEY: SecretStr | None = None
+    OPENCODE_BASE_URL: str = "https://opencode.ai/zen/v1"
+    OPENCODE_MODEL: str | None = None
     # Credit view on the dashboard. OpenAI does not let an API key read its balance, so
     # the credit added (and from when) is stated here; spend is subtracted from it.
     OPENAI_CREDIT_USD: float | None = None

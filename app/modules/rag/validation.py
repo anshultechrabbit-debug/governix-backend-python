@@ -20,10 +20,11 @@ the answer becomes a no-answer.
 
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 
 from app.core.stemming import stem
 from app.modules.citations.numerics import extract_numeric_facts
-from app.modules.rag.query_plan import normal_label
+from app.modules.rag.query_plan import normal_label, without_version_refs
 
 # Fraction of a claim's content words that must appear in the cited evidence.
 # 0.35 rather than 0.5: a faithful paraphrase shares most but not all of its
@@ -118,7 +119,7 @@ SYNONYM_GROUPS = (
     "own owns owned owner owners ownership custodian custodians",
     "retain retains retained retaining retention preserve preserves preserved preservation keep keeps kept",
     "threshold thresholds benchmark benchmarks cutoff",
-    "maximum max cap caps capped ceiling exceed exceeds exceeding upto",
+    "maximum max cap caps capped ceiling exceed exceeds exceeding upto atmost",
     "minimum min floor least",
     "approval approvals approve approves approved authorization authorisation authorize authorise "
     "authorized authorised sanction sanctioned",
@@ -127,8 +128,18 @@ SYNONYM_GROUPS = (
     "branch branches office offices",
     "review reviews reviewed verification verify verified",
     "frequency frequent often periodicity daily weekly fortnightly monthly quarterly annually yearly",
-    "penalty penalties penal fine fines",
-    "period periods duration tenure",
+    "penalty penalties penal fine fines fined",
+    "period periods duration tenure term terms",
+    # Lending vocabulary a reader and a policy word differently ("how much does the lender finance?" /
+    # "we fund up to 65%", "a fee for closing early" / "foreclosure charge").
+    "fund funds funded funding finance finances financed financing lend lends lending lent lender lenders financier",
+    "fee fees charge charges charged levy levied",
+    "close closes closed closing closure foreclose foreclosed foreclosure preclose preclosure",
+    "income incomes earning earnings salary salaries",
+    "require requires required requirement requirements need needs needed necessary mandatory compulsory must",
+    "late overdue delay delayed arrear arrears",
+    "emi emis instalment instalments installment installments",
+    "pay pays paid paying payment payments repay repays repaid repaying repayment repayments",
 )
 _SYNONYMS: dict[str, frozenset[str]] = {}
 for _group in SYNONYM_GROUPS:
@@ -170,6 +181,11 @@ _NEGATION = re.compile(r"\b(?:not|no|never|cannot|nor|neither|none|without)\b|n[
 # "Sl. No.: 65", "No. of accounts", "No Change": the word "no" that negates nothing.
 _NOT_NEGATION = re.compile(r"\b(?:sl|s)\.?\s*no\b\.?|\bno\.?\s*[:#]?\s*\d|\bno\.\s*of\b|\bno\s+change\b", re.I)
 _SENTENCE_END = re.compile(r"(?<=[.?!;:])\s+|\n+|\s\|\s|\s*[•▪●]\s*")
+
+
+_LIMIT_WORDS = {"up to": "upto", "at most": "atmost", "not more than": "atmost", "no more than": "atmost",
+                "not less than": "least", "no less than": "least"}
+_LIMIT_PHRASES = re.compile(r"\b(?:up\s+to|at\s+most|not\s+more\s+than|no\s+more\s+than|not\s+less\s+than|no\s+less\s+than)\b")
 
 
 def term_parts(term: str) -> list[str]:
@@ -231,6 +247,8 @@ class TermIndex:
         self._initials: set[str] | None = None
         # "FIU- IND" (a line broken at the hyphen) is the word "FIU-IND"; "75%" says "percent".
         text = re.sub(r"(?<=\w)-\s+(?=\w)", "-", text.lower()).replace("%", " percent ")
+        # Limits written as phrases are the words for them: "up to 15 years" states a maximum.
+        text = _LIMIT_PHRASES.sub(lambda m: _LIMIT_WORDS[" ".join(m.group(0).split())], text)
         # Clause "4.25.9" is one word; it also counts for its section, "4.25".
         words = [part for word in _TERM_WORD.findall(text) for part in _dotted(word)]
         self.counts: dict[str, int] = {}
@@ -360,8 +378,20 @@ def _sentences(text: str) -> list[str]:
     return [s for s in _SENTENCE_END.split(text) if s and s.strip()]
 
 
+# ", not 90 days", "rather than 1%": the claim corrects a figure, it does not negate the rule.
+_CONTRAST = re.compile(
+    r",?\s*(?:and\s+)?(?:not|rather\s+than|instead\s+of)\s+(?:the\s+|a\s+|an\s+)?(?:₹|rs\.?|inr)?\s*\d[\d,.]*\s*"
+    r"(?:%|percent|per\s+cent|lakhs?|crores?|years?|months?|days?|weeks?)?", re.I)
+
+
 def _flips_polarity(claim: str, cited_text: str) -> bool:
     """The claim restates one source sentence but drops or adds its negation."""
+    # Only a figure the source does not state can be the one corrected: "is not 60 days" of a 60-day
+    # rule negates the rule itself.
+    stated = {f.value for f in extract_numeric_facts(cited_text)}
+    claim = _CONTRAST.sub(
+        lambda m: " " if (facts := extract_numeric_facts(m.group(0))) and all(f.value not in stated for f in facts)
+        else m.group(0), claim)
     words = _content_words(claim)
     if not words:
         return False
@@ -420,7 +450,8 @@ _FULL_STOP = re.compile(r"[.!?](?=\s)")
 def _window(text: str, start: int, end: int) -> str:
     """The text beside a figure, within its line (a table row): its whole sentence, and at
     least NUMBER_WINDOW characters either side. A tiered clause ("Approval authority for X
-    ... up to INR 8 lakh, ...; above INR 24 lakh, the Committee.") is one sentence."""
+    ... up to INR 8 lakh, ...; above INR 24 lakh, the Committee.") is one sentence. A figure in
+    a table cell is also beside its column's heading ("Processing fee" over "1.75% + GST")."""
     line_start = text.rfind("\n", 0, start) + 1
     newline = text.find("\n", end)
     line_end = newline if newline != -1 else len(text)
@@ -428,7 +459,26 @@ def _window(text: str, start: int, end: int) -> str:
     sentence_start = stops[-1] if stops else line_start
     following = _FULL_STOP.search(text, end, line_end)
     sentence_end = following.end() if following else line_end
-    return text[max(line_start, min(sentence_start, start - NUMBER_WINDOW)):min(line_end, max(sentence_end, end + NUMBER_WINDOW))]
+    window = text[max(line_start, min(sentence_start, start - NUMBER_WINDOW)):min(line_end, max(sentence_end, end + NUMBER_WINDOW))]
+    return f"{window}\n{heading}" if (heading := _column_heading(text, line_start, line_end, start)) else window
+
+
+def _column_heading(text: str, line_start: int, line_end: int, start: int) -> str:
+    """The heading over the cell at `start`, when its line is a table row ("a | b | c") under a
+    heading row of as many cells: the first row of the table."""
+    row = text[line_start:line_end]
+    if "|" not in row:
+        return ""
+    heading = ""
+    for line in reversed(text[:line_start].split("\n")):
+        if not line.strip():
+            continue  # rows are often a blank line apart
+        if line.count("|") != row.count("|"):
+            break
+        heading = line
+    if not heading:
+        return ""
+    return heading.split("|")[text[line_start:start].count("|")].strip()
 
 
 # A bare number that is a measured value rather than a clause reference: "against threshold 17.8".
@@ -468,6 +518,103 @@ def _unbound_numbers(text: str, cited_text: str, subjects: list[str], skip: set[
     return unbound
 
 
+# --- figures an answer may state that its evidence does not ------------------------------
+#
+# Applying a rule to the reader's own case ("a Rs. 60 lakh loan at 0.40% pays Rs. 24,000") states
+# figures the policy never prints. They are accepted only when they can be checked: the reader's
+# own figure where the question puts it, and arithmetic on the reader's figures and the evidence's,
+# recomputed here. Arithmetic on the evidence's figures alone is not accepted (except a change of
+# unit): with enough figures in a passage, some sum would "explain" almost any invented number.
+_FAMILY = {"amount": "value", "quantity": "value", "number": "value", "percent": "percent"}
+_PER_YEAR = {"month": Decimal(12), "week": Decimal(52), "day": Decimal(365)}
+_GIVEN_BEFORE = re.compile(
+    r"(?:\bnot|\bno|rather than|instead of|\bfor|\bof|\bon|\bwith|\bif|\bwhen|\bat|\bas of|\bfrom|\buntil|"
+    r"\bsince|\bbefore|\bafter|\bthan|\bvs\.?|\bversus|\bbut|\bonly|\bjust)\s*(?:a|an|the|only|just)?\s*$", re.I)
+_GIVEN_AFTER = re.compile(
+    r"^\s*,?\s*(?:(?:is|are|was|were|would\s+be|falls?|lies)\s+)?(?:not\s+|well\s+|still\s+)?"
+    r"(?:below|above|under|over|less|more|lower|higher|greater|within|beyond|short\s+of|exceeds?|"
+    r"meets?|does\s+not|doesn't|isn't|qualif|requires?|needs?)", re.I)
+
+
+def _given_in_context(text: str, fact) -> bool:
+    return bool(_GIVEN_BEFORE.search(text[max(0, fact.start - 30):fact.start])
+                or _GIVEN_AFTER.match(text[fact.end:fact.end + 40]))
+
+
+# "28 to 65 years", "2-3%": the first figure of a range takes the unit written after the second.
+_RANGE_START = re.compile(r"(\d+(?:\.\d+)?)\s*(?:to|-|–|—)\s*$", re.I)
+
+
+def _range_starts(text: str, facts: list) -> set[tuple[str, str]]:
+    starts: set[tuple[str, str]] = set()
+    for fact in facts:
+        if fact.kind in ("duration", "percent") and (m := _RANGE_START.search(text[max(0, fact.start - 20):fact.start])):
+            unit = fact.value.partition(" ")[2] if fact.kind == "duration" else "%"
+            starts |= {f.key for f in extract_numeric_facts(f"{m.group(1)} {unit}".replace(" %", "%"))}
+    return starts
+
+
+def _magnitude(fact) -> tuple[str, Decimal, str] | None:
+    """(family, number, unit): "6000000" rupees, "0.4" percent, "35" year."""
+    try:
+        if fact.kind == "duration":
+            number, _, unit = fact.value.partition(" ")
+            return "duration", Decimal(number), unit
+        if fact.kind in _FAMILY:
+            return _FAMILY[fact.kind], Decimal(fact.value), ""
+    except InvalidOperation:
+        return None
+    return None
+
+
+def _close(a: Decimal, b: Decimal) -> bool:
+    return abs(a - b) <= max(Decimal("0.01"), abs(b) * Decimal("0.005"))
+
+
+def _in_years(number: Decimal, unit: str) -> Decimal | None:
+    if unit == "year":
+        return number
+    return number / _PER_YEAR[unit] if unit in _PER_YEAR else None
+
+
+def _derived(fact, evidence_facts: list, given: list) -> bool:
+    """The figure is arithmetic on the question's figures and the evidence's, or the evidence's figure
+    in another unit of time ("72 months" stated as "6 years")."""
+    target = _magnitude(fact)
+    if target is None:
+        return False
+    family, value, unit = target
+    stated = [m for f in evidence_facts if (m := _magnitude(f))]
+    asked = [m for f in given if (m := _magnitude(f))]
+    if family == "duration":
+        # The evidence's figure in another unit; never the question's own figure restated.
+        wanted = _in_years(value, unit)
+        if wanted is not None and any((y := _in_years(n, u)) is not None and _close(wanted, y)
+                                      for _f, n, u in stated if _f == "duration"):
+            return True
+    for index, (a_family, a, a_unit) in enumerate(asked):
+        others = [(m, True) for m in stated] + [(m, False) for m in asked[:index] + asked[index + 1:]]
+        for (b_family, b, b_unit), documented in others:
+            candidates = []
+            # A rate applies to an amount only when the documents state one of them: "80% of Rs. 1 crore"
+            # from a reader who misremembers 80% is their premise, not the policy's figure.
+            if a_family == "percent" and b_family == "value" and documented:
+                candidates.append(b * a / 100)
+            if b_family == "percent" and a_family == "value" and documented:
+                candidates.append(a * b / 100)
+            if a_family == b_family and a_unit == b_unit:
+                candidates += [a + b, abs(a - b)]
+            if a_family == "value" and b_family == "value":
+                candidates.append(a * b)
+                if b:
+                    candidates.append(a / b)
+                if a:
+                    candidates.append(b / a)
+            if candidates and family in ("value", "percent", "duration") and any(_close(value, c) for c in candidates):
+                return True
+    return False
+
+
 def validate_claims(
     raw_claims: list[dict], evidence: dict[str, EvidenceText], subjects: list[str] | None = None,
     question: str = "",
@@ -475,6 +622,8 @@ def validate_claims(
     """`subjects` are the question's key terms: what the claims must be about; `question` is
     read for the variants it pins down ("Tier 2")."""
     asked = qualifiers(question)
+    given = extract_numeric_facts(without_version_refs(question))  # the reader's own figures
+    given_values = {f.value for f in given}
     results = []
     for raw in raw_claims:
         text = _DANGLING_MARK.sub("", " ".join(_CITATION_MARKS.sub("", str(raw.get("text", ""))).split()))
@@ -507,20 +656,28 @@ def validate_claims(
             result.problems.append(f"refers to evidence id(s) {', '.join(talk)} instead of the document")
             results.append(result)
             continue
-        available = {f.key for f in extract_numeric_facts(cited_text)}
+        evidence_facts = extract_numeric_facts(cited_text)
+        available = {f.key for f in evidence_facts} | _range_starts(cited_text, evidence_facts)
         allowed = set().union(*(evidence[e].allowed_numbers for e in known))
         # A bare number may legitimately restate a figure the evidence expresses
         # in another unit or with a unit attached ("75" for "75%" or "75 lakh"),
         # so any kind of fact also matches on value alone.
         available_values = {value for _kind, value in available | allowed}
+        available_values |= {value.partition(" ")[0] for kind, value in available if kind == "duration"}  # "60-day"
         # "Version 2.0" names a version of the evidence; it is a reference, not a figure.
         versions = {normal_label(v) for e in evidence.values() for v in e.versions}
         references = [m.span(1) for m in _CLAIM_VERSION.finditer(text) if normal_label(m.group(1)) in versions]
-        for fact in extract_numeric_facts(text):
-            if any(start <= fact.start and fact.end <= end for start, end in references):
-                continue
+        facts = [f for f in extract_numeric_facts(text)
+                 if not any(start <= f.start and f.end <= end for start, end in references)]
+        stated = [f for f in facts if f.key in available or f.key in allowed or f.value in available_values]
+        derived = [f for f in facts if f not in stated and _derived(f, evidence_facts, given)]
+        for fact in facts:
             result.numbers_checked += 1
-            if fact.key in available or fact.key in allowed or fact.value in available_values:
+            if fact in stated or fact in derived:
+                continue
+            # The question's own figure, used as the question uses it ("for a Rs. 60 lakh loan", "Rs. 8
+            # lakh is below ...", "..., not 1%"), beside a figure the evidence supports.
+            if fact.value in given_values and (stated or derived) and _given_in_context(text, fact):
                 continue
             result.valid = False
             result.problems.append(f"'{fact.raw}' is not in the cited evidence")
@@ -528,7 +685,10 @@ def validate_claims(
         claim_words = _content_words(text)
         if claim_words:
             labels = " ".join(evidence[e].label for e in known)
-            support = len(claim_words & _content_words(f"{cited_text}\n{labels}")) / len(claim_words)
+            # Word forms count ("deposits" supports "deposit", "reported" supports "reporting"), as in
+            # every other term check: applying a rule restates it in other forms of its own words.
+            source = TermIndex(f"{cited_text}\n{labels}")
+            support = sum(1 for w in claim_words if source.mentions(w)) / len(claim_words)
             if support < MIN_SUPPORT:
                 result.valid = False
                 result.problems.append(f"weak support ({support:.0%} of terms found in evidence)")

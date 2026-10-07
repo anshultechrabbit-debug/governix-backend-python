@@ -82,9 +82,11 @@ def test_unavailable_model_keeps_the_question_and_blocks_only_follow_ups():
 class _Rewriter:
     def __init__(self, question, resolvable):
         self.content = {"standalone_question": question, "resolvable": resolvable}
+        self.calls: list[str] = []  # the user message of each call
 
-    def generate_json(self, *_args, **_kwargs):
+    def generate_json(self, _system, user, *_args, **_kwargs):
         from app.infrastructure.ai.llm.base import LLMResult
+        self.calls.append(user)
         return LLMResult(content=self.content, model="test")
 
 
@@ -153,3 +155,78 @@ def test_the_same_between_things_the_question_names_is_not_a_follow_up():
     assert not refers_to_earlier_turn("Do the two versions have the same policy owner?")
     assert not refers_to_earlier_turn("Is the LTV the same in v1 and v2?")
     assert refers_to_earlier_turn("What did the same policy say about prepayment?")
+
+
+# --- a long chat (evaluation of a 115-turn conversation) ---------------------------------
+
+def test_several_questions_in_one_message_are_never_collapsed_by_a_pronoun():
+    # Turn 74: "... Answer both without mixing them.\n... What does the Gold Loan Policy actually say?"
+    # was rewritten into the second question only. "them" points inside the message.
+    history = [ConversationTurn(question="Is gold purity verification required?", answer="Gold purity must be verified.")]
+    message = ("A customer asks about gold-loan LTV and mortgage LTV. Answer both without mixing them.\n"
+               "A customer has an existing personal loan and wants a gold loan. What does the Gold Loan Policy say?")
+    llm = _Rewriter("What does the Gold Loan Policy say about an existing personal loan?", True)
+    rewrite = standalone_question(llm, message, history)
+    assert rewrite.question == message and not llm.calls
+
+
+def test_the_rewrite_keeps_every_question():
+    from app.modules.rag.query_rewrite import SYSTEM_PROMPT
+
+    assert "Never drop, merge or replace one of them" in SYSTEM_PROMPT
+
+
+def test_which_questions_depend_on_the_conversation():
+    from app.modules.rag.query_rewrite import depends_on_history
+
+    assert depends_on_history("What is the limit?", HISTORY)                 # short: leans on the earlier turn
+    assert depends_on_history("What about mortgage?", HISTORY)
+    assert depends_on_history("Who approves it for salaried applicants?", HISTORY)
+    assert not depends_on_history("What is the limit?", [])                  # nothing to lean on
+    assert not depends_on_history("What is the maximum LTV for residential mortgages above Rs. 75 lakh?", HISTORY)
+
+
+def test_a_short_follow_up_that_found_nothing_is_restated_from_the_conversation():
+    from app.modules.rag.query_rewrite import restated_questions
+
+    llm = _Rewriter("", True)
+    llm.content = {"questions": ["What LTV is allowed for gold loans?"]}
+    history = [ConversationTurn(question="What is the gold-loan LTV?", answer="The maximum LTV for gold loans is 75%.")]
+    assert restated_questions(llm, "How much is allowed?", history) == ["What LTV is allowed for gold loans?"]
+    assert "What is the gold-loan LTV?" in llm.calls[-1]                     # the model saw the earlier turn
+    restated_questions(llm, "How much is allowed?")
+    assert "Earlier conversation" not in llm.calls[-1]                       # and none when none is given
+
+
+def test_an_oversized_earlier_turn_is_cut_not_refused():
+    from app.modules.rag.schema import AskRequest
+
+    request = AskRequest(question="What is the limit?", history=[{"question": "q" * 3000, "answer": "a" * 20000}])
+    assert (len(request.history[0].question), len(request.history[0].answer)) == (2000, 8000)
+
+
+@pytest.mark.parametrize("question, foreign", [
+    ("LTV kitna hai gold loan ka?", True),                     # Hinglish in Latin letters
+    ("¿Cuál es el LTV máximo para préstamos de oro?", True),
+    ("Quel est le taux maximum du prêt ?", True),
+    ("गोल्ड लोन का एलटीवी क्या है?", True),
+    ("What is the LTV for gold loans?", False),
+    ("wat is max tenur of home lon v3", False),                # informal English stays English
+    ("Hi", False),
+])
+def test_questions_not_in_english_are_recognised_in_any_script(question, foreign):
+    assert is_non_english(question) is foreign
+
+
+def test_the_rewrite_reports_the_readers_language():
+    llm = FakeLLM({"standalone_question": "What is the maximum LTV for gold loans?", "resolvable": True,
+                   "language": "Spanish"})
+    rewrite = standalone_question(llm, "¿Cuál es el LTV máximo para préstamos de oro?", [])
+    assert rewrite.reason == "translation" and rewrite.language == "Spanish"
+
+
+def test_a_translation_may_reword_but_never_refigure():
+    from app.modules.rag.service import _same_figures
+
+    assert _same_figures("The fee of 2% is Rs. 10,000.", "La comisión del 2% es de Rs. 10,000.")
+    assert not _same_figures("The fee of 2% is Rs. 10,000.", "La comisión del 3% es de Rs. 10,000.")

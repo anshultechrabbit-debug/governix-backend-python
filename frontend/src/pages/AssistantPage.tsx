@@ -191,6 +191,8 @@ export function AssistantPage() {
 
 function Turn({ turn }: { turn: Turn }) {
   const answer = turn.answer;
+  const dispatch = useAppDispatch();
+  const askAgain = () => dispatch(ask({ id: newId(), question: turn.question, options: turn.options }));
   return (
     <div id={`turn-${turn.id}`} className="scroll-mt-4 space-y-3">
       <div className="ml-auto w-fit max-w-[80%] whitespace-pre-wrap break-words rounded-lg bg-brand-600 px-4 py-3 text-sm text-white">{turn.question}</div>
@@ -198,7 +200,7 @@ function Turn({ turn }: { turn: Turn }) {
       {turn.status === "error" && <ErrorState error={new Error(turn.error)} />}
       {turn.status === "done" && answer && (
         <Card className="overflow-hidden">
-          {answer.status === "no_answer" ? <NoAnswer reason={answer.no_answer} /> : <Answered answer={answer} />}
+          {answer.status === "no_answer" ? <NoAnswer reason={answer.no_answer} onRetry={askAgain} /> : <Answered answer={answer} />}
         </Card>
       )}
     </div>
@@ -384,9 +386,30 @@ const SHORT_CLAIMS = 2;
 
 /** Replies to a greeting or a question with no subject: not a failed search, a prompt to ask. */
 const CONVERSATIONAL = ["GREETING", "NO_SUBJECT"];
+/** The answer ran out of time or the AI service did not respond: nothing was decided about the documents. */
+const TEMPORARY = ["DEADLINE_EXCEEDED", "LLM_UNAVAILABLE"];
+/** The question needs one more detail before it can be searched. */
+const NEEDS_DETAIL = ["NEEDS_CONTEXT", "VERSION_NOT_FOUND", "COMPARISON_TARGET_UNCLEAR"];
 
-function NoAnswer({ reason }: { reason: Answer["no_answer"] }) {
+function NoAnswer({ reason, onRetry }: { reason: Answer["no_answer"]; onRetry: () => void }) {
   if (!reason) return null;
+  if (TEMPORARY.includes(reason.reason)) {
+    return (
+      <div className="p-5">
+        <p className="font-medium text-ink">{reason.reason === "DEADLINE_EXCEEDED" ? "This took too long to answer" : "The AI service didn’t respond"}</p>
+        <p className="mt-1 text-sm text-ink-soft">{reason.message}</p>
+        <Button className="mt-3" size="sm" variant="secondary" onClick={onRetry}>Ask again</Button>
+      </div>
+    );
+  }
+  if (NEEDS_DETAIL.includes(reason.reason)) {
+    return (
+      <div className="p-5">
+        <p className="font-medium text-ink">I need a little more detail</p>
+        <p className="mt-1 text-sm text-ink-soft">{reason.message}</p>
+      </div>
+    );
+  }
   if (CONVERSATIONAL.includes(reason.reason)) {
     return (
       <div className="p-5">

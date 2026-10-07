@@ -10,6 +10,15 @@ _STOP = frozenset(
     "a an and are as at be by can do does for from has have how i in is it of on or shall should "
     "that the their this to was what when where which who will with".split()
 )
+# A sentence that states something: a figure or a verb that asserts. Not a heading ("Pricing and Fee
+# Schedule") and not a table row, which means nothing quoted without its column headings.
+_STATES = re.compile(r"\d|\b(?:shall|must|is|are|was|were|may|will|should|can|applies|apply|requires?|need|needs)\b", re.I)
+MIN_QUOTED_WORDS = 4
+
+
+def _quotable(sentence: str) -> bool:
+    return (sentence.count("|") < 2 and len(sentence.split()) >= MIN_QUOTED_WORDS
+            and bool(_STATES.search(sentence)))
 
 
 class LocalLLM(LLMProvider):
@@ -37,7 +46,7 @@ class LocalLLM(LLMProvider):
             for position, sentence in enumerate(split_sentences(item["text"])):
                 words = set(_WORD.findall(sentence.lower()))
                 overlap = len(terms & words)
-                if overlap:
+                if overlap and _quotable(sentence):
                     scored.append((overlap, -order, -position, sentence.strip(), item["id"]))
         scored.sort(reverse=True)
         claims, seen = [], set()

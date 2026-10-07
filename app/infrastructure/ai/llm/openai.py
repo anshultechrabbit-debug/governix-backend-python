@@ -6,13 +6,13 @@ from typing import Any
 
 from app.infrastructure.ai import usage as usage_log
 from app.infrastructure.ai.credit import CreditPause, transient
-from app.infrastructure.ai.llm.base import LLMProvider, LLMResult, LLMUnavailableError
+from app.infrastructure.ai.llm.base import CALL_ENDS_AT, LLMProvider, LLMResult, LLMUnavailableError
 
 logger = logging.getLogger(__name__)
 
 TRUNCATION_RETRIES = 1  # default when the caller does not pass one
 # Only reasoning models accept `reasoning_effort`; sending it to others is a 400.
-_REASONING_MODEL = re.compile(r"^(?:gpt-5|o\d)", re.I)
+_REASONING_MODEL = re.compile(r"^(?:gpt-5|o\d|gemini-(?:2\.5|[3-9]))", re.I)  # Gemini 2.5+ think too
 
 
 # A rate limit or a dropped connection passes within seconds; the client's own retries are
@@ -34,6 +34,19 @@ def _wait_for(exc: Exception, attempt: int) -> float | None:
     return min(wait, MAX_WAIT_SECONDS)
 
 
+def _json_object(raw: str) -> dict[str, Any] | None:
+    """The JSON object in a reply, also inside code fences or after a sentence of prose."""
+    text = raw.strip()
+    for candidate in (text, re.sub(r"^```(?:json)?\s*|\s*```$", "", text), text[text.find("{"):text.rfind("}") + 1]):
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
 class OpenAILLM(LLMProvider):
     """Structured-JSON generation against the OpenAI chat completions API.
 
@@ -53,14 +66,21 @@ class OpenAILLM(LLMProvider):
         reasoning_effort: str | None = None,
         base_url: str | None = None,
         truncation_retries: int = 1,
+        provider: str = "openai",
+        schema_in_prompt: bool = False,
     ) -> None:
         if not api_key:
             raise LLMUnavailableError("OPENAI_API_KEY is not configured.")
         from openai import OpenAI
 
-        self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=3)
+        self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=self.MAX_RETRIES)
+        self.timeout = timeout
         self.model = model
-        self.model_id = f"openai:{model}"
+        self.provider = provider
+        self.model_id = f"{provider}:{model}"
+        # A server that ignores structured-output schemas: the schema goes into the prompt, the JSON is
+        # read out of the reply, and an empty or unreadable reply is asked for again.
+        self.schema_in_prompt = schema_in_prompt
         self.max_output_tokens = max_output_tokens
         self.truncation_retries = truncation_retries
         self.reasoning_effort = reasoning_effort
@@ -71,7 +91,12 @@ class OpenAILLM(LLMProvider):
         from app.infrastructure.ai.llm.local import LocalLLM
         return LocalLLM().generate_json(system, user, schema, context=context)
 
+    def _limit(self, budget: int) -> dict[str, Any]:
+        """The output cap: OpenAI's own name for it, or the older one other servers implement."""
+        return {"max_completion_tokens": budget} if self.provider == "openai" else {"max_tokens": budget}
+
     def _options(self) -> dict[str, Any]:
+        # The model decides, whichever gateway serves it ("gpt-5.4-mini" through OpenCode too).
         if _REASONING_MODEL.match(self.model):
             return {"reasoning_effort": self.reasoning_effort} if self.reasoning_effort else {}
         # Grounded answers want the most likely wording, the same on every run.
@@ -79,7 +104,64 @@ class OpenAILLM(LLMProvider):
         return {"temperature": 0}
 
     def generate_json(self, system: str, user: str, schema: dict[str, Any], *, context=None) -> LLMResult:
+        if self.schema_in_prompt:
+            return self._complete_prompted(system, user, schema, context=context)
         return self._complete(system, user, schema, budget=self.max_output_tokens, retries=self.truncation_retries, context=context)
+
+    PROMPTED_ATTEMPTS = 2
+    MAX_RETRIES = 3
+    # The least time a call is given, even when the request's limit has (nearly) passed.
+    MIN_CALL_SECONDS = 2.0
+
+    def _completions(self):
+        """The completions API, with a timeout and retries that end by CALL_ENDS_AT when it is set.
+
+        Each try gets the full timeout; with the client's retries, one slow model would otherwise
+        keep a reader waiting (1 + retries) times as long as the timeout says."""
+        ends_at = CALL_ENDS_AT.get()
+        if ends_at is None:
+            return self._client.chat.completions
+        left = max(ends_at - time.perf_counter(), self.MIN_CALL_SECONDS)
+        per_try = min(self.timeout, left)
+        retries = max(0, min(self.MAX_RETRIES, int(left // per_try) - 1))
+        return self._client.with_options(timeout=per_try, max_retries=retries).chat.completions
+
+    def _complete_prompted(self, system: str, user: str, schema: dict[str, Any], *, context=None) -> LLMResult:
+        """Structured output from a model that does not enforce a schema."""
+        from openai import OpenAIError
+
+        if self._credit.active:
+            return self._local(system, user, schema, context)
+        system = (f"{system}\n\nOutput format: reply with ONE JSON object and nothing else (no prose, no code "
+                  f"fences), matching this JSON Schema:\n{json.dumps(schema)}")
+        started = time.perf_counter()
+        raw, response = "", None
+        for _attempt in range(self.PROMPTED_ATTEMPTS):
+            try:
+                response = self._completions().create(
+                    model=self.model,
+                    messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                    response_format={"type": "json_object"}, **self._limit(self.max_output_tokens), **self._options(),
+                )
+            except OpenAIError as exc:
+                usage_log.record("answers", self.model, error=usage_log.error_code(exc))
+                logger.warning("%s LLM request failed (%s: %s). Falling back to LocalLLM.", self.provider, type(exc).__name__, exc)
+                self._credit.failed(exc)
+                return self._local(system, user, schema, context)
+            raw = response.choices[0].message.content or ""
+            if (content := _json_object(raw)) is not None:
+                usage = response.usage
+                usage_log.record("answers", response.model or self.model, input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+                                 output_tokens=getattr(usage, "completion_tokens", 0) or 0)
+                return LLMResult(
+                    content=content, model=response.model or self.model,
+                    input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+                    output_tokens=getattr(usage, "completion_tokens", 0) or 0,
+                    latency_ms=round((time.perf_counter() - started) * 1000, 1), raw=raw,
+                    metadata={"finish_reason": response.choices[0].finish_reason, "schema_in_prompt": True},
+                )
+            logger.warning("%s returned no JSON object (%d chars); asking again", self.model, len(raw))
+        raise LLMUnavailableError(f"{self.model} returned no usable JSON")
 
     def _complete(self, system: str, user: str, schema: dict[str, Any], *, budget: int, retries: int, context=None) -> LLMResult:
         from openai import OpenAIError
@@ -97,14 +179,14 @@ class OpenAILLM(LLMProvider):
             waited = 0
             while True:
                 try:
-                    response = self._client.chat.completions.create(
+                    response = self._completions().create(
                         model=self.model,
                         messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
                         response_format={
                             "type": "json_schema",
                             "json_schema": {"name": "grounded_answer", "schema": schema, "strict": True},
                         },
-                        max_completion_tokens=budget,
+                        **self._limit(budget),
                         **options,
                     )
                     break
@@ -115,7 +197,7 @@ class OpenAILLM(LLMProvider):
                         time.sleep(wait)
                         waited += 1
                         continue
-                    logger.warning("OpenAI LLM request failed (%s: %s). Falling back to LocalLLM.", type(exc).__name__, exc)
+                    logger.warning("%s LLM request failed (%s: %s). Falling back to LocalLLM.", self.provider, type(exc).__name__, exc)
                     self._credit.failed(exc)
                     return self._local(system, user, schema, context)
             choice = response.choices[0]
@@ -148,20 +230,31 @@ class OpenAILLM(LLMProvider):
         )
 
     def _open_stream(self, system: str, user: str, schema: dict[str, Any], options: dict[str, Any]):
-        return self._client.chat.completions.create(
+        return self._completions().create(
             model=self.model,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             response_format={
                 "type": "json_schema",
                 "json_schema": {"name": "grounded_answer", "schema": schema, "strict": True},
             },
-            max_completion_tokens=self.max_output_tokens,
+            **self._limit(self.max_output_tokens),
             stream=True,
             stream_options={"include_usage": True},
             **options,
         )
 
     def stream_json(self, system: str, user: str, schema: dict[str, Any], *, context=None):
+        """Stream the structured output: text deltas as they arrive, then the LLMResult.
+
+        A model without schema enforcement is asked once, whole: its JSON can only be trusted complete."""
+        if self.schema_in_prompt:
+            result = self._complete_prompted(system, user, schema, context=context)
+            yield result.raw or json.dumps(result.content)
+            yield result
+            return
+        yield from self._stream_json(system, user, schema, context=context)
+
+    def _stream_json(self, system: str, user: str, schema: dict[str, Any], *, context=None):
         """Stream the structured output: text deltas as they arrive, then the LLMResult.
 
         A long answer (a list of twenty clauses) takes as long to generate either
