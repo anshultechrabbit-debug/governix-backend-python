@@ -46,8 +46,10 @@ from app.modules.citations.numerics import extract_numeric_facts
 from app.modules.documents.model import Document, DocumentStatus
 from app.modules.policies.model import Policy, PolicyStatus, PolicyVersion, VersionStatus
 from app.modules.rag.claim_stream import ClaimStream
+from app.modules.rag.calculate import Calculation, checked_calculations, near
 from app.modules.rag.evidence import (
-    EvidenceItem, EvidenceSet, build_evidence, coverage_of, is_document_question, key_terms,
+    EvidenceItem, EvidenceSet, applies_to_reader, build_evidence, coverage_of, is_document_question, key_terms,
+    situation_figures, situation_terms,
 )
 from app.infrastructure.ai.llm.local import LocalLLM
 from app.modules.rag.prompts import (
@@ -113,7 +115,14 @@ HISTORY_KEY_CHARS = 300
 #   v38    the reader's figures and checked arithmetic allowed; each compared document/version searched
 #          on its own; answers in the reader's language
 #   v40    a timeout or model failure is reported as such, never as "not found"
-ANSWER_CACHE_VERSION = "v40"
+#   v44    the reader's own case ("if my score is 680", "I am a ...") and advice wording leave the term
+#          checks; conditional, process and advice questions answered from what the documents state
+#   v45    "when did X start / change?" read every version, oldest first, and name the earliest stating it
+#   v46    "which period had the lowest X?" read every version; each version searched on its own
+#   v47    every figure of the reader's case checked (warning, no verdict, when one is not); the outcome
+#          for the reader may negate a rule; the earlier version's wording of each rule applied
+#   v48    arithmetic ("total interest on Rs 1 crore over 15 years") recomputed (rag/calculate.py) and shown
+ANSWER_CACHE_VERSION = "v48"
 # No supported answer in the version in force: worth looking one version back.
 # Earlier versions answer only what the version in force does not cover. An answer it gave that the
 # checks then withheld (ANSWER_FAILED_VALIDATION, ANSWER_OFF_TOPIC) means it covers the subject:
@@ -815,6 +824,7 @@ class RAGService:
         names: list[str] = []  # the policies cited so far
         passages: list[str] = []  # and their passages
         on_topic = evidence.comparison is not None or is_document_question(request.question)
+        close = self._close_in_meaning(evidence.items)  # as the final check (_validated_answer) decides
         for part in self._generate_stream(principal, request, plan, evidence):
             if isinstance(part, LLMResult):
                 attempt.llm_result = part
@@ -830,7 +840,8 @@ class RAGService:
                     source.get("policy_name") if named else None, source.get("document_title") if named else None,
                 ])))
                 passages.append(source.get("excerpt") or "")
-            if not on_topic and self._off_topic(principal, request.question, [c["text"] for c in held] + names, passages) is not None:
+            if not on_topic and self._off_topic(principal, request.question, [c["text"] for c in held] + names, passages,
+                                                close=close) is not None:
                 continue
             on_topic = True
             timings.setdefault("first_claim", round((time.perf_counter() - started) * 1000, 1))
@@ -1136,7 +1147,8 @@ class RAGService:
 
     # --- gate, generation, validation ------------------------------------------------
 
-    def _sides(self, principal: Principal, plan: QueryPlan, filters: SearchFilters, question: str) -> list[SearchFilters]:
+    def _sides(self, principal: Principal, plan: QueryPlan, filters: SearchFilters, question: str,
+               candidates: list[Candidate] | None = None) -> list[SearchFilters]:
         """The documents or versions a question sets side by side, each as its own search scope.
 
         "Compare the gold loan and mortgage LTV": each policy it names. "... in all three versions",
@@ -1153,6 +1165,13 @@ class RAGService:
             versions = filters.version_scope.version_ids  # earlier versions searched together (fallback)
         elif plan.query_class is QueryClass.ACROSS_VERSIONS and len(named) == 1:
             versions = [v.id for v, _ in self._searchable_versions(principal, named)]
+        elif plan.query_class is QueryClass.ACROSS_VERSIONS and (policy := (
+                filters.policy_ids[0] if len(filters.policy_ids) == 1
+                else next((c.policy_id for c in candidates or [] if c.policy_id), None))):
+            # "When did Flexi-EMI start?", "Which period had the lowest EMI?": every version of the policy
+            # chosen, or of the one whose passage matched best, so that each version's own passage is read
+            # even when other versions' passages outrank it.
+            versions = [v.id for v, _ in self._searchable_versions(principal, [policy])]
         else:
             return []
         if not 2 <= len(versions) <= MAX_SIDES:
@@ -1162,7 +1181,7 @@ class RAGService:
     def _each_side(self, principal, plan, filters, question, candidates: list[Candidate], timings, prefix) -> list[Candidate]:
         """Search each side on its own; return the best passage of each (it must be in the evidence),
         and add each side's leading passages to the candidates."""
-        sides = self._sides(principal, plan, filters, question)
+        sides = self._sides(principal, plan, filters, question, candidates)
         if not sides:
             return []
         step = time.perf_counter()
@@ -1210,14 +1229,16 @@ class RAGService:
         codes = requested_codes(question)
         if codes and any(names_code(item.candidate.text, c) for item in evidence.items for c in codes):
             return
-        if (subject := self._subject(question)) != question:
+        subject = self._subject(question)
+        ignore = self._circumstances(principal, subject)
+        if subject != question or ignore:
             evidence.coverage, evidence.missing_terms = coverage_of(
-                subject, [i.full_text + " " + i.source.section_path for i in evidence.items])
+                subject, [i.full_text + " " + i.source.section_path for i in evidence.items], ignore)
         if self._close_in_meaning(evidence.items):
             return  # worded differently, but a passage means what was asked: the model judges it
         if evidence.coverage < self.settings.RAG_MIN_TERM_COVERAGE:
             raise _NoAnswer("KEY_TERMS_NOT_FOUND", evidence.missing_terms)
-        salient, missing = self._salient_coverage(principal, question, evidence)
+        salient, missing = self._salient_coverage(principal, question, evidence, ignore)
         if salient < self.settings.RAG_MIN_SALIENT_COVERAGE:
             raise _NoAnswer("KEY_TERMS_NOT_FOUND", missing)
 
@@ -1226,7 +1247,17 @@ class RAGService:
         threshold = self.settings.RAG_SEMANTIC_MIN_SIMILARITY
         return threshold is not None and any(i.candidate.scores.get("vector", 0.0) >= threshold for i in items)
 
-    def _salient_coverage(self, principal: Principal, question: str, evidence: EvidenceSet) -> tuple[float, list[str]]:
+    def _circumstances(self, principal: Principal, question: str) -> set[str]:
+        """Words that only describe the reader's own case and that no document the caller can see uses
+        ("I am a software engineer, ...", "if my CIBIL is 640, ..."): what a rule is applied to, not what
+        it is about, so neither the evidence nor the answer can be expected to contain them. Words the
+        documents do use stay subjects ("as a doctor", "if I take a gold loan"), and the claims are still
+        checked against all of them."""
+        terms = situation_terms(question)
+        return self.retriever.unseen_terms(principal, sorted(terms)) if terms else set()
+
+    def _salient_coverage(self, principal: Principal, question: str, evidence: EvidenceSet,
+                          ignore: set[str] | frozenset[str] = frozenset()) -> tuple[float, list[str]]:
         """Share of the question's distinguishing weight (IDF) that the evidence covers.
 
         Plain coverage counts every term alike, so "prepayment charges on home
@@ -1237,18 +1268,21 @@ class RAGService:
         """
         if not evidence.missing_terms:
             return 1.0, []
-        weights = self.retriever.visible_term_weights(principal, key_terms(self._subject(question)))
+        weights = self.retriever.visible_term_weights(
+            principal, [t for t in key_terms(self._subject(question)) if t not in ignore])
         total = sum(weights.values())
         if total <= 0:
             return 1.0, []
         missing = [t for t in weights if t in set(evidence.missing_terms)]
         return 1 - sum(weights[t] for t in missing) / total, missing
 
-    def _check_on_topic(self, principal: Principal, question: str, said: list[str], cited: list[str]) -> None:
-        if (missing := self._off_topic(principal, question, said, cited)) is not None:
+    def _check_on_topic(self, principal: Principal, question: str, said: list[str], cited: list[str], *,
+                        close: bool = False) -> None:
+        if (missing := self._off_topic(principal, question, said, cited, close=close)) is not None:
             raise _NoAnswer("ANSWER_OFF_TOPIC", missing)
 
-    def _off_topic(self, principal: Principal, question: str, said: list[str], cited: list[str]) -> list[str] | None:
+    def _off_topic(self, principal: Principal, question: str, said: list[str], cited: list[str], *,
+                   close: bool = False) -> list[str] | None:
         """The question's terms the answer leaves out, when too much is left out; None when on topic.
 
         `said` is the answer's sentences and the names of the policies they cite; `cited` is
@@ -1273,11 +1307,20 @@ class RAGService:
             return None
         everything = TermIndex(" ".join(said + cited))
         subject = self._subject(question)
-        absent = [name for name in named_entities(subject) if not everything.mentions(name)]
+        # The reader's own case ("I live in Pune", "as a software engineer") is what the rule is applied
+        # to; the documents never mention it, so neither can an answer drawn from them.
+        ignore = self._circumstances(principal, subject)
+        absent = [name for name in named_entities(subject) if name not in ignore and not everything.mentions(name)]
         if absent:
             return absent
         # A date in the question chose the version; the answer need not repeat it.
-        terms = [t for t in key_terms(subject) if not t.isdigit() and t not in _MONTHS]
+        terms = [t for t in key_terms(subject) if not t.isdigit() and t not in _MONTHS and t not in ignore]
+        if close:
+            # A passage close in meaning answered it: words no document uses ("CIBIL", "turnaround") cannot
+            # be in any answer drawn from the documents (a claim that repeated one would fail its check).
+            # The words the documents do use still decide whether the answer is about what was asked.
+            unseen = self.retriever.unseen_terms(principal, terms)
+            terms = [t for t in terms if t not in unseen]
         weights = self.retriever.visible_term_weights(principal, terms)
         total = sum(weights.values())
         if total <= 0:
@@ -1316,6 +1359,7 @@ class RAGService:
         texts = _evidence_texts(evidence)
         claims = ClaimStream()
         numbering: dict[str, int] = {}
+        calculations: list[Calculation] | None = None  # written before the claims; read once they begin
         try:
             llm: LLMProvider = self._llm_factory()
             context_items = [{"id": i.id, "text": i.full_text} for i in evidence.items]
@@ -1331,7 +1375,10 @@ class RAGService:
                 for raw in claims.feed(part):
                     if claims.declared_insufficient:
                         continue  # the answer will be a no-answer: show nothing
-                    if (claim := self._streamed_claim(principal, request, plan, evidence, raw, texts, items, numbering)):
+                    if calculations is None:
+                        calculations = checked_calculations(claims.preamble().get("calculations"), texts, question)
+                    if (claim := self._streamed_claim(principal, request, plan, evidence, raw, texts, items, numbering,
+                                                      calculations)):
                         yield claim
         except LLMUnavailableError as exc:
             logger.error("LLM unavailable: %s", exc)
@@ -1402,9 +1449,11 @@ class RAGService:
                 kept.append(sentence_id)
         return kept
 
-    def _streamed_claim(self, principal, request, plan, evidence, raw, texts, items, numbering) -> dict | None:
+    def _streamed_claim(self, principal, request, plan, evidence, raw, texts, items, numbering,
+                        calculations: list[Calculation] | None = None) -> dict | None:
         """One claim checked exactly as the final answer checks it, or None if it fails."""
-        results = validate_claims([raw], texts, key_terms(self._subject(request.question)), request.question)
+        results = validate_claims([raw], texts, key_terms(self._subject(request.question)), request.question,
+                                  calculations)
         if not results:
             return None
         _drop_metadata_echo(results, request.question, plan)
@@ -1481,8 +1530,10 @@ class RAGService:
             # The model read the evidence and found no answer in it. Claims it wrote anyway are about
             # something nearby (the home loan LTV for a gold loan question): true, but not an answer.
             raise _NoAnswer("INSUFFICIENT_EVIDENCE")
+        # "How much total interest on Rs 1 crore over 15 years?": arithmetic the model wrote, recomputed.
+        calculations = checked_calculations(content.get("calculations"), texts, request.question)
         results = validate_claims(content.get("claims", []), texts, key_terms(self._subject(request.question)),
-                                  request.question)
+                                  request.question, calculations)
         _drop_metadata_echo(results, request.question, plan)
         # What the checks removed is for the audit trail and debugging, not the reader:
         # the answer they see is already only what passed.
@@ -1509,7 +1560,8 @@ class RAGService:
         if evidence.comparison is None and not is_document_question(request.question) and not verified:
             named = [" ".join(filter(None, [items[e].source.policy_name, items[e].source.document_title]))
                      for e in cited if e in items and items[e].source.version_id not in evidence.unrelated]
-            self._check_on_topic(principal, request.question, [r.text for r in valid] + named, [texts[e].text for e in cited])
+            self._check_on_topic(principal, request.question, [r.text for r in valid] + named, [texts[e].text for e in cited],
+                                 close=self._close_in_meaning(evidence.items))
 
         if plan.query_class in (QueryClass.CURRENT, QueryClass.HISTORICAL) and evidence.comparison is None:
             # Several versions read together (the earlier-version fallback): the newest one that states
@@ -1524,6 +1576,11 @@ class RAGService:
         if computed := _magnitude_comparison(request.question, valid, items, numbering):
             claims.append(computed)
             checks.append("Computed the difference from the two cited figures")
+        for calculation in _calculations_used(calculations, claims, numbering):
+            # The arithmetic behind a figure no document prints, shown so the reader can check it.
+            claims.append(Claim(text=f"Calculation: {calculation.shown}.",
+                                citations=[numbering[e] for e in calculation.evidence_ids if e in numbering]))
+            checks.append(f"Recomputed {calculation.shown}")
         if self.settings.RAG_ANSWER_MODE == "select":
             # What a writing model would have said around the quoted rules.
             if premise := premise_claim(request.question, claims):
@@ -1557,6 +1614,12 @@ class RAGService:
         answer = " ".join(f"{c.text} [{', '.join(map(str, c.citations))}]" for c in claims)
         summary = self._summary(request.question, content.get("summary"), valid, texts, claims,
                                 subject=self._subject(request.question))
+        if unchecked := _unchecked_figures(request.question, claims):
+            # "I am 27, earn Rs 65,000 and have a 760 score": an answer that checks the income and the score
+            # but not the age reads as a "yes" it is not. Say so, and give no overall verdict.
+            warnings.append(f"This answer does not check {' or '.join(unchecked)} from your question, so it may "
+                            "be incomplete. Ask about it on its own before relying on the answer.")
+            summary = None
         warnings += self._version_warnings(request.question, plan, sources, evidence)
         if llm_result and llm_result.model == LocalLLM.model_id and self.settings.LLM_PROVIDER != "local":
             warnings.insert(0, "The AI service was unavailable, so this answer quotes the documents directly.")
@@ -1701,6 +1764,11 @@ class RAGService:
         seen: set[str] = set()
         today = datetime.now(UTC).date()
         terms = [t for t in key_terms(self._subject(question)) if not t.isdigit()]
+        # "I am 27, ... Can I get a loan?": the rules applied to the reader's case are matched by their own
+        # wording (the question's words name the reader, not the rule), the ones the reader fails first.
+        by_wording = applies_to_reader(question)
+        if by_wording:
+            valid = sorted(valid, key=lambda r: not _FAILS.search(r.text))
         for result in valid:
             if len(notes) >= self.MAX_VERSION_NOTES:
                 break
@@ -1716,7 +1784,8 @@ class RAGService:
             previous = self._previous_version(principal, item.source)
             if previous is None:
                 continue
-            found = self._rule_in_version(principal, previous, clause, item.source.page_start, current, terms)
+            found = self._rule_in_version(principal, previous, clause, item.source.page_start, current, terms,
+                                          by_wording=by_wording)
             if found is None:
                 continue
             rule, candidate = found
@@ -1761,9 +1830,13 @@ class RAGService:
         ).first()
 
     def _rule_in_version(self, principal, version: PolicyVersion, clause: str | None, page: int, current: str,
-                         terms: list[str]) -> tuple[str, Candidate] | None:
+                         terms: list[str], *, by_wording: bool = False) -> tuple[str, Candidate] | None:
         """The rule in `version` that corresponds to `current`: same clause number, or (unnumbered)
-        on the same page and naming every term of the question."""
+        on the same page and naming every term of the question; with `by_wording`, the rule on the
+        same page worded most like `current` ("Applicant age: 25 to 65 years" for "Applicant age: 28 to
+        65 years")."""
+        if by_wording and not clause:
+            return self._rule_worded_like(principal, version, page, current)
         query = select(Chunk).where(
             Chunk.version_id == version.id,
             visible_clause(principal, Chunk.organization_id, Chunk.branch_id, Chunk.department_id, Chunk.policy_id),
@@ -1789,6 +1862,28 @@ class RAGService:
                     page_start=chunk.page_start, page_end=chunk.page_end,
                 )
         return None
+
+    def _rule_worded_like(self, principal, version: PolicyVersion, page: int, current: str) -> tuple[str, Candidate] | None:
+        """The rule on `page` of `version` worded most like `current`, if it shares most of its words."""
+        query = select(Chunk).where(
+            Chunk.version_id == version.id, Chunk.page_start <= page, Chunk.page_end >= page,
+            visible_clause(principal, Chunk.organization_id, Chunk.branch_id, Chunk.department_id, Chunk.policy_id),
+        )
+        best: tuple[float, str, Chunk] | None = None
+        for chunk in self.session.scalars(query.order_by(Chunk.chunk_index).limit(8)):
+            for rule in _RULE_BREAK.split(chunk.text):
+                rule = " ".join(rule.split())
+                if rule and (score := _overlap(rule, current)) >= SAME_RULE_OVERLAP and (best is None or score > best[0]):
+                    best = (score, rule, chunk)
+        if best is None:
+            return None
+        _, rule, chunk = best
+        return rule, Candidate(
+            chunk_id=chunk.id, document_id=chunk.document_id, policy_id=chunk.policy_id,
+            version_id=chunk.version_id, section_id=chunk.section_id, chunk_index=chunk.chunk_index,
+            text=chunk.text, section_path=chunk.section_path, section_number=chunk.section_number,
+            page_start=chunk.page_start, page_end=chunk.page_end,
+        )
 
     def _summary(self, question: str, text, valid: list, texts: dict[str, EvidenceText], claims: list[Claim],
                  subject: str | None = None) -> str | None:
@@ -1909,6 +2004,8 @@ class RAGService:
         return bool(
             key_terms(question) or is_document_question(question) or acronym_in_question(question)
             or plan.query_class is not QueryClass.CURRENT or plan.version_ids
+            # "I am 25 years old, can I apply?": the reader's own figures are what to look up.
+            or situation_figures(question)
         )
 
     # --- audit ---------------------------------------------------------------------
@@ -2002,6 +2099,35 @@ def _names_clause(text: str, clause: str) -> bool:
 _CLAIM_WORD = re.compile(r"[a-z][a-z0-9]{2,}")
 
 
+def _calculations_used(calculations: list[Calculation], claims: list[Claim], numbering: dict[str, int]) -> list[Calculation]:
+    """The calculations whose result a claim states, citing evidence the answer cites."""
+    stated = [n for c in claims for f in extract_numeric_facts(c.text) if f.kind != "date"
+              if (n := _decimal(f.value.partition(" ")[0])) is not None]
+    used = [c for c in calculations
+            if any(e in numbering for e in c.evidence_ids) and any(near(n, c.result) for n in stated)]
+    return list({c.shown: c for c in used}.values())
+
+
+def _decimal(text: str) -> Decimal | None:
+    try:
+        return Decimal(text)
+    except InvalidOperation:
+        return None
+
+
+def _unchecked_figures(question: str, claims: list[Claim]) -> list[str]:
+    """The figures the reader gives about their own case that no claim checks, when claims check others
+    ("27" of "I am 27, earn Rs 65,000 and have a 760 score" when only the income and score are checked).
+    Empty when none is checked: then the answer states the rule rather than applying it."""
+    def number(fact) -> str:
+        return fact.value.partition(" ")[0]  # "27 year" is the reader's "27"
+
+    said = {number(f) for c in claims for f in extract_numeric_facts(c.text)}
+    figures = situation_figures(question)
+    unchecked = [f.raw for f in figures if number(f) not in said]
+    return unchecked if len(unchecked) < len(figures) else []
+
+
 def _claim_words(text: str) -> set[str]:
     return {w for w in _CLAIM_WORD.findall(without_version_refs(text).lower()) if w not in _RESTATEMENT_FILLER}
 
@@ -2088,6 +2214,12 @@ _RULE_BREAK = re.compile(r"\n+|(?<=[.;])\s+(?=\d{1,3}(?:\.\d{1,3}){1,3}\s)")
 # make "the" value a guess.
 AMBIGUOUS_RULES = 3
 MAX_CHOICES = 6
+# An earlier version's rule is the same rule as one in force when it shares this share of its words
+# ("Applicant age: 25 to 65 years" / "Applicant age: 28 to 65 years"); a neighbouring rule on the same page
+# shares far fewer ("Net monthly income of at least ..." / "Total EMIs must not exceed 50% of net income").
+SAME_RULE_OVERLAP = 0.7
+# A claim that the reader's case fails a rule ("At 27, you are below the minimum age of 28").
+_FAILS = re.compile(r"\b(?:not|no|cannot|below|under|less\s+than|short\s+of|fails?|exceeds?|too)\b|n[’']t\b", re.I)
 
 
 def _rules_matching(evidence: EvidenceSet, question: str) -> dict[tuple, dict[str, tuple]]:
@@ -2114,7 +2246,9 @@ def _refuse_if_ambiguous(evidence: EvidenceSet, question: str) -> None:
     question as asked with different figures ("the retention period for the approval note" when
     the policy sets 7, 10, 12 and 14 years in different chapters)."""
     if (requested_clauses(question) or requested_codes(question) or _WANTS_ALL.search(question)
-            or is_document_question(question)):
+            or is_document_question(question)
+            # "If my score is 680, what rate applies?": the reader's case picks the row or band.
+            or applies_to_reader(question)):
         return
     for (policy, version), rules in _rules_matching(evidence, question).items():
         if len(rules) < AMBIGUOUS_RULES or len({figures for figures, _, _ in rules.values()}) < AMBIGUOUS_RULES:

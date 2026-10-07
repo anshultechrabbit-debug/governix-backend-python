@@ -1,7 +1,10 @@
 """Which question words the evidence must contain before an answer is attempted."""
 import pytest
 
-from app.modules.rag.evidence import coverage_of, is_document_question, key_terms
+from app.modules.rag.evidence import (
+    applies_to_reader, coverage_of, is_document_question, key_terms, readers_situation, situation_terms,
+)
+from app.modules.rag.query_plan import QueryClass, plan_query
 
 
 def test_question_framing_words_are_not_required_but_numbers_are():
@@ -161,3 +164,86 @@ def test_a_long_diff_is_capped_for_the_model():
 ])
 def test_how_to_answer_is_not_what_to_find(question, terms):
     assert key_terms(question) == terms
+
+
+@pytest.mark.parametrize("question, figure", [
+    ("If my credit score is 680, what interest rate will I get?", "680"),
+    ("I am 25, can I apply for a home loan?", "25"),
+    ("I earn Rs. 50,000 per month, am I eligible for a home loan?", "000"),
+])
+def test_the_readers_own_figures_are_not_required(question, figure):
+    # A rule is applied to them ("680 falls in the 650-699 band"); no document states them.
+    assert figure not in key_terms(question)
+
+
+@pytest.mark.parametrize("question, situation", [
+    ("If my credit score is 680, what interest rate will I get?", "If my credit score is 680"),
+    ("What happens if I miss an EMI?", "if I miss an EMI"),
+    ("I am a doctor. Can I apply?", "I am a doctor"),
+    ("When is the EMI due?", ""),  # a question, not a case
+    ("What is India's electricity demand in 2050?", ""),
+])
+def test_the_readers_situation_is_told_from_the_question(question, situation):
+    assert readers_situation(question)[0] == situation
+
+
+def test_situation_words_are_optional_only_beside_a_subject_of_the_question():
+    # "software engineer" describes the reader; "home loan" is what is asked about.
+    assert situation_terms("I am a software engineer. Am I eligible for a home loan?") >= {"software", "engineer"}
+    assert "home" not in situation_terms("I am a software engineer. Am I eligible for a home loan?")
+    # Nothing else is asked: the situation is the subject.
+    assert situation_terms("What happens if I miss an EMI?") == set()
+
+
+@pytest.mark.parametrize("question", [
+    "Should I choose a shorter tenure or a longer one?",
+    "Which repayment option is best for a young professional?",
+    "What is the turnaround time for the sanction letter?",
+])
+def test_advice_and_speed_wording_is_not_what_to_find(question):
+    assert not {"choose", "best", "option", "turnaround"} & set(key_terms(question))
+
+
+def test_a_rule_applied_to_the_readers_case_is_not_ambiguous():
+    assert applies_to_reader("If my credit score is 680, what interest rate will I get?")
+    assert not applies_to_reader("What is the retention period for the approval note?")
+
+
+@pytest.mark.parametrize("question, subject", [
+    ("When did the 50% EMI-to-income rule start?", "emi-to-income"),
+    ("When did Flexi-EMI start?", "flexi-emi"),
+    ("Since when is Flexi-EMI offered?", "flexi-emi"),
+    ("Which version first introduced the NRI co-borrower rule?", "nri"),
+])
+def test_when_something_started_is_asked_of_every_version(question, subject):
+    # The version in force states the rule but cannot say when it began.
+    plan = plan_query(question)
+    assert plan.query_class is QueryClass.ACROSS_VERSIONS and plan.since
+    assert subject in key_terms(question) and "start" not in key_terms(question)
+
+
+@pytest.mark.parametrize("question", [
+    "When is the EMI due?",
+    "When does the Flexi-EMI interest-only period start?",  # a rule's own start, in the version in force
+    "When was this policy published?",
+])
+def test_a_rule_about_time_is_not_a_question_about_versions(question):
+    assert not plan_query(question).since
+
+
+@pytest.mark.parametrize("question", [
+    "Which period had the lowest EMI for Rs 50 lakh for 15 years?",
+    "When was the processing fee highest?",
+    "Which year had the highest interest rate?",
+])
+def test_which_period_had_a_figure_is_asked_of_every_version(question):
+    assert plan_query(question).query_class is QueryClass.ACROSS_VERSIONS
+    assert not {"period", "year", "had"} & set(key_terms(question))
+
+
+@pytest.mark.parametrize("question", [
+    "Which period has the highest FD rate?",  # the tenure bands of one rate table
+    "What is the lock-in period?",
+])
+def test_a_period_in_force_today_is_not_a_question_about_versions(question):
+    assert plan_query(question).query_class is QueryClass.CURRENT

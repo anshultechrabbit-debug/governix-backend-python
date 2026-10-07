@@ -3,7 +3,9 @@
 For every claim:
   1. Citation validation  - it cites at least one evidence id that exists.
   2. Numeric validation   - every rate, amount, percentage, date, tenure or
-                            number in it appears in the cited evidence.
+                            number in it appears in the cited evidence (or is
+                            the reader's figure, or arithmetic recomputed in
+                            app.modules.rag.calculate).
   3. Support validation   - its content words overlap the cited evidence.
   4. Self-reference        - it states document content, not "E2 says ...".
   5. Subject validation    - a subject the question names ("MAP/SIR Reports") is
@@ -24,6 +26,7 @@ from decimal import Decimal, InvalidOperation
 
 from app.core.stemming import stem
 from app.modules.citations.numerics import extract_numeric_facts
+from app.modules.rag.calculate import Calculation, matches
 from app.modules.rag.query_plan import normal_label, without_version_refs
 
 # Fraction of a claim's content words that must appear in the cited evidence.
@@ -101,7 +104,9 @@ _FRAMING = frozenset(
     "document documents titled title dated published publishes publication issued states stated says said "
     "mentions mentioned notes noted suggested suggests suggestion commented comment comments requested "
     "replied reply response responded remarks according listed lists shows shown described describes "
-    "includes included contains".split()
+    "includes included contains "
+    # The outcome of a rule applied to the reader's case ("so you do not qualify", "meets the minimum").
+    "qualify qualifies qualified eligible ineligible meet meets met satisfy satisfies satisfied".split()
 )
 
 
@@ -384,8 +389,12 @@ _CONTRAST = re.compile(
     r"(?:%|percent|per\s+cent|lakhs?|crores?|years?|months?|days?|weeks?)?", re.I)
 
 
-def _flips_polarity(claim: str, cited_text: str) -> bool:
-    """The claim restates one source sentence but drops or adds its negation."""
+def _flips_polarity(claim: str, cited_text: str, *, outcome: bool = False) -> bool:
+    """The claim restates one source sentence but drops or adds its negation.
+
+    `outcome`: the claim applies the rule to the reader's own figure, so a negation it adds is the
+    result for the reader ("At 27, you do not meet the applicant age of 28 to 65 years"), not a
+    reversed rule. Dropping the source's negation is never allowed."""
     # Only a figure the source does not state can be the one corrected: "is not 60 days" of a 60-day
     # rule negates the rule itself.
     stated = {f.value for f in extract_numeric_facts(cited_text)}
@@ -407,6 +416,8 @@ def _flips_polarity(claim: str, cited_text: str) -> bool:
     if claim_negated and not source_negated and _negations_quoted(claim, cited_text):
         return False  # its negation comes from another sentence it combines ("... does not have updated address")
     if claim_negated and not source_negated:
+        if outcome:
+            return False
         # The next sentences may carry the short answer of a question-and-answer pair ("... income? Ans. No.").
         return not _negated(" ".join(sentences[best_index + 1:best_index + 3]))
     return source_negated and not claim_negated and _restates_negated_part(claim, sentences[best_index])
@@ -531,9 +542,28 @@ _GIVEN_BEFORE = re.compile(
     r"(?:\bnot|\bno|rather than|instead of|\bfor|\bof|\bon|\bwith|\bif|\bwhen|\bat|\bas of|\bfrom|\buntil|"
     r"\bsince|\bbefore|\bafter|\bthan|\bvs\.?|\bversus|\bbut|\bonly|\bjust)\s*(?:a|an|the|only|just)?\s*$", re.I)
 _GIVEN_AFTER = re.compile(
-    r"^\s*,?\s*(?:(?:is|are|was|were|would\s+be|falls?|lies)\s+)?(?:not\s+|well\s+|still\s+)?"
+    # "You are 27, which is below ...", "27 years old, which is under ..."
+    r"^\s*(?:years?\s+old\s*)?,?\s*(?:(?:which|that|this|it)\s+)?"
+    r"(?:(?:is|are|was|were|would\s+be|falls?|lies)\s+)?(?:not\s+|well\s+|still\s+)?"
     r"(?:below|above|under|over|less|more|lower|higher|greater|within|beyond|short\s+of|exceeds?|"
     r"meets?|does\s+not|doesn't|isn't|qualif|requires?|needs?)", re.I)
+
+
+# What a recomputed figure is ("the total interest", "you save", "the difference"): the calculation's
+# result, which no passage names. Only for a claim that states such a result; every other subject word
+# must still be in its evidence.
+_RESULT_WORDS = frozenset(
+    "total totals overall sum cumulative combined altogether net saving savings save saves saved difference "
+    "extra additional".split()
+)
+
+
+def _number(fact) -> Decimal | None:
+    """A fact's number: "93.98 lakh" -> 9398000, "180 months" -> 180; None for a date."""
+    try:
+        return Decimal(fact.value.partition(" ")[0])
+    except InvalidOperation:
+        return None
 
 
 def _given_in_context(text: str, fact) -> bool:
@@ -617,13 +647,16 @@ def _derived(fact, evidence_facts: list, given: list) -> bool:
 
 def validate_claims(
     raw_claims: list[dict], evidence: dict[str, EvidenceText], subjects: list[str] | None = None,
-    question: str = "",
+    question: str = "", calculations: list[Calculation] | None = None,
 ) -> list[ClaimResult]:
     """`subjects` are the question's key terms: what the claims must be about; `question` is
-    read for the variants it pins down ("Tier 2")."""
+    read for the variants it pins down ("Tier 2"); `calculations` are the answer's recomputed
+    arithmetic (app.modules.rag.calculate), whose results a claim citing their evidence may state."""
     asked = qualifiers(question)
     given = extract_numeric_facts(without_version_refs(question))  # the reader's own figures
     given_values = {f.value for f in given}
+    # "I am 27" restated as "27 years": the reader's bare number with the unit its rule uses.
+    given_values |= {f"{f.value} {unit}" for f in given if f.kind == "number" for unit in ("year", "month", "day")}
     results = []
     for raw in raw_claims:
         text = _DANGLING_MARK.sub("", " ".join(_CITATION_MARKS.sub("", str(raw.get("text", ""))).split()))
@@ -671,18 +704,26 @@ def validate_claims(
                  if not any(start <= f.start and f.end <= end for start, end in references)]
         stated = [f for f in facts if f.key in available or f.key in allowed or f.value in available_values]
         derived = [f for f in facts if f not in stated and _derived(f, evidence_facts, given)]
+        # The result (or a step) of a calculation recomputed over the evidence this claim cites.
+        mine = [c for c in calculations or () if set(c.evidence_ids) & set(known)]
+        computed = [f for f in facts if f not in stated and f not in derived and mine
+                    and (n := _number(f)) is not None and any(matches(n, c) for c in mine)]
+        applied = False  # the claim applies a rule to the reader's own figure
         for fact in facts:
             result.numbers_checked += 1
-            if fact in stated or fact in derived:
+            if fact in stated or fact in derived or fact in computed:
                 continue
             # The question's own figure, used as the question uses it ("for a Rs. 60 lakh loan", "Rs. 8
             # lakh is below ...", "..., not 1%"), beside a figure the evidence supports.
-            if fact.value in given_values and (stated or derived) and _given_in_context(text, fact):
+            if fact.value in given_values and (stated or derived or computed) and _given_in_context(text, fact):
+                applied = True
                 continue
             result.valid = False
             result.problems.append(f"'{fact.raw}' is not in the cited evidence")
 
         claim_words = _content_words(text)
+        if computed:
+            claim_words -= _RESULT_WORDS
         if claim_words:
             labels = " ".join(evidence[e].label for e in known)
             # Word forms count ("deposits" supports "deposit", "reported" supports "reporting"), as in
@@ -694,7 +735,8 @@ def validate_claims(
                 result.problems.append(f"weak support ({support:.0%} of terms found in evidence)")
 
         claim_index = TermIndex(text)
-        named = [t for t in subjects or [] if _is_subject(t) and claim_index.mentions(t)]
+        named = [t for t in subjects or [] if _is_subject(t) and claim_index.mentions(t)
+                 and not (computed and t in _RESULT_WORDS)]
         evidence_index = TermIndex(cited_text + "\n" + "\n".join(evidence[e].label for e in known))
         if absent := [t for t in named if not evidence_index.mentions(t)]:
             result.valid = False
@@ -713,7 +755,7 @@ def validate_claims(
                 text, cited_versions, cited_text, evidence, [evidence[e] for e in known])):
             result.valid = False
             result.problems.append(wrong)
-        if _flips_polarity(text, cited_text):
+        if _flips_polarity(text, cited_text, outcome=applied):
             result.valid = False
             result.problems.append("reverses the negation of the source sentence")
         results.append(result)

@@ -20,7 +20,10 @@ from app.modules.auth.acl import can_see
 from app.modules.auth.permissions import Principal
 from app.modules.categories.model import Category
 from app.modules.citations.numerics import extract_numeric_facts, sentence_at
-from app.modules.rag.query_plan import COMPARISON_WORDS, compares_versions, without_version_refs
+from app.modules.rag.query_plan import (
+    COMPARISON_WORDS, PERIOD_WORDS, WHEN_INTRODUCED_WORDS, asks_when_introduced, asks_which_period, compares_versions,
+    without_version_refs,
+)
 from app.modules.rag.validation import TermIndex
 from app.modules.documents.model import Document, DocumentStatus
 from app.modules.policies.model import DocumentRelationship, PolicyVersion, RelationStatus, VersionStatus
@@ -90,13 +93,59 @@ QUESTION_TERMS = frozenset(
     "ignore ignoring disregard forget pretend take takes taking took taken get gets getting got "
     "rise rises rising rose risen increase increased increases increasing decrease decreased decreases "
     "decreasing drop drops dropped dropping fall falls fell fallen go goes went gone "
-    "highest lowest largest smallest biggest cheapest offered offer offers range ranges available".split()
+    "highest lowest largest smallest biggest cheapest offered offer offers range ranges available "
+    # Payment/disbursement action words: documents say "disbursed", "credited", "remitted" — not "paid".
+    # Adding these prevents 'paid'/'pay' blocking the gate for questions like 'To whom is the loan paid?'
+    "paid pay pays paying disburse disbursed disbursement credit credited crediting remit remitted "
+    "transfer transferred transfers send sends sent issue issued issues release releases released "
+    # Process/procedure/step framing words: documents don't repeat 'steps', 'process', 'procedure'.
+    "step steps process processes procedure procedures stage stages phase phases "
+    "application applications apply applies applied "
+    # Conditional/outcome framing words: 'if', 'happens', 'result' frame the question but
+    # documents never literally say 'if X happens' — they state rules like 'penalty shall apply'.
+    "if happens happen happened result results resulted outcome outcomes consequence consequences "
+    "occur occurs occurred trigger triggers triggered lead leads led cause causes caused "
+    "then else otherwise scenario "
+    # Reasoning/how-it-works framing: documents say 'calculated as', 'determined by', not 'how it works'.
+    "work works working calculation calculate calculates calculated compute computes computed "
+    "determine determines determined decide decides decided assess assesses assessed basis decided "
+    "function functions functioning operate operates operating "
+    # Action/event words users ask about but documents describe differently:
+    # 'miss an EMI' -> 'delayed payment'; 'default' -> 'NPA'; 'fail' -> 'non-compliance'.
+    "miss misses missed failing fail fails failed default defaults defaulted "
+    "breach breaches breached violate violates violated penalise penalizes penalized "
+    # Definition framing: documents state the definition, not the word 'define'. ("definition(s)" and
+    # "approval" stay subjects: "the Definitions section", "the approval cycle".)
+    "define meaning "
+    # Approval/Authority framing: users ask 'who approves', document says 'sanctioning authority'
+    # (approve/approval/sanction already match one another through validation.SYNONYM_GROUPS).
+    "authorize authorized authority sanction sanctioned whose "
+    # Exceptions/Exemptions framing:
+    # 'exempt' or 'exception' often describe the rule, but might not be explicitly written.
+    "exception exceptions exempt exempted anyone "
+    # Timelines/Limits framing:
+    "timeline deadline limit limits "
+    # Eligibility framing:
+    "eligible eligibility qualify qualifies criteria scheme schemes "
+    # Advice and judgement ("should I", "which is better", "is it worth it", "what do you recommend"): how
+    # the reader wants the options weighed, not what they are. The answer gives what the documents say
+    # about each option; the documents are not expected to use these words.
+    "best better worse worst good ideal ideally suitable suited suit suits appropriate advisable advise "
+    "advice advised recommend recommends recommended recommendation recommendations prefer prefers "
+    "preferable wise wiser worth worthwhile sensible smart afford choose chooses choosing chose chosen "
+    "choice choices opt opts opting option options alternative alternatives pick pros cons advantage "
+    "advantages disadvantage disadvantages drawback drawbacks downside downsides "
+    # How fast or how soon ("how quickly is it approved", "what is the turnaround time"): the documents
+    # state the time itself ("within 48 working hours").
+    "fast faster fastest quicker soon sooner speed speedy turnaround tat".split()
 )
 # Closed word classes that never name a question's subject. Unlike the open list above, these
 # classes are finite: quantifiers and determiners ("all three versions"), number words and
 # ordinals ("first changed"), prepositions ("as per", "vs", "via"), and words that ask where an
 # answer is written rather than what it is ("on which page", "a provision on").
 CLOSED_CLASS_TERMS = frozenset(
+    # auxiliary verbs the search's stop words miss ("which period had ...", "were they ...")
+    "had were been "
     # quantifiers, determiners
     "all any both each either every neither none other another such same own whole entire several "
     "few more most less least only also "
@@ -104,10 +153,14 @@ CLOSED_CLASS_TERMS = frozenset(
     "one two three four five six seven eight nine ten first second third fourth fifth last next "
     # prepositions and comparison operators. Not those that bound a figure ("above 75 lakh", "within 7
     # days", "before GST"): rule books separate one band from the next by them.
-    "per via vs versus upon onto into without between among amongst across against toward towards "
+    "per via vs versus instead rather upon onto into without between among amongst across against toward towards "
     "throughout during except including regarding concerning respect up back "
     # where an answer is written
-    "page pages provision provisions sentence sentences line lines word words wording text texts".split()
+    "page pages provision provisions sentence sentences line lines word words wording text texts "
+    # Comparison direction words: 'below 650' or 'above 75 lakh' frame the comparison but
+    # the document states the rule as 'minimum 650' or 'up to 75 lakh' — the direction word
+    # itself never appears in evidence as a searchable subject term.
+    "below above under over within beyond exceeds exceed exceeding".split()
 )
 # Questions about the document itself: its title, publisher, date, legal basis.
 _DOCUMENT_QUESTION = re.compile(
@@ -161,6 +214,10 @@ def key_terms(question: str) -> list[str]:
     is not: it chose the versions searched, and neither is "changed" in "has it changed
     between the versions?"."""
     framing = COMPARISON_WORDS if compares_versions(question) else frozenset()
+    if asks_when_introduced(question):  # "When did Flexi-EMI start?": the subject is Flexi-EMI
+        framing = framing | COMPARISON_WORDS | WHEN_INTRODUCED_WORDS
+    if asks_which_period(question):  # "Which period had the lowest EMI?": the subject is the EMI
+        framing = framing | PERIOD_WORDS
     question = without_version_refs(question)
     given = _readers_figures(question)
     return [
@@ -176,10 +233,87 @@ _HYPHENATED_FIGURE = re.compile(r"\d+(?:\.\d+)?-(?:years?|months?|weeks?|days?|y
 
 def _readers_figures(question: str) -> set[str]:
     """The words of the figures a question states with a unit ("drop to 7.5%", "a Rs. 1 crore property",
-    "over 10 years"): the reader's own figures, to apply a rule to or to be corrected. The documents
-    need not contain them; "170 schemes" or "in 2050", bare numbers, still name a subject."""
-    return {w.lower().strip(".,") for f in extract_numeric_facts(question)
-            if f.kind in ("percent", "amount", "duration", "quantity") for w in re.findall(r"[\w.,]+", f.raw)}
+    "over 10 years"), or in the reader's own situation ("if my score is 680", "I am 25"): the reader's own
+    figures, to apply a rule to or to be corrected. The documents need not contain them; "170 schemes" or
+    "in 2050", bare numbers elsewhere, still name a subject."""
+    facts = [f for f in extract_numeric_facts(question) if f.kind in ("percent", "amount", "duration", "quantity")]
+    facts += situation_figures(question)
+    # Split as the question's terms are ("Rs. 50,000" -> "rs", "50", "000"), and whole ("50,000").
+    return {w for f in facts for w in (*query_terms(f.raw), *(x.lower().strip(".,") for x in re.findall(r"[\w.,]+", f.raw)))}
+
+
+# The reader's own case, which a rule is applied to: "if my credit score is 680, ...", "I am 25 and earn
+# Rs. 50,000", "as a software engineer, ...", "... what happens if I miss an EMI?". A clause opened by a
+# condition, or a statement about the reader, up to the end of the clause. "When is the EMI due?" asks
+# a question; "when I prepay" states a case.
+_CLAUSE_BREAK = re.compile(r",(?!\d)|[;:?!\n]|\.(?=\s+[A-Z])|(?i:\s+but\s+)")
+_CONDITION = re.compile(
+    r"\b(?:if|unless|once|suppose|supposing|assume|assuming|in\s+case|provided|given\s+that"
+    r"|when(?:ever)?\b(?!\s+(?:is|was|are|were|will|would|do|does|did|can|could|should|shall|must|may|might"
+    r"|has|have|had)\b))\b",
+    re.I,
+)
+_ABOUT_READER = re.compile(
+    r"^\s*(?:and\s+|also\s+)?(?:i|i'm|i’m|im|i've|i’ve|i'd|i’d|my|we|we're|we’re|our|as\s+an?)\b", re.I
+)
+# A clause that asks rather than tells: "can I get a loan", "what rate applies". It ends the reader's
+# situation ("I am 27, earn Rs 65,000, can I get a loan?").
+_ASKS = re.compile(
+    r"^\s*(?:and\s+|so\s+|then\s+)?(?:what|which|how|when|where|who|whom|whose|why|whether|please|tell|explain"
+    r"|(?:can|could|am|is|are|was|were|will|would|should|shall|may|might|must|do|does|did|have|has)"
+    r"\s+(?:i|we|you|it|they|my|the|this|that|there|a|an)\b)",
+    re.I,
+)
+_SENTENCE = re.compile(r"(?<=[?!])\s+|(?<=\.)\s+(?=[A-Z])")
+
+
+def readers_situation(question: str) -> tuple[str, str]:
+    """The question split into the reader's own situation and the rest: ("if my credit score is 680",
+    "what interest rate will I get"). Either may be empty. A statement about the reader runs on until a
+    clause asks something: "I am 27, earn Rs 65,000 and have a 760 score. Can I get a loan?"."""
+    situation, rest = [], []
+    for sentence in _SENTENCE.split(question):
+        telling = False  # within a statement about the reader
+        for clause in _CLAUSE_BREAK.split(sentence):
+            clause = (clause or "").strip().removesuffix(".")
+            if not clause:
+                continue
+            if _ABOUT_READER.match(clause) or (telling and not _ASKS.match(clause)):
+                situation.append(clause)
+                telling = True
+            elif condition := _CONDITION.search(clause):
+                rest.append(clause[:condition.start()])
+                situation.append(clause[condition.start():])
+                telling = False
+            else:
+                rest.append(clause)
+                telling = False
+    return " ".join(" ".join(situation).split()), " ".join(" ".join(rest).split())
+
+
+def situation_figures(question: str) -> list:
+    """The figures the reader states about their own case ("I am 25", "my score is 680"), dates aside."""
+    situation, _rest = readers_situation(question)
+    return [f for f in extract_numeric_facts(situation) if f.kind != "date"] if situation else []
+
+
+def situation_terms(question: str) -> set[str]:
+    """Key terms that only describe the reader ("a software engineer", "my CIBIL score"), when the rest of
+    the question names a subject of its own. Empty when it does not: then the situation is what is asked
+    about ("what happens if I miss an EMI?") and its words are the subject."""
+    situation, rest = readers_situation(without_version_refs(question))
+    if not situation:
+        return set()
+    main = set(key_terms(rest))
+    if not main:
+        return set()
+    return {t for t in key_terms(situation) if t not in main}
+
+
+def applies_to_reader(question: str) -> bool:
+    """The question applies the documents' rules to the reader's own case (their figures or situation):
+    the case picks the rule, so several rules with different figures are not a reason to ask which."""
+    return bool(readers_situation(question)[0] or _readers_figures(question))
 
 
 # Questions about what a document is made of: its chapters, its contents.
@@ -195,7 +329,7 @@ def is_document_question(question: str) -> bool:
     return bool(_DOCUMENT_QUESTION.search(question))
 
 
-def coverage_of(question: str, texts: list[str]) -> tuple[float, list[str]]:
+def coverage_of(question: str, texts: list[str], ignore: set[str] | frozenset[str] = frozenset()) -> tuple[float, list[str]]:
     """Fraction of the question's subject terms present in the evidence.
 
     Terms and evidence are both reduced to a stem (app.core.stemming) so that a
@@ -207,9 +341,10 @@ def coverage_of(question: str, texts: list[str]) -> tuple[float, list[str]]:
     suffix stemmer cannot join ("generate"/"generation", "require"/"requirement").
     Without it the gate rejected questions whose evidence used the noun form of a
     verb the question phrased as a verb. A hyphenated term ("FIU-IND") counts when
-    each of its parts is present, as the text is indexed word by word.
+    each of its parts is present, as the text is indexed word by word. `ignore`: terms not to require
+    (words that only describe the reader's own case; see RAGService._circumstances).
     """
-    terms = key_terms(question)
+    terms = [t for t in key_terms(question) if t not in ignore]
     if not terms:
         return 1.0, []  # nothing specific to look for; relevance is judged by score
     index = TermIndex("\n".join(texts))

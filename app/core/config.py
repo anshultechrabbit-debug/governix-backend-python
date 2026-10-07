@@ -137,7 +137,7 @@ class Settings(BaseSettings):
     # "foreclosure"), instead of the key-term check refusing it. With RAG_ANSWER_MODE=select the model's
     # pick, checked sentence by sentence, then stands in for the word-overlap topic check. None: off.
     # Calibrate per embedding model (similarities differ between models).
-    RAG_SEMANTIC_MIN_SIMILARITY: float | None = None
+    RAG_SEMANTIC_MIN_SIMILARITY: float | None = 0.35
     # The LLM's own server, when it is not OpenAI's. Separate from OPENAI_BASE_URL, which the
     # OpenAI embeddings also use: a local answering model leaves the embeddings where they are.
     LLM_BASE_URL: str | None = None
@@ -208,7 +208,7 @@ class Settings(BaseSettings):
     RAG_MIN_TERM_COVERAGE: float = 0.4
     # The same, weighted by how rare each term is in what the caller can see:
     # the evidence must cover most of what distinguishes the question.
-    RAG_MIN_SALIENT_COVERAGE: float = 0.5
+    RAG_MIN_SALIENT_COVERAGE: float = 0.35
     RAG_CACHE_TTL_SECONDS: int = 600
     # Latest version first; when it has no supported answer, search the earlier versions of
     # each policy, most recent first (at most RAG_FALLBACK_MAX_DEPTH back; None: all of them).

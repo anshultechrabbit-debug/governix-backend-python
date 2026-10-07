@@ -31,6 +31,19 @@ class ClaimStream:
         """The model said the evidence does not answer the question (it writes this before the claims)."""
         return bool(_INSUFFICIENT.search(self._text))
 
+    def preamble(self) -> dict:
+        """The fields written before the claims (the answer's calculations), once the claims have begun;
+        empty before then or if they do not parse."""
+        if not self._in_array:
+            return {}
+        start = _CLAIMS_START.search(self._text)
+        head = self._text[:start.start()].rstrip().rstrip(",") + "}" if start else ""
+        try:
+            parsed = json.loads(head)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
     def feed(self, delta: str) -> list[dict]:
         """Add streamed text; return the claims that became complete."""
         self._text += delta

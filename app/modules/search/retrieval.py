@@ -378,6 +378,24 @@ class HybridRetriever:
         """
         if not terms or principal.organization_id is None:
             return {}
+        cached = self._visible_counts(principal, terms)
+        total = max(cached.get("__total__", 1), 1)
+        return {
+            term: math.log(1 + (total - df + 0.5) / (df + 0.5))
+            for term in dict.fromkeys(terms)
+            if (df := min(cached.get(term, 0), total)) != NOT_INDEXED
+        }
+
+    def unseen_terms(self, principal: Principal, terms: list[str]) -> set[str]:
+        """The terms that occur in no searchable chunk the caller can see. A term whose count could not
+        be read is not among them."""
+        if not terms or principal.organization_id is None:
+            return set()
+        cached = self._visible_counts(principal, terms)
+        return {term for term in terms if cached.get(term) == 0}
+
+    def _visible_counts(self, principal: Principal, terms: list[str]) -> dict[str, int]:
+        """Chunk counts of each term (and "__total__") in the caller's scope, cached for DF_TTL_SECONDS."""
         scope = ("visible", principal.organization_id, principal.permission_scope)
         now = time.monotonic()
         wanted = ["__total__", *dict.fromkeys(terms)]
@@ -389,12 +407,7 @@ class HybridRetriever:
                 for term, count in fresh.items():
                     _DF_CACHE[(*scope, term)] = (now + DF_TTL_SECONDS, count)
             cached.update(fresh)
-        total = max(cached.get("__total__", 1), 1)
-        return {
-            term: math.log(1 + (total - df + 0.5) / (df + 0.5))
-            for term in dict.fromkeys(terms)
-            if (df := min(cached.get(term, 0), total)) != NOT_INDEXED
-        }
+        return cached
 
     def _visible_frequencies(self, principal: Principal, terms: list[str]) -> dict[str, int]:
         """One UNION ALL statement for all terms, same pattern as _document_frequencies.

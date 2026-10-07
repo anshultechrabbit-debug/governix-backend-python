@@ -61,6 +61,38 @@ COMPARISON_WORDS = frozenset(
     "introduced introduce added removed deleted dropped withdrawn inserted original originally "
     "became become becomes strict stricter strictness lenient looser loose tighter tightened relaxed evolved".split()
 )
+# "When did the 50% EMI-to-income rule start?", "Since when is Flexi-EMI offered?", "When was the fee
+# raised?", "Which version first added ...?": when something appeared, changed or ended. The version in
+# force cannot tell; every version, oldest first, can.
+_WHEN_INTRODUCED = re.compile(
+    r"\bsince\s+when\b|\bfrom\s+(?:which|what)\s+(?:version|edition|date|year)\b"
+    r"|\bwhen\s+(?:did|was|were|has|have|had)\b[^?.;]*?\b(?:"
+    r"start|started|begin|began|begun|commence|commenced|introduce|introduced|add|added|launch|launched|"
+    r"come|came|appear|appeared|bring|brought|take\s+effect|took\s+effect|become|became|"
+    r"change|changed|increase|increased|raise|raised|reduce|reduced|lower|lowered|revise|revised|"
+    r"remove|removed|drop|dropped|withdraw|withdrawn|discontinue|discontinued|stop|stopped|end|ended)\b"
+    r"|\b(?:which|what)\s+(?:version|edition)\s+(?:first\s+)?(?:introduced|added|brought|started|began|changed)\b"
+    r"|\bfirst\s+(?:introduced|added|appeared|mentioned|offered|started|began)\b",
+    re.I,
+)
+# "Which period had the lowest EMI for Rs 50 lakh?", "When was the processing fee highest?": a figure
+# across the periods the versions were in force, one after another. Past tense only: "which period has
+# the highest rate?" can ask about the tenure bands of one rate table.
+_WHICH_PERIOD = re.compile(
+    r"\b(?:which|what)\s+(?:period|time|year|month|date|phase)\s+(?:had|was|were|saw)\b"
+    r"|\bwhen\s+(?:was|were|did)\b[^?.;]*?\b(?:lowest|highest|cheapest|costliest|largest|smallest|longest|"
+    r"shortest|least|most|best|worst|peak|peaked)\b",
+    re.I,
+)
+# What such a question calls a version: the period it was in force.
+PERIOD_WORDS = frozenset("period periods time times year years month months date dates phase phases peak peaked".split())
+# Words that ask when something started or changed, not what it is ("start", "since", "came in").
+WHEN_INTRODUCED_WORDS = frozenset(
+    "start starts started starting begin begins began begun beginning commence commences commenced since "
+    "launch launched come came appear appears appeared bring brought take took effect become became raise "
+    "raised reduce reduced lower lowered revise revised remove withdraw discontinue discontinued stop stopped "
+    "end ended".split()
+)
 _PAST = re.compile(r"\b(was|were|used to|previously|earlier|before|prior to|as of|as on|at that time|back in)\b", re.I)
 _YEAR = re.compile(r"\b(?:in|during|for)\s+((?:19|20)\d{2})\b", re.I)
 # A year range ("during 2022-27", "2017-22", "FY 2022-23") names a period the
@@ -82,6 +114,8 @@ class QueryPlan:
     explanation: str = ""
     # A comparison with no subject ("what changed in v2?") is answered from the section diff.
     diff: bool = False
+    # "When did X start / change?": answered from the earliest version that states it.
+    since: bool = False
 
     def describe(self) -> dict:
         return {
@@ -125,9 +159,17 @@ def plan_query(
         # "What changed in version 2.0?": that version and the one it is compared with.
         return QueryPlan(QueryClass.COMPARISON, "versions", version_labels=labels,
                          explanation=f"Question asks how version {labels[0]} differs from another version")
+    if not labels and asks_when_introduced(question):
+        return QueryPlan(QueryClass.ACROSS_VERSIONS, "all", since=True,
+                         explanation="Question asks when something started or changed; every version is searched, "
+                                     "oldest first, each passage labelled with its version and effective date")
     if not labels and _ACROSS.search(question):
         return QueryPlan(QueryClass.ACROSS_VERSIONS, "all",
                          explanation="Question asks about every version; each passage is labelled with its version")
+    if not labels and asks_which_period(question):
+        return QueryPlan(QueryClass.ACROSS_VERSIONS, "all",
+                         explanation="Question asks which period had a figure; every version is searched, oldest "
+                                     "first, each passage labelled with its version and the period it was in force")
     if _COMPARE.search(question) and not labels and _VERSION_CONTEXT.search(question):
         return QueryPlan(QueryClass.COMPARISON, "versions",
                          explanation="Question asks what changed between versions")
@@ -184,10 +226,20 @@ def normal_label(label: str) -> str:
     return ".".join(part.lstrip("0") or "0" for part in parts)
 
 
+def asks_when_introduced(question: str) -> bool:
+    """ "When did the 50% EMI-to-income rule start?", "Since when is Flexi-EMI offered?"."""
+    return bool(_WHEN_INTRODUCED.search(question))
+
+
+def asks_which_period(question: str) -> bool:
+    """ "Which period had the lowest EMI for Rs 50 lakh?", "When was the fee highest?"."""
+    return bool(_WHICH_PERIOD.search(question))
+
+
 def compares_versions(question: str) -> bool:
     """ "Has the owner changed between the versions?", "What changed in v2?", "... in each edition":
     words like "changed" and "between" then frame the question instead of naming its subject."""
     return bool(
         (_COMPARE.search(question) and (_VERSION_REF.search(question) or _VERSION_CONTEXT.search(question)))
-        or _ACROSS.search(question)
+        or _ACROSS.search(question) or _WHICH_PERIOD.search(question)
     )
