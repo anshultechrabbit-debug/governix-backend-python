@@ -122,7 +122,16 @@ HISTORY_KEY_CHARS = 300
 #   v47    every figure of the reader's case checked (warning, no verdict, when one is not); the outcome
 #          for the reader may negate a rule; the earlier version's wording of each rule applied
 #   v48    arithmetic ("total interest on Rs 1 crore over 15 years") recomputed (rag/calculate.py) and shown
-ANSWER_CACHE_VERSION = "v48"
+#   v49    QUESTION_TERMS narrowed: eligible/eligibility, limit/limits, exception/exempt,
+#          authority/sanction/authorize, criteria, scheme, deadline no longer stripped — they are
+#          policy content words and must be required in evidence; reasoning/rationale/justification
+#          added as framing words; new prompt rules for yes/no, combined positive+negative, scope/
+#          applicability, functional/purpose, existence, and condition-chosen slab questions;
+#          CLARIFY_PROMPT splits combined positive+negative and functional+non-functional
+#   v50    SYSTEM_PROMPT rules for 'how much', 'when', 'which', 'what if', and additive 'also';
+#          query_rewrite topic referents for 'this/that/these' with conversational history;
+#          upfront informal and banking typo normalization in standalone_question
+ANSWER_CACHE_VERSION = "v50"
 # No supported answer in the version in force: worth looking one version back.
 # Earlier versions answer only what the version in force does not cover. An answer it gave that the
 # checks then withheld (ANSWER_FAILED_VALIDATION, ANSWER_OFF_TOPIC) means it covers the subject:

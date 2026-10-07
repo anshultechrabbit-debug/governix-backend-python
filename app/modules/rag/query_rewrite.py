@@ -43,32 +43,51 @@ def _truncate_at_sentence(text: str, limit: int) -> str:
         return segment[:last_end].rstrip()
     return segment.rstrip()  # no boundary found: fall back to raw truncation
 
+_TOPIC_REFERENT = (
+    r"loan|loans|product|products|fee|fees|charge|charges|rate|rates|limit|limits|condition|conditions|"
+    r"criterion|criteria|restriction|restrictions|exception|exceptions|benefit|benefits|feature|features|"
+    r"option|options|category|categories|type|types|band|bands|tier|tiers|scheme|schemes|applicant|borrower"
+)
 _REFERENT = (
     r"discussion|answer|question|point|one|ones|figure|figures|number|numbers|scheme|schemes|comment|comments|"
     r"response|topic|case|table|list|amount|value|policy|document|section|clause|version|chapter|rule|"
-    r"requirement|item|items|study|studies|scenario|scenarios|suggestion|person|organisation|organization"
+    r"requirement|item|items|study|studies|scenario|scenarios|suggestion|person|organisation|organization|"
+    rf"{_TOPIC_REFERENT}"
 )
 _FOLLOW_UP = re.compile(
     # "that clause 1.1.8" names the clause: an identifier after the noun is no back-reference.
     rf"\b(?:that|those|the\s+(?:above|previous|earlier|same|last|former|latter))\s+(?:{_REFERENT})\b"
     r"(?!\s+(?:no\.?\s*)?[\dA-Z][\w.]*\d)"
+    # "this loan" / "these fees" reference a topic just discussed, whereas "this document" names the file.
+    rf"|\b(?:this|these)\s+(?:{_TOPIC_REFERENT})\b(?!\s+(?:no\.?\s*)?[\dA-Z][\w.]*\d)"
     r"|\b(?:you\s+(?:just\s+)?(?:said|mentioned)|as\s+mentioned|mentioned\s+(?:above|earlier|before))\b"
     # A dot inside a number ("Version 2.0") does not end the sentence.
     r"|^\s*(?:and|also|what\s+about|how\s+about|what\s+else|and\s+then)\b(?:[^.?!]|\.(?=\d)){0,40}[.?!]?\s*$"
-    r"|^\s*(?:why|how|when|who|what|where)\b(?:[^.?!]|\.(?=\d)){0,25}\b(?:it|they|them|that)\s*[.?!]?\s*$"
+    r"|^\s*(?:why|how|when|who|what|where)\b(?:[^.?!]|\.(?=\d)){0,25}\b(?:it|they|them|that|this|these)\s*[.?!]?\s*$"
     r"|^\s*what\s+changed\s*[.?!]?\s*$",
     re.I,
 )
-# A pronoun that may point back ("What is its place of storage?"). Common in
-# standalone questions too, so it only triggers a rewrite when there is an
-# earlier turn to resolve it against; the rewrite returns a standalone question unchanged.
+# A pronoun or near-pronoun that may point back to an earlier turn.
 _PRONOUN = re.compile(r"\b(?:its|their|it|they|them|he|she|his|her)\b", re.I)
 
-SYSTEM_PROMPT = """You rewrite a user's latest message into standalone questions in English, for searching documents.
+SYSTEM_PROMPT = """You rewrite a user's latest message into clean, standalone questions in English, for searching policy documents.
 
 Rules:
+- Fix obvious spelling mistakes: write the correct English word the user meant
+  (e.g. 'pokucy' → 'policy', 'intrest' / 'intrest rate' → 'interest rate', 'laon' → 'loan',
+  'eligblity' → 'eligibility', 'chages' → 'charges', 'defualt' → 'default',
+  'mortage' → 'mortgage', 'prepayemnt' → 'prepayment', 'disbusement' → 'disbursement').
+  If you are not sure what was meant, keep the word as written. Never invent a word.
+- Normalize informal, abbreviated or colloquial words into standard English:
+  'wanna' → 'want to', 'gonna' → 'going to', 'gotta' → 'have to', 'abt' → 'about',
+  'plz' / 'pls' → 'please', 'coz' / 'cuz' → 'because', 'wat' / 'wut' → 'what',
+  'hw' → 'how', 'dnt' → 'do not', 'shud' → 'should', 'cud' → 'could',
+  'nd' (meaning 'and') → 'and', 'ur' → 'your', 'u' (meaning 'you') → 'you',
+  'da' (meaning 'the') → 'the', 'dis' / 'dat' → 'this' / 'that', 'govt' → 'government'.
+- Do NOT change domain abbreviations, acronyms or proper nouns: LTV, KYC, EMI, CIBIL, NPA,
+  FOIR, FIU-IND, RBI, NBFC, NRI, SMA, NPA, PAN, etc. — these are exact policy terms.
 - Use the earlier conversation only to resolve references such as "that discussion", "it", "the previous version".
-- Replace each reference with the subject it points to, named exactly as the earlier conversation names
+  Replace each reference with the subject it points to, named exactly as the earlier conversation names
   it. Never write "the earlier conversation", "the previous answer" or "the discussion" in the question,
   and never name a subject the earlier conversation does not contain.
 - Do not answer the question.
@@ -77,15 +96,16 @@ Rules:
 - A short follow-up ("What about Version 2.0?", "And for education loans?") asks the PREVIOUS question again
   with the new detail: keep the previous question's subject and replace only what the follow-up changes.
   The new detail must appear in the rewrite:
-  "What is the processing fee for car loans?" + "What about education loans?" -> "What is the processing fee for education loans?";
-  "What is the car-loan tenure?" + "And for home loans?" -> "What is the home-loan tenure?";
-  "Who is the policy owner of Version 1.0?" + "What about Version 2.0?" -> "Who is the policy owner of Version 2.0?".
+  "What is the processing fee for car loans?" + "What about education loans?" → "What is the processing fee for education loans?";
+  "What is the car-loan tenure?" + "And for home loans?" → "What is the home-loan tenure?";
+  "Who is the policy owner of Version 1.0?" + "What about Version 2.0?" → "Who is the policy owner of Version 2.0?".
 - A reference ("that limit", "it", "that figure") points to the subject of the MOST RECENT turn whenever that
   subject could be meant, even if the earlier turn used the same word: after "What is the income limit?"
   then "What is the maximum LTV?", "that limit" is the maximum LTV (a maximum is a limit). Only reach back
   to an older turn when the most recent one plainly cannot be meant.
-- If the latest message is already a complete standalone question in English, return it unchanged: do not
-  add an earlier turn's subject to a question that is complete without it.
+- If the latest message is already a complete standalone question in English with no spelling issues and no
+  informal words, return it unchanged: do not add an earlier turn's subject to a question that is complete
+  without it.
 - If the latest message asks several questions, rewrite each one and put each on its own line, ending with
   "?". Never drop, merge or replace one of them.
 - resolvable is true whenever your rewrite says what the message means. Set it to false only when a
@@ -197,6 +217,35 @@ def _conversation(history: list) -> str:
     ) or "(none)"
 
 
+# Informal, abbreviated or SMS-style words that should be corrected upfront, not just as a fallback.
+# These fail keyword retrieval (the index has no entry for "laon", "abt", "wanna") and may
+# produce wrong vector embeddings, so correct them before the first retrieval attempt.
+_INFORMAL_LANGUAGE = re.compile(
+    r"\b(?:"
+    # Text abbreviations and contractions
+    r"wanna|gonna|gotta|kinda|sorta|abt|plz|pls|coz|cuz|cos\b|nah|yup|yep|"
+    r"dunno|imma|lemme|hafta|oughta|btw|fyi|idk|imo|tbh|afaik|"
+    r"wat\b|wut\b|hw\b|dnt\b|shud\b|cud\b|nd\b|ur\b|da\b|dis\b|dat\b|dem\b|dey\b|"
+    r"govt\b|dept\b(?!\s*\.|\s*:\s*\w)|approx\b"
+    r")\b",
+    re.I,
+)
+# Common banking / finance misspellings that the keyword lane will never match:
+_COMMON_TYPOS = re.compile(
+    r"\b(?:laon|lona|inrest|intrest|interet|eligblity|eligiblty|polucy|pokucy|"
+    r"retension|carges|chages|defualt|banck|mortage|prepayemnt|disbusement|"
+    r"guarentor|guaranter|documets|appliation|collatteral|procesing|cheque\s*bonces?)"
+    r"\b",
+    re.I,
+)
+
+
+def has_informal_or_typo(question: str) -> bool:
+    """True when the question uses informal abbreviations, SMS language, or known banking typos
+    that would fail keyword retrieval and should be normalized upfront."""
+    return bool(_INFORMAL_LANGUAGE.search(question) or _COMMON_TYPOS.search(question))
+
+
 def standalone_question(llm: LLMProvider | None, question: str, history: list) -> Rewrite:
     """The question to search with. Raises nothing: an unavailable model leaves it unchanged."""
     explicit = refers_to_earlier_turn(question)
@@ -206,9 +255,15 @@ def standalone_question(llm: LLMProvider | None, question: str, history: list) -
     possible = not explicit and bool(history and _PRONOUN.search(question)) and not several_questions(question)
     follow_up = explicit or possible
     foreign = is_non_english(question)
-    if not follow_up and not foreign:
+    # Informal/typo correction fires even for standalone English questions so the keyword lane
+    # gets the correct word ("laon" → "loan") instead of falling back after a failed attempt.
+    informal = not follow_up and not foreign and has_informal_or_typo(question)
+    if not follow_up and not foreign and not informal:
         return Rewrite(question)
-    reason = "follow_up" if follow_up else "translation"
+    if informal:
+        reason = "normalized"
+    else:
+        reason = "follow_up" if follow_up else "translation"
     if follow_up and not history:
         return Rewrite(question, reason, resolvable=False)
     if llm is None:
@@ -239,7 +294,14 @@ def standalone_question(llm: LLMProvider | None, question: str, history: list) -
 
 CLARIFY_PROMPT = """You turn a user's message into clean English search questions for finding the answer in policy documents.
 
-- Fix spelling mistakes ("pokucy" -> "policy", "retension" -> "retention").
+- Fix spelling mistakes ("pokucy" -> "policy", "retension" -> "retention", "laon" -> "loan",
+  "intrest" -> "interest", "eligblity" -> "eligibility", "chages" -> "charges"). If unsure of
+  the intended word, keep it as written.
+- Normalize informal, abbreviated or SMS-style words into standard English: "wanna" -> "want to",
+  "gonna" -> "going to", "abt" -> "about", "plz"/"pls" -> "please", "coz"/"cuz" -> "because",
+  "wat"/"wut" -> "what", "hw" -> "how", "dnt" -> "do not", "shud" -> "should", "cud" -> "could",
+  "nd" (and) -> "and", "ur" -> "your", "u" (you) -> "you", "da" (the) -> "the", "govt" -> "government".
+  Never change domain abbreviations or acronyms (LTV, KYC, EMI, CIBIL, NPA, FOIR, RBI, PAN, etc.).
 - Drop greetings, politeness, and instructions about the answer's length or style ("hello", "please",
   "explain in short", "give me a short script").
 - If the message asks several separate questions (up to ten), or about separate subjects (for example
@@ -248,6 +310,14 @@ CLARIFY_PROMPT = """You turn a user's message into clean English search question
   same question ("... what is the limit? Is it 15 months?") stays part of that one question.
   Otherwise write exactly one question.
 - Keep every subject the user asks about, and every name, number, date and abbreviation as written.
+- When a question asks for both the permitted/required AND the prohibited/restricted in a single ask
+  ("what is allowed and what is not", "list the requirements as well as the exceptions", "what can
+  and cannot be done", "eligible and ineligible cases"), split it into exactly two questions: one for
+  the positive side (what is allowed / required / eligible) and one for the negative side (what is not
+  allowed / prohibited / excepted / ineligible). Keep the subject the same in both.
+- When a question mixes a functional ask ("what does X do", "what is the purpose of X") with a
+  non-functional or quality ask ("how reliable is X", "what is the SLA for X", "how fast is it
+  processed"), split them into separate questions, one per dimension.
 - If an earlier conversation is given and the message on its own does not say what it is about ("What is
   the limit?", "How much is allowed?"), take the subject from the most recent turn it can refer to. Take
   only the subject: never a figure, value or answer from the conversation. Never replace or add to a

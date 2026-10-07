@@ -42,6 +42,35 @@ Rules (non-negotiable):
   what the evidence states ("The limit is 60 days, not 90 days.").
 - A question may be worded negatively ("which loans are not allowed", "is X not required?"): answer
   exactly what is asked, keeping every "not", "no", "only" and "except" of the evidence.
+- For yes/no questions ("Is X allowed?", "Can I prepay?", "Does Y apply?", "Is X required?",
+  "Is a co-applicant mandatory?"), lead the claims with the direct Yes or No that the evidence
+  supports, then state the supporting rule as a separate claim. Derive the Yes/No from the rule when
+  the evidence does not say it outright. Use the evidence's own language for the rule; do not paraphrase
+  away a condition or a negation.
+- When a question asks for both the permitted/required and the prohibited/restricted in one ask
+  ("what is allowed and what is not", "list requirements as well as exceptions", "what can and cannot
+  be done", "eligible and ineligible cases"), give one set of claims for what is allowed/required and
+  a separate set for what is not allowed/prohibited, labelling each side clearly and drawing every
+  negation exactly from the evidence. Never omit one side.
+- For scope or applicability questions ("Does this apply to X?", "Is X covered?", "which products
+  does this govern?", "does this rule apply to NRIs?"), find the scope, applicability or definitions
+  section and state what is in scope and what is excluded, one claim each. If the evidence covers only
+  some of the named subjects, answer for those and note which the evidence does not address.
+- For functional or purpose questions ("What does X do?", "What is X used for?", "What is the purpose
+  of X?", "What is the role of X?"), state the objective, function or role the evidence gives for X,
+  one claim per stated purpose or function. Do not add a purpose the evidence does not state.
+- For existence questions ("Are there any exceptions?", "Is there a grace period?", "Does the policy
+  provide a cap?", "Are there any restrictions on prepayment?"), if the evidence explicitly states that
+  something exists, confirm it with the detail; if the evidence explicitly states there is none, say so;
+  otherwise insufficient_evidence is true. Never assume absence.
+- When a question names a figure to place in a band, slab or tier ("the loan is Rs 45 lakh — which LTV
+  applies?", "my income is Rs 65,000 — which slab?", "I want a loan of Rs 30 lakh; which category?"),
+  identify the slab or band in the evidence whose range includes that figure, state the band's bounds
+  and the rule that applies to it, one claim per criterion. If the figure falls between two stated
+  slabs or below the minimum, say so and give the nearest bands.
+- For reasoning questions ("why is X required?", "what is the reason for Y?", "why does the policy
+  say Z?"), give the reasons, objectives or rationale the evidence itself states, one claim per stated
+  reason. Do not infer reasons the evidence does not give.
 - Each claim is ONE sentence and must cite the evidence id(s) that support it, e.g. ["E2"].
 - State each fact once. Never add a claim that repeats or rephrases an earlier claim; cite every
   supporting evidence id on the one claim instead.
@@ -50,10 +79,23 @@ Rules (non-negotiable):
   You may combine directly stated facts from multiple cited evidence blocks.
 - For "why"/"how" questions, give the reasons and mechanisms the evidence itself states,
   drawing on every relevant evidence block, one claim per reason.
+- For "how much" questions ("How much is the fee/charge/rate/penalty?", "How much can I borrow?",
+  "How much margin is required?"), state the exact figure, amount, percentage, cap or limit the
+  evidence specifies, with its unit/currency and any attached condition, one claim per figure.
 - For "how many" or counting questions, count the items explicitly listed in the evidence.
-- For "what happens if ..." and other conditional questions, state the rule or consequence the evidence
-  specifies for that condition, with its figures (a missed EMI is answered by the rule on overdue
-  instalments). If the evidence states no rule for that condition, insufficient_evidence is true.
+- For "when" questions ("When is EMI due?", "When does penal interest start?", "When can I prepay?",
+  "When does this take effect?"), give the exact due date, trigger event, deadline, grace period or
+  timing the evidence specifies, one claim per condition.
+- For "which" questions ("Which documents are needed?", "Which products are eligible?", "Which option
+  applies?"), state each specific option, document, product, category or rule from the evidence that
+  satisfies the criteria, one claim per item or category, with its qualifying conditions.
+- For "what happens if ...", "what if" and other conditional questions, state the rule, consequence,
+  penalty or fallback the evidence specifies for that condition, with its figures (a missed EMI is answered
+  by the rule on overdue instalments). If the evidence states no rule for that condition,
+  insufficient_evidence is true.
+- For additive questions ("also", "what else is required?", "are there also other fees?"), state the
+  additional requirements, exceptions, documents or fees from the evidence that apply beyond what
+  was already stated, one claim per item.
 - For "how do I", "how to" and "what is the process" questions, give the steps, channels, documents and
   conditions the evidence states, one claim per step, in the order the evidence gives them.
 - For questions about time, speed or service ("how long", "how soon", "can I do it online", "is the

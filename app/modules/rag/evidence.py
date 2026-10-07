@@ -107,9 +107,13 @@ QUESTION_TERMS = frozenset(
     "occur occurs occurred trigger triggers triggered lead leads led cause causes caused "
     "then else otherwise scenario "
     # Reasoning/how-it-works framing: documents say 'calculated as', 'determined by', not 'how it works'.
+    # 'reasoning'/'reason'/'reasons' is how users ask "why?"; evidence states the rule not the reason.
     "work works working calculation calculate calculates calculated compute computes computed "
     "determine determines determined decide decides decided assess assesses assessed basis decided "
     "function functions functioning operate operates operating "
+    "reasoning reason reasons rationale justification "
+    # Framing around what the user wants to know ("how does X work?"):
+    "works working "
     # Action/event words users ask about but documents describe differently:
     # 'miss an EMI' -> 'delayed payment'; 'default' -> 'NPA'; 'fail' -> 'non-compliance'.
     "miss misses missed failing fail fails failed default defaults defaulted "
@@ -117,16 +121,11 @@ QUESTION_TERMS = frozenset(
     # Definition framing: documents state the definition, not the word 'define'. ("definition(s)" and
     # "approval" stay subjects: "the Definitions section", "the approval cycle".)
     "define meaning "
-    # Approval/Authority framing: users ask 'who approves', document says 'sanctioning authority'
-    # (approve/approval/sanction already match one another through validation.SYNONYM_GROUPS).
-    "authorize authorized authority sanction sanctioned whose "
-    # Exceptions/Exemptions framing:
-    # 'exempt' or 'exception' often describe the rule, but might not be explicitly written.
-    "exception exceptions exempt exempted anyone "
-    # Timelines/Limits framing:
-    "timeline deadline limit limits "
-    # Eligibility framing:
-    "eligible eligibility qualify qualifies criteria scheme schemes "
+    # Pure question-framing words that policy documents do not use as subjects. IMPORTANT: do NOT
+    # add words that appear as content in policy documents (e.g. 'eligible', 'limit', 'exception',
+    # 'authority', 'sanction') — those must remain as gate terms so evidence is actually checked.
+    # Only add words the reader uses to frame the ask that no evidence passage is expected to contain.
+    "whose anyone timeline "
     # Advice and judgement ("should I", "which is better", "is it worth it", "what do you recommend"): how
     # the reader wants the options weighed, not what they are. The answer gives what the documents say
     # about each option; the documents are not expected to use these words.
