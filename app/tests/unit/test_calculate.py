@@ -69,3 +69,15 @@ def test_the_calculations_are_read_before_the_claims_stream():
     assert stream.preamble() == {}  # the claims have not begun
     stream.feed('"evidence_ids": ["E3"]}], "claims": [{"text": "Total interest is Rs. 93,98,060.", ')
     assert stream.preamble()["calculations"][0]["expression"] == "107767 * 180 - 10000000"
+
+
+@pytest.mark.parametrize("claim, right", [
+    ("No, ₹35,000 / ₹60,000 × 100 = 58.33%, which exceeds 50%.", True),
+    ("Rs. 35,000 / Rs. 60,000 = 58.33%", True),
+    ("35,000 / 60,000 x 100 = 70%", False),          # the stated result is wrong
+])
+def test_arithmetic_a_claim_writes_out_is_recomputed(claim, right):
+    from app.modules.rag.calculate import figures_in, written_arithmetic
+
+    grounded = figures_in("my income is ₹60,000 and my existing EMI is ₹35,000")
+    assert (Decimal("58.33") in written_arithmetic(claim, grounded)) is right

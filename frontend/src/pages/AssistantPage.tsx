@@ -385,11 +385,20 @@ function answerBasis(answer: Answer) {
 const SHORT_CLAIMS = 2;
 
 /** Replies to a greeting or a question with no subject: not a failed search, a prompt to ask. */
-const CONVERSATIONAL = ["GREETING", "NO_SUBJECT"];
+const CONVERSATIONAL = ["GREETING", "NO_SUBJECT", "INSTRUCTIONS_IGNORED"];
 /** The answer ran out of time or the AI service did not respond: nothing was decided about the documents. */
 const TEMPORARY = ["DEADLINE_EXCEEDED", "LLM_UNAVAILABLE"];
 /** The question needs one more detail before it can be searched. */
 const NEEDS_DETAIL = ["NEEDS_CONTEXT", "VERSION_NOT_FOUND", "COMPARISON_TARGET_UNCLEAR"];
+/** What the documents lacked: the topic is not there at all, or the closest text does not state the answer. */
+const NOT_FOUND_HEADINGS: Record<string, string> = {
+  KEY_TERMS_NOT_FOUND: "Not covered in your documents",
+  NO_RELEVANT_DOCUMENTS: "Not covered in your documents",
+  LOW_RELEVANCE: "Not covered in your documents",
+  INSUFFICIENT_EVIDENCE: "Your documents don’t answer this directly",
+  ANSWER_FAILED_VALIDATION: "Your documents don’t answer this directly",
+  ANSWER_OFF_TOPIC: "Your documents don’t answer this directly",
+};
 
 function NoAnswer({ reason, onRetry }: { reason: Answer["no_answer"]; onRetry: () => void }) {
   if (!reason) return null;
@@ -434,14 +443,14 @@ function NoAnswer({ reason, onRetry }: { reason: Answer["no_answer"]; onRetry: (
   }
   return (
     <div className="p-5">
-      <p className="font-medium text-ink">I couldn’t find this in your documents</p>
+      <p className="font-medium text-ink">{NOT_FOUND_HEADINGS[reason.reason] ?? "Not covered in your documents"}</p>
       <p className="mt-1 text-sm text-ink-soft">{reason.message}</p>
       {reason.missing_terms.length > 0 && (
-        <p className="mt-2 text-xs text-muted">Not mentioned in the documents you can access: <span className="font-medium text-ink-soft">{reason.missing_terms.join(", ")}</span></p>
+        <p className="mt-2 text-xs text-muted">Not mentioned anywhere in your documents: <span className="font-medium text-ink-soft">{reason.missing_terms.join(", ")}</span></p>
       )}
       {!!reason.suggestions.length && (
         <div className="mt-3">
-          <p className="text-xs font-medium text-muted">You could try:</p>
+          <p className="text-xs font-medium text-muted">Try:</p>
           <ul className="mt-1 list-disc space-y-0.5 pl-4 text-xs text-ink-soft">{reason.suggestions.map((suggestion) => <li key={suggestion}>{suggestion}</li>)}</ul>
         </div>
       )}

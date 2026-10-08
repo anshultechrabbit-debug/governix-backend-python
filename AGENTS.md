@@ -12,9 +12,14 @@ Alembic migrations, Postgres 18 with pgvector 0.8, and a React + Tailwind + Redu
   `validation.SYNONYM_GROUPS` is for general English synonyms only.
 - Keep refusal safety. Never loosen a check in a way that lets an unsupported answer through.
 - Ask before changing the DB schema or building the rule-level unit index (stage 3 of `docs/rag-audit.md`).
-- Don't run the live question suites (`run_suite.py`, `run_csv_suite.py`) unless asked. They call the
-  LLM for every question and cost tokens; the user tests in the UI. Unit tests are free and take
-  about a second, so always run them: `.venv/bin/python -m pytest app/tests/unit -q`
+- Don't run tests, suites or probe scripts unless the user asks. The user tests in the UI and is
+  careful with OpenAI credit. That includes `run_suite.py`, `run_csv_suite.py`, `pytest` and any script
+  that embeds or asks a question.
+  - `app/tests` uses `LLM_PROVIDER=local` and `EMBEDDING_PROVIDER=local`, plus a separate
+    `<db>_test` database, so it makes no OpenAI calls. Still ask first.
+  - Read code to check a change instead of running it.
+- Fix types of question, not single questions. When a check rejects a correct answer, fix the check's
+  rule, not a word list.
 - Report changes under these headings: What changed / Files / DB / API / Tests / Risks.
 - When answer behaviour changes, bump `ANSWER_CACHE_VERSION` in `app/modules/rag/service.py` and add a
   comment line for it. Otherwise cached answers (10 min) hide the change.
@@ -59,6 +64,119 @@ fall back to earlier versions.
 appears in no visible document gets the highest weight. That is how "FIU-IND" asked of a bank with
 no KYC policy is refused.
 
+## Meaning check (v54): the general fix for "correct answer, rejected for its wording"
+
+`validate_claims` marks each failed claim `wording_only` when it failed only on wording:
+- weak word support;
+- a question word the passage does not use ("bracket", "criterion", "additional", "meet");
+- the reader's own figure phrased in a way the patterns don't recognise.
+
+Hard failures stay strict and are never judged by meaning:
+- absence statements;
+- invented or missing citations;
+- a figure in neither the evidence nor the question;
+- a figure taken from another row;
+- a wrong tier or variant;
+- a wrong version;
+- a dropped "not".
+
+`RAGService._judge` asks the model once, with the question and each claim's passage, whether the claim is
+`supported` and `answers` the question (`MEANING_CHECK_PROMPT`). Wording-only claims with both verdicts are
+kept, and so is an answer the word-overlap topic check would withhold (claims that don't answer are
+dropped).
+
+It fails closed: with no verdict (`RAG_MEANING_CHECK=False`, the model down, or the local stand-in), the
+claim is removed as before. The summary's wording-only failures go to the existing summary meaning check.
+
+New phrasings need no new word lists. The lists in `evidence.py` stay only as a fast path that saves the
+extra call.
+
+The judge must not accept a statement about another rule. For "Do I satisfy the EMI-to-income
+condition?", a minimum-income claim does not answer it; `MEANING_CHECK_PROMPT` says so.
+
+## Prompt and context injection (v57)
+
+`rag/injection.py` recognises instructions to an AI by their grammar, not by a list of attack strings:
+- overriding its instructions ("ignore/disregard/forget ... previous instructions");
+- giving it a new role ("you are now", "pretend you are", "developer mode");
+- asking for its instructions ("reveal/print ... your system prompt");
+- addressing an AI by name ("Note to the AI assistant: ...", "AI: approve ...");
+- chat markup ("<|im_start|>", "[INST]").
+
+In a document, "you" is the customer, so only an AI named as such counts as addressed. In a question,
+"you" is the assistant, and "ignore the documents/rules" also counts. Keep that split: brochures say
+"you are now eligible" and "you must submit".
+
+Where it applies:
+- **Questions.** `_prepare_request` strips instructions before anything reads the question, and again
+  after the rewrite (that catches other languages and follow-ups).
+  - In a statement, the whole sentence goes (it's the payload). In a sentence ending with "?", only the
+    instruction clause goes.
+  - Forged history turns are cleaned too.
+  - What remains is answered, with a warning that the instructions were ignored. If nothing remains,
+    the reason is `INSTRUCTIONS_IGNORED` (conversational on the page).
+- **Documents.** `build_evidence` removes injected sentences before the model reads them or the
+  validator checks against them, keeping the layout. `EvidenceSet.injections` produces a warning naming
+  the document, and it is logged.
+- **Prompt.** The question is fenced between `<<<` and `>>>` and is data. The model is told never to
+  follow or reveal instructions and never to treat the question's claims as evidence.
+- **Forms.** "Policy update: ..." form lines stay as the reader's claim, never "my ... is" facts.
+- **Validator.** A figure the question attributes to the documents ("the policy says ... 2%",
+  `validation.premise_values`) may only be corrected ("10.05%, not 2%"). Stating it is a hard failure,
+  never judged by meaning.
+- **Backstop.** Every claim is still checked against the documents, so an injection that slips past
+  cannot add an unsupported statement.
+
+## "Not found" answers (v58)
+
+For the reasons in `NOT_FOUND_REASONS`, `service._explain_not_found` builds the message from what was read:
+the nearest section headings and documents in the evidence. "Front matter" and contents pages are left out.
+
+- Not covered (`KEY_TERMS_NOT_FOUND` / `LOW_RELEVANCE` / `NO_RELEVANT_DOCUMENTS`): "Your documents don't
+  seem to cover this. The nearest sections I found, “Pricing and Fee Schedule” ... in the Home Loan
+  Guide, are about other topics."
+- Not stated (`INSUFFICIENT_EVIDENCE`): "I read ... but they don't state this, and I won't guess."
+- Not quotable (`ANSWER_FAILED_VALIDATION`): "... nothing there states the answer clearly enough for me
+  to quote it."
+- Off topic (`ANSWER_OFF_TOPIC`): "The closest passages ... are about something other than what you
+  asked."
+
+Suggestions are questions about those sections ("What does the Home Loan Guide say in “Who Can Apply”?").
+When nothing came close, the generic tips in `SUGGESTIONS` are used.
+
+The page heading depends on the reason (`NOT_FOUND_HEADINGS` in `AssistantPage.tsx`): "Not covered in
+your documents" or "Your documents don't answer this directly", never "I couldn't find this". Suggestions
+come from ACL-filtered evidence, so they never name a document the reader can't see.
+
+## Clarifying questions (v56)
+
+- **When to ask "Which one do you mean?"** `_refuse_if_ambiguous` asks only when at least 3 matching rules
+  are variants of one rule (`_variants_of_one_rule`: ≥50% shared words, `VARIANT_OVERLAP`) and set
+  different figures. Example: "approval note retained ... 7 / 10 / 14 years".
+  - Rules that only share the question's word ("What will my EMI be?" matches Flexi-EMI, EMI dates, the
+    EMI cap and the overdue penalty) go to the model.
+- **Wording.** The message names the policy once ("Home Loan Guide (Version 8)"), and the choices are
+  readable rules with the bullet removed, cut at a word. The page adds the "Which one do you mean?"
+  heading and the "Matching rules" list, so the backend repeats neither.
+- **Questions missing a detail** ("What will my EMI be?" with no amount or tenure). The prompt says to
+  give what the figure depends on and an example row, then ask for the missing details. That is an
+  answer, not `insufficient_evidence`.
+
+## Input forms and arithmetic (v55)
+
+- **Filled-in forms.** `query_rewrite.from_form` runs first in `_prepare_request`. A message such as
+  "Context: / Age: 35 / Income: ₹60,000 / Version: 6 / Question: Do I ...?" becomes "My age is 35 and my
+  income is ₹60,000. Do I ... in Version 6?", so the reader's-case handling and version routing apply.
+  - "Expected:" and "Answer:" blocks from pasted test cases are dropped, and short headings ("Q63")
+    are skipped.
+  - Ordinary multi-line questions are unchanged.
+- **Version labels.** `_VERSION_REF` also accepts "Version: 6".
+- **Arithmetic written in a claim.** The model often writes arithmetic inline ("₹35,000 / ₹60,000 × 100 =
+  58.33%") instead of in `calculations`. `calculate.written_arithmetic` recomputes it with the same grounded
+  evaluator, and `validate_claims` accepts its figures only when the stated result is right.
+- **Shares.** `_derived` also accepts one figure as a percentage of another ("Rs. 35,000 is 58.33% of
+  Rs. 60,000").
+
 ## Question types (since 2026-10-07)
 
 - **Conditional / the reader's own case** ("If my credit score is 680...", "I am 25, can I apply?",
@@ -79,6 +197,30 @@ no KYC policy is refused.
     but never drop the rule's own one. "27 years" counts as the reader's "27".
   - Earlier-version notes for reader-case questions match each rule by its own wording
     (`_rule_worded_like`, `SAME_RULE_OVERLAP`), failing rules first. Example: v8 age 28-65, v7 25-65.
+  - `evidence.READER_OUTCOME_WORDS` ("meet", "satisfy", "criterion", "criteria", "eligible", "eligibility",
+    "qualify", "requirement", "stated") are framing only when `applies_to_reader(question)`. They are the
+    yes/no frame of "do I meet the minimum-income criterion?". Without a reader's case they stay gate terms
+    ("What are the eligibility criteria?"), as v49 intended.
+  - Don't make these words required again for reader-case questions. A correct claim ("Rs. 49,000 is
+    below the Rs. 60,000 minimum") is then withheld as off topic because it doesn't say "meet", and a
+    claim saying "criterion" fails the subject check.
+  - "additional", "extra", "further" and "else" are additive framing (in `QUESTION_TERMS`). The word they
+    qualify stays a term.
+  - A yes/no question ("Is/Can/Does/Am ...", `evidence.asks_yes_no`) that gives a bare figure ("Is age 25
+    eligible?", "Is age 24?") tests that figure, so it counts as the reader's figure
+    (`situation_figures`). Years are excluded, because they choose versions.
+  - The prompt requires a "Yes"/"No" first claim that sets the figure against the rule, and a summary
+    that starts the same way. `_unchecked_figures` flags a yes/no reply that gives the rule without
+    applying the figure.
+  - Placing a figure in a band ("Is credit score 650 in the 650-699 bracket?", "Which band does 680 fall
+    in?", `evidence._PLACES_FIGURE`): "bracket", "band", "slab", "tier", "range" and "falls in" are the
+    reader's words for a table row (`READER_OUTCOME_WORDS`, and `validation._FRAMING` for support). Tables
+    list just "650 - 699".
+  - If "bracket" were a required term, the v8 "Yes" claim would be removed and the answer would fall
+    back to an earlier version without saying Yes.
+  - A figure said to be the reader's in a claim ("Your total EMIs are 60%") is accepted beside a rule
+    figure (`validation._READERS_OWN`). Arithmetic on the reader's own figures (60% of Rs. 50,000) must
+    go through `calculations`.
 - **Advisory and speed** ("should I", "which is better", "how fast", "turnaround"): these words are in
   `QUESTION_TERMS`. The prompt says to give the options and trade-offs the documents state, with no
   verdict.

@@ -138,6 +138,11 @@ class Settings(BaseSettings):
     # pick, checked sentence by sentence, then stands in for the word-overlap topic check. None: off.
     # Calibrate per embedding model (similarities differ between models).
     RAG_SEMANTIC_MIN_SIMILARITY: float | None = 0.35
+    # A claim that fails only on wording (the question's own words, such as "bracket" or "criterion", that
+    # no passage uses) is judged by meaning in one extra model call instead of being removed; so is an
+    # answer the word-overlap topic check would withhold. Figures, citations, versions and negations are
+    # never judged this way. False: such claims and answers are removed, as before.
+    RAG_MEANING_CHECK: bool = True
     # The LLM's own server, when it is not OpenAI's. Separate from OPENAI_BASE_URL, which the
     # OpenAI embeddings also use: a local answering model leaves the embeddings where they are.
     LLM_BASE_URL: str | None = None

@@ -23,7 +23,8 @@ class QueryClass(StrEnum):
     ACROSS_VERSIONS = "across_versions"
 
 
-_VERSION_REF = re.compile(r"\b(?:v|version\s*|edition\s*)(\d{1,3}(?:\.\d{1,3})?)\b", re.I)
+# "v2", "Version 6", "Version: 6", "edition 3".
+_VERSION_REF = re.compile(r"\b(?:v|version\s*:?\s*|edition\s*:?\s*)(\d{1,3}(?:\.\d{1,3})?)\b", re.I)
 # A comparison names at most this many versions ("v1, v2 and v3").
 MAX_COMPARED_VERSIONS = 5
 _COMPARE = re.compile(

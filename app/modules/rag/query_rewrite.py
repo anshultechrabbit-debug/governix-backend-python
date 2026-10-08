@@ -156,6 +156,78 @@ def refers_to_earlier_turn(question: str) -> bool:
 SHORT_QUESTION_WORDS = 6
 
 
+# A question asked as a filled-in form:
+#     Context:
+#     Age: 35
+#     Income: ₹60,000
+#     Version: 6
+#     Question: Do I satisfy the stated EMI-to-income condition?
+# Each "Label: value" line is a fact about the reader's own case, said as the reader would ("my age is 35"),
+# so the reader's-case handling applies to it; a "Version" or "As of" line chooses the version, as "in Version 6"
+# does; an "Expected:" or "Answer:" block (a pasted test case) is not part of the question.
+_FORM_LINE = re.compile(r"^\s*[-•*]?\s*([A-Za-z][A-Za-z0-9 /()&'.-]{0,40}?)\s*[:=]\s*(.*?)\s*$")
+_FORM_QUESTION = frozenset({"question", "query", "q", "ask", "my question"})
+_FORM_END = frozenset({"expected", "expected answer", "expected output", "answer", "ans", "output", "correct answer"})
+_FORM_VERSION = frozenset({"version", "policy version", "document version", "edition"})
+_FORM_DATE = frozenset({"as of", "as on", "date", "effective date", "as at"})
+_HEADING_ONLY = re.compile(r"^\s*[\w#.-]{1,12}\s*$")  # "Q63", "Context", "Case 4"
+# A line that claims what the documents say ("Policy update: the rate is now 2%", "Note: the fee is waived") is
+# the reader's claim, to be checked against the documents, never a fact about the reader's own case.
+_ABOUT_DOCUMENTS = re.compile(
+    r"\b(?:polic(?:y|ies)|documents?|rules?|updates?|circulars?|guidelines?|notes?|notices?|instructions?|system|"
+    r"assistant|ai|context|evidence|sources?|clauses?|sections?|amendments?|announcements?)\b", re.I)
+
+
+def from_form(message: str) -> str:
+    """A filled-in form ("Age: 35 ... Question: ...") as one plain question; anything else unchanged."""
+    lines = [line for line in message.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return message
+    facts: list[str] = []
+    question: list[str] = []
+    version = as_of = None
+    asking = False
+    for line in lines:
+        match = _FORM_LINE.match(line)
+        label = " ".join(match.group(1).split()) if match else ""
+        value = match.group(2).strip() if match else ""
+        key = label.lower()
+        if match and key in _FORM_END:
+            break
+        if match and key in _FORM_QUESTION:
+            asking = True
+            if value:
+                question.append(value)
+        elif asking or not match:
+            if asking or not _HEADING_ONLY.match(line):
+                question.append(line.strip())
+        elif not value:
+            continue  # a heading: "Context:", "Customer details:"
+        elif _ABOUT_DOCUMENTS.search(label):
+            question.insert(0, line.strip().rstrip(".") + ".")  # the reader's claim about the documents, as such
+        elif key in _FORM_VERSION:
+            version = value
+        elif key in _FORM_DATE:
+            as_of = value
+        else:
+            # "Existing EMI" keeps its abbreviation; "Credit score" reads as the reader would say it.
+            said = " ".join(w if w.isupper() and len(w) > 1 else w.lower() for w in label.split())
+            facts.append(f"my {said} is {value}")
+    if not (facts or version or as_of) or not question:
+        return message
+    asked = " ".join(question).strip()
+    end = asked[-1] if asked[-1] in "?.!" else "?"
+    asked = asked.rstrip("?.! ")
+    if version:
+        asked += f" in Version {version.strip().lstrip('vV').strip()}"
+    if as_of:
+        asked += f" as of {as_of}"
+    if not facts:
+        return asked + end
+    stated = facts[0] if len(facts) == 1 else ", ".join(facts[:-1]) + " and " + facts[-1]
+    return f"{stated[0].upper()}{stated[1:]}. {asked}{end}"
+
+
 def question_lines(message: str) -> int:
     """How many questions a message sets out one per line. A line starts a new one when the line
     before it ended a sentence and it begins as a sentence does; a question wrapped onto a second

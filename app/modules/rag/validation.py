@@ -26,7 +26,7 @@ from decimal import Decimal, InvalidOperation
 
 from app.core.stemming import stem
 from app.modules.citations.numerics import extract_numeric_facts
-from app.modules.rag.calculate import Calculation, matches
+from app.modules.rag.calculate import Calculation, figures_in, matches, near, written_arithmetic
 from app.modules.rag.query_plan import normal_label, without_version_refs
 
 # Fraction of a claim's content words that must appear in the cited evidence.
@@ -106,7 +106,9 @@ _FRAMING = frozenset(
     "replied reply response responded remarks according listed lists shows shown described describes "
     "includes included contains "
     # The outcome of a rule applied to the reader's case ("so you do not qualify", "meets the minimum").
-    "qualify qualifies qualified eligible ineligible meet meets met satisfy satisfies satisfied".split()
+    "qualify qualifies qualified eligible ineligible meet meets met satisfy satisfies satisfied "
+    # A figure placed in a table's row ("650 falls in the 650 - 699 band"): the table only lists the row.
+    "falls fall lies belongs band bands bracket brackets slab slabs tier tiers bucket buckets".split()
 )
 
 
@@ -367,6 +369,10 @@ class ClaimResult:
     valid: bool
     problems: list[str] = field(default_factory=list)
     numbers_checked: int = 0
+    # Failed only on wording: words the passage does not use ("bracket", "criterion"), or the reader's
+    # own figure phrased in a way these patterns do not recognise. Its citations, figures, versions,
+    # variants and negations all passed, so its meaning can be judged instead (RAGService._judge).
+    wording_only: bool = False
 
 
 def _content_words(text: str) -> set[str]:
@@ -540,13 +546,15 @@ _FAMILY = {"amount": "value", "quantity": "value", "number": "value", "percent":
 _PER_YEAR = {"month": Decimal(12), "week": Decimal(52), "day": Decimal(365)}
 _GIVEN_BEFORE = re.compile(
     r"(?:\bnot|\bno|rather than|instead of|\bfor|\bof|\bon|\bwith|\bif|\bwhen|\bat|\bas of|\bfrom|\buntil|"
-    r"\bsince|\bbefore|\bafter|\bthan|\bvs\.?|\bversus|\bbut|\bonly|\bjust)\s*(?:a|an|the|only|just)?\s*$", re.I)
+    r"\bsince|\bbefore|\bafter|\bthan|\bvs\.?|\bversus|\bbut|\bonly|\bjust|\baged)\s*(?:a|an|the|only|just)?\s*$",
+    re.I)
 _GIVEN_AFTER = re.compile(
-    # "You are 27, which is below ...", "27 years old, which is under ..."
+    # "You are 27, which is below ...", "27 years old, which is under ...", "age 25 is not eligible"
     r"^\s*(?:years?\s+old\s*)?,?\s*(?:(?:which|that|this|it)\s+)?"
     r"(?:(?:is|are|was|were|would\s+be|falls?|lies)\s+)?(?:not\s+|well\s+|still\s+)?"
     r"(?:below|above|under|over|less|more|lower|higher|greater|within|beyond|short\s+of|exceeds?|"
-    r"meets?|does\s+not|doesn't|isn't|qualif|requires?|needs?)", re.I)
+    r"meets?|does\s+not|doesn't|isn't|qualif|requires?|needs?|eligible|ineligible|allowed|permitted|"
+    r"accepted|acceptable|enough|sufficient|insufficient)", re.I)
 
 
 # What a recomputed figure is ("the total interest", "you save", "the difference"): the calculation's
@@ -566,9 +574,37 @@ def _number(fact) -> Decimal | None:
         return None
 
 
-def _given_in_context(text: str, fact) -> bool:
+# "Your total EMIs are 60% of your income", "you earn Rs. 50,000": the figure is said to be the reader's.
+# A claim is one sentence, so a full stop here is an abbreviation or a decimal ("Your EMIs of Rs. 30,000").
+_READERS_OWN = re.compile(r"\b(?:your|you|you're|you’re|you've|you’ve)\b[^;!?]{0,50}$", re.I)
+
+
+def _given_in_context(text: str, fact, *, premise: bool = False) -> bool:
+    """The question's figure is used as the reader's. A `premise` (a figure the question says the documents
+    give: "the updated policy says the rate is 2%") may only be corrected ("10.05%, not 2%")."""
+    if premise:
+        return bool(_CORRECTED.search(text[max(0, fact.start - 30):fact.start]))
     return bool(_GIVEN_BEFORE.search(text[max(0, fact.start - 30):fact.start])
-                or _GIVEN_AFTER.match(text[fact.end:fact.end + 40]))
+                or _GIVEN_AFTER.match(text[fact.end:fact.end + 40])
+                or _READERS_OWN.search(text[max(0, fact.start - 50):fact.start]))
+
+
+_CORRECTED = re.compile(r"(?:\bnot|\bno|\bnor|rather than|instead of|\bthan|\bvs\.?|\bversus|\bbut)\s*(?:a|an|the)?\s*$", re.I)
+# "The policy says the rate is 2%", "according to the circular, the fee is 1%", "Policy update: rate is 2%": what
+# the question claims the documents say. Its figures are the reader's premise, not the reader's own case.
+_CLAIMED = re.compile(
+    r"\b(?:polic(?:y|ies)|documents?|guide|rules?|updates?|circulars?|notices?|clauses?|sections?|bank)\b"
+    r"[^.?!\n]{0,60}?\b(?:says?|said|states?|stated|is\s+now|are\s+now|now\s+(?:is|are)|changed|updated|reads?)\b"
+    r"|\baccording\s+to\b|\b(?:policy|rule)\s+update\b", re.I)
+
+
+def premise_values(question: str) -> set[str]:
+    """The values of the figures the question attributes to the documents ("the policy says ... 2%")."""
+    values = set()
+    for sentence in re.split(r"(?<=[.?!])\s+|\n+", question):
+        if _CLAIMED.search(sentence):
+            values |= {f.value for f in extract_numeric_facts(sentence)}
+    return values
 
 
 # "28 to 65 years", "2-3%": the first figure of a range takes the unit written after the second.
@@ -640,6 +676,9 @@ def _derived(fact, evidence_facts: list, given: list) -> bool:
                     candidates.append(a / b)
                 if a:
                     candidates.append(b / a)
+                if family == "percent":
+                    # "Rs. 35,000 is 58.33% of Rs. 60,000": one figure as a share of the other.
+                    candidates += [x * 100 for x in (a / b if b else None, b / a if a else None) if x is not None]
             if candidates and family in ("value", "percent", "duration") and any(_close(value, c) for c in candidates):
                 return True
     return False
@@ -657,6 +696,7 @@ def validate_claims(
     given_values = {f.value for f in given}
     # "I am 27" restated as "27 years": the reader's bare number with the unit its rule uses.
     given_values |= {f"{f.value} {unit}" for f in given if f.kind == "number" for unit in ("year", "month", "day")}
+    premises = premise_values(without_version_refs(question))  # "the policy says the rate is 2%": correct only
     results = []
     for raw in raw_claims:
         text = _DANGLING_MARK.sub("", " ".join(_CITATION_MARKS.sub("", str(raw.get("text", ""))).split()))
@@ -706,20 +746,34 @@ def validate_claims(
         derived = [f for f in facts if f not in stated and _derived(f, evidence_facts, given)]
         # The result (or a step) of a calculation recomputed over the evidence this claim cites.
         mine = [c for c in calculations or () if set(c.evidence_ids) & set(known)]
-        computed = [f for f in facts if f not in stated and f not in derived and mine
-                    and (n := _number(f)) is not None and any(matches(n, c) for c in mine)]
+        # ... or of one the claim writes out itself ("₹35,000 / ₹60,000 × 100 = 58.33%"), recomputed the same way.
+        written = written_arithmetic(text, figures_in(question) | figures_in(cited_text)) if "=" in text else set()
+        computed = [f for f in facts if f not in stated and f not in derived and (n := _number(f)) is not None
+                    and ((mine and any(matches(n, c) for c in mine)) or any(near(n, v) for v in written))]
         applied = False  # the claim applies a rule to the reader's own figure
+        hard = False  # a failure no rewording explains (see ClaimResult.wording_only)
         for fact in facts:
             result.numbers_checked += 1
             if fact in stated or fact in derived or fact in computed:
                 continue
             # The question's own figure, used as the question uses it ("for a Rs. 60 lakh loan", "Rs. 8
             # lakh is below ...", "..., not 1%"), beside a figure the evidence supports.
-            if fact.value in given_values and (stated or derived or computed) and _given_in_context(text, fact):
+            if fact.value in given_values and (stated or derived or computed) and _given_in_context(
+                    text, fact, premise=fact.value in premises):
                 applied = True
                 continue
             result.valid = False
-            result.problems.append(f"'{fact.raw}' is not in the cited evidence")
+            if fact.value in premises:
+                # What the question claims the documents say, stated as a fact: never judged by meaning.
+                hard = True
+                result.problems.append(f"'{fact.raw}' is the question's claim about the documents, not their figure")
+            elif fact.value in given_values:
+                # The reader's figure, phrased otherwise: whether it is presented as theirs is a question
+                # of meaning. Any other figure the evidence does not state is invented.
+                result.problems.append(f"'{fact.raw}' is the question's figure, not set against a rule")
+            else:
+                hard = True
+                result.problems.append(f"'{fact.raw}' is not in the cited evidence")
 
         claim_words = _content_words(text)
         if computed:
@@ -742,21 +796,22 @@ def validate_claims(
             result.valid = False
             result.problems.append(f"the cited evidence does not mention {', '.join(absent)}")
         elif unbound := _unbound_numbers(text, cited_text, named, allowed):
-            result.valid = False
+            result.valid, hard = False, True
             result.problems.append(f"{', '.join(unbound)} is not stated for {', '.join(named)} in the cited evidence")
         mismatched = [(w, v) for w, v in _variants(text) if w in asked and v != asked[w]]
         other = [_variant_name(w, v) for w, v in mismatched]
         if other:
-            result.valid = False
+            result.valid, hard = False, True
             wanted = ", ".join(dict.fromkeys(_variant_name(w, asked[w]) for w, _v in mismatched))
             result.problems.append(f"is about {', '.join(dict.fromkeys(other))}, not {wanted}")
         cited_versions = set().union(*(evidence[e].versions for e in known))
         if cited_versions and (wrong := _unsupported_versions(
                 text, cited_versions, cited_text, evidence, [evidence[e] for e in known])):
-            result.valid = False
+            result.valid, hard = False, True
             result.problems.append(wrong)
         if _flips_polarity(text, cited_text, outcome=applied):
-            result.valid = False
+            result.valid, hard = False, True
             result.problems.append("reverses the negation of the source sentence")
+        result.wording_only = not result.valid and not hard
         results.append(result)
     return results

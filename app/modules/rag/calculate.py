@@ -96,6 +96,38 @@ def checked_calculations(raw: object, evidence: dict, question: str) -> list[Cal
     return checked
 
 
+# Arithmetic a claim writes out itself: "₹35,000 / ₹60,000 × 100 = 58.33%", "(53,883 × 180) − 50,00,000 =
+# 46,98,940". Currency marks are dropped; "x" between figures is a multiplication; "N%" is N / 100.
+_CURRENCY = re.compile(r"₹|\b(?:rs|inr)\b\.?", re.I)
+_WRITTEN = re.compile(r"([\d.,\s*/+\-()%]+?)\s*=\s*(\d[\d,]*(?:\.\d+)?)\s*(%?)")
+_TIMES = re.compile(r"(?<=[\d)%])\s*[x×]\s*(?=[\d(])", re.I)
+_OPERATOR = re.compile(r"[\d)%]\s*[*/+\-]\s*[\d(]")
+
+
+def written_arithmetic(text: str, grounded: set[Decimal]) -> set[Decimal]:
+    """The figures of each calculation a claim writes out ("A / B × 100 = C") whose stated result is right
+    and whose figures are all grounded (the evidence's, the question's, or a unit conversion): its
+    result and every figure and step in it. Empty when there is none, or it is wrong."""
+    plain = _TIMES.sub(" * ", _CURRENCY.sub("", text)).replace("×", "*").replace("÷", "/").replace("−", "-")
+    accepted: set[Decimal] = set()
+    for match in _WRITTEN.finditer(plain):
+        expression = re.sub(r"^[^\d(]+", "", match.group(1)).strip()  # "No, 35,000 / ..." starts at the figure
+        if not _OPERATOR.search(expression) or len(expression) > MAX_EXPRESSION_CHARS:
+            continue
+        expression = re.sub(r"(\d[\d,]*(?:\.\d+)?)\s*%", r"(\1 / 100)", _DIGIT_COMMA.sub("", expression))
+        try:
+            stated = Decimal(match.group(2).replace(",", ""))
+            values: set[Decimal] = set()
+            used: list[Decimal] = []
+            result = _evaluate(ast.parse(expression, mode="eval").body, grounded | CONSTANTS, values, used)
+        except (SyntaxError, _Rejected, InvalidOperation, DivisionByZero, ZeroDivisionError, RecursionError):
+            continue
+        # "35,000 / 60,000 = 58.33%": a share written as a percentage.
+        if near(stated, result) or (match.group(3) and near(stated, result * 100)):
+            accepted |= values | set(used) | {result, stated}
+    return accepted
+
+
 def _evaluate(node: ast.AST, grounded: set[Decimal], values: set[Decimal], used: list[Decimal]) -> Decimal:
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
         value = Decimal(str(node.value))

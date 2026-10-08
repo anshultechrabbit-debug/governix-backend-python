@@ -113,7 +113,9 @@ def test_unanswerable_question_returns_no_answer_without_calling_the_llm(admin, 
     assert answer["status"] == "no_answer"
     assert answer["no_answer"]["reason"] in ("KEY_TERMS_NOT_FOUND", "LOW_RELEVANCE", "NO_RELEVANT_DOCUMENTS")
     assert "gold" in answer["no_answer"]["missing_terms"] or answer["no_answer"]["reason"] != "KEY_TERMS_NOT_FOUND"
-    assert answer["no_answer"]["message"].startswith("None of the documents you can access answer this")
+    # Said with what was read instead (service._explain_not_found), or plainly when nothing came close.
+    message = answer["no_answer"]["message"]
+    assert message.startswith(("Your documents don't seem to cover this", "I didn't find anything on this")), message
     # At most a rewording of the question is asked for; no answer is ever generated.
     from app.modules.rag.prompts import SYSTEM_PROMPT
     assert SYSTEM_PROMPT not in scripted.systems
