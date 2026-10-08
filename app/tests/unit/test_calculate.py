@@ -81,3 +81,38 @@ def test_arithmetic_a_claim_writes_out_is_recomputed(claim, right):
 
     grounded = figures_in("my income is ₹60,000 and my existing EMI is ₹35,000")
     assert (Decimal("58.33") in written_arithmetic(claim, grounded)) is right
+
+
+ELIGIBILITY = EvidenceText("E2", "• Net monthly income of at least Rs. 60,000\n\n• Total EMIs must not exceed 50% of net "
+                                 "income\n\n• We fund up to 65% of the agreed property value", versions=frozenset({"8"}))
+FAMILY = {"E3": EMI_TABLE, "E2": ELIGIBILITY}
+
+
+@pytest.mark.parametrize("question, evidence_id, claim", [
+    # The "how much" family, worked as people write it: currency marks, units, lakh/crore, words for operators.
+    (TOTAL, "E3", "Total interest on Rs. 1 crore over 15 years: Rs. 1,07,767 × 180 months − Rs. 1 crore = Rs. 93,98,060."),
+    (TOTAL, "E3", "You would pay Rs. 1,07,767 x 15 x 12 - Rs. 1,00,00,000 = about Rs. 93.98 lakh in interest."),
+    (TOTAL, "E3", "EMIs of Rs. 1,07,767 over 180 months come to Rs. 1,93,98,060."),
+    (SAVING, "E3", "You save (Rs. 53,883 × 180) − (Rs. 1,06,358 × 60) = Rs. 33,17,460 in interest by choosing 5 years."),
+    (SAVING, "E3", "Interest over 15 years: Rs. 53,883 × 180 months − Rs. 50 lakh = Rs. 46,98,940."),
+    ("My income is Rs 60,000 and my existing EMI is Rs 10,000. How much more EMI can I take?", "E2",
+     "You can take up to 50% × Rs. 60,000 − Rs. 10,000 = Rs. 20,000 more in EMIs."),
+    ("How much can I borrow on a property worth Rs 80 lakh?", "E2",
+     "You can borrow up to 65% of Rs. 80 lakh, which is Rs. 52 lakh."),
+])
+def test_how_much_arithmetic_written_in_a_claim_is_checked_and_kept(question, evidence_id, claim):
+    from app.modules.rag.evidence import key_terms
+
+    [result] = validate_claims([{"text": claim, "evidence_ids": [evidence_id]}], FAMILY, key_terms(question), question)
+    assert result.valid, result.problems
+
+
+@pytest.mark.parametrize("claim", [
+    "Total interest is Rs. 1,07,767 × 180 − Rs. 1 crore = Rs. 85,00,000.",      # wrong result
+    "Total interest is Rs. 1,07,767 × 200 − Rs. 1 crore = Rs. 1,15,53,400.",    # 200 is in neither source
+])
+def test_wrong_or_ungrounded_arithmetic_is_removed_and_never_judged_by_meaning(claim):
+    from app.modules.rag.evidence import key_terms
+
+    [result] = validate_claims([{"text": claim, "evidence_ids": ["E3"]}], FAMILY, key_terms(TOTAL), TOTAL)
+    assert not result.valid and not result.wording_only

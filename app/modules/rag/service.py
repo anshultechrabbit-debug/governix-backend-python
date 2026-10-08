@@ -158,7 +158,9 @@ HISTORY_KEY_CHARS = 300
 #   v57    prompt and context injection (rag/injection.py): instructions in questions, history and documents
 #          set aside; the question fenced as data; figures a question attributes to the policy only corrected
 #   v58    no-answers say what was read (nearest sections and documents) and suggest questions about them
-ANSWER_CACHE_VERSION = "v58"
+#   v59    "how much" arithmetic: working written in a claim as people write it (Rs., lakh/crore, months, %,
+#          minus/times, "is"/"≈") recomputed; EMI × months a single step; formulas for the whole family
+ANSWER_CACHE_VERSION = "v59"
 # No supported answer in the version in force: worth looking one version back.
 # Earlier versions answer only what the version in force does not cover. An answer it gave that the
 # checks then withheld (ANSWER_FAILED_VALIDATION, ANSWER_OFF_TOPIC) means it covers the subject:

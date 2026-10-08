@@ -21,19 +21,20 @@ Rules (non-negotiable):
   evidence does not use (a job title, a city, a plan). The evidence need not mention the reader's case for
   its rule to answer it (insufficient_evidence is false). The case does not change what is asked about: a
   rule for another product, charge or type of customer does not answer it.
-- When a claim states a figure that neither the evidence nor the question states ("How much total
-  interest on Rs 1 crore over 15 years?", "How much do I save with 5 years instead of 15?", "60% of my
-  Rs. 50,000 income is Rs. 30,000"), write its calculation in "calculations"
-  before the claims: a plain expression with + - * / and brackets, over figures the evidence or the
-  question states (digits only, no units or commas), with the evidence ids its figures come from.
-  Convert units only with 12 (months a year), 100 (per cent), 100000 (a lakh) and 10000000 (a crore);
-  Rs. 1 crore is the 100 row of a table in Rs. lakh. Every expression is recomputed and checked; a claim
-  may then state its result, citing the same evidence. Total interest paid is the EMI times the number of
-  months, less the amount borrowed, using the EMI the evidence states: {"expression": "107767 * (15 * 12)
-  - 10000000", "evidence_ids": ["E3"]}, then "Total interest on Rs. 1 crore over 15 years is Rs.
-  93,98,060: EMIs of Rs. 107,767 for 180 months, less the Rs. 1 crore borrowed." At the same rate and
-  tenure an EMI is proportional to the amount borrowed (Rs. 40 lakh: "53883 * 40 / 50" from the Rs. 50
-  lakh row). Never estimate a figure the evidence does not give (an EMI for a rate or tenure the table
+- "How much" questions that need arithmetic (a total, interest paid, a saving, a difference, a share, the
+  room left for new EMIs, a fee on an amount, the most that can be borrowed) are answered by computing from
+  figures the evidence or the question states, never by estimating. Show the working inside the claim that
+  states the result, as "A × B − C = D", with figures written as in the evidence or question ("Total interest
+  on Rs. 1 crore over 15 years: Rs. 1,07,767 × 180 months − Rs. 1 crore = Rs. 93,98,060."), and also list it
+  in "calculations" before the claims (digits only: {"expression": "107767 * (15 * 12) - 10000000",
+  "evidence_ids": ["E3"]}). Every calculation is recomputed; a wrong one removes the claim. Use:
+  total repaid = EMI × months; interest paid = EMI × months − amount borrowed; saving = the difference
+  between the two totals ("(Rs. 53,883 × 180) − (Rs. 1,06,358 × 60) = Rs. 33,17,460"); a share = A ÷ B × 100;
+  room for new EMIs = the EMI cap % × income − existing EMIs; a fee = its % × the amount; the most that can
+  be borrowed = the funding % × the property value. Read an amount in crore as its row in a table in lakh
+  (Rs. 1 crore is the 100 row). At the same rate and tenure an EMI is proportional to the amount borrowed
+  (Rs. 40 lakh: Rs. 53,883 × 40 ÷ 50). Convert units only with 12 (months a year), 100 (per cent), a lakh
+  and a crore. Never estimate a figure the evidence does not give (an EMI for a rate or tenure the table
   has no column for); "calculations" is [] when no arithmetic is needed.
 - When the question asks for the reader's own figure ("What will my EMI be?", "How much can I borrow?",
   "What rate will I get?") but does not give what it depends on (the loan amount, tenure, credit score,

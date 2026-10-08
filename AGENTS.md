@@ -171,9 +171,20 @@ come from ACL-filtered evidence, so they never name a document the reader can't 
     are skipped.
   - Ordinary multi-line questions are unchanged.
 - **Version labels.** `_VERSION_REF` also accepts "Version: 6".
-- **Arithmetic written in a claim.** The model often writes arithmetic inline ("₹35,000 / ₹60,000 × 100 =
-  58.33%") instead of in `calculations`. `calculate.written_arithmetic` recomputes it with the same grounded
-  evaluator, and `validate_claims` accepts its figures only when the stated result is right.
+- **Arithmetic written in a claim (v59, the whole "how much" family).** The model usually writes the
+  working inline, as people do: "Rs. 1,07,767 × 180 months − Rs. 1 crore = Rs. 93,98,060", "(Rs. 53,883 ×
+  180) − (Rs. 1,06,358 × 60) = Rs. 33,17,460", "50% × Rs. 60,000 − Rs. 10,000 = Rs. 20,000".
+  - `calculate.written_arithmetic` tokenises figures with currency marks, units (months/years), scales
+    (lakh/crore/thousand/k) and %, and operators as symbols or words (minus/less/times/divided by). It
+    accepts "=", "≈", "is" and "about".
+  - Every figure must be grounded (evidence, question, or a unit conversion), and the stated result must
+    match the recomputed one.
+  - The prompt asks for the working inside the claim, and lists the family's formulas: total repaid,
+    interest paid, saving, share, room for new EMIs, fee on an amount, and maximum loan.
+  - `_derived` also accepts EMI × months, using the question's years in months.
+  - For a claim whose figure was verified this way, the question's own words and words addressing the
+    reader ("you would pay", "you can borrow") count as supported.
+  - Wrong or ungrounded arithmetic stays a hard failure.
 - **Shares.** `_derived` also accepts one figure as a percentage of another ("Rs. 35,000 is 58.33% of
   Rs. 60,000").
 

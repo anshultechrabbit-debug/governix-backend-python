@@ -139,7 +139,8 @@ SYNONYM_GROUPS = (
     "period periods duration tenure term terms",
     # Lending vocabulary a reader and a policy word differently ("how much does the lender finance?" /
     # "we fund up to 65%", "a fee for closing early" / "foreclosure charge").
-    "fund funds funded funding finance finances financed financing lend lends lending lent lender lenders financier",
+    "fund funds funded funding finance finances financed financing lend lends lending lent lender lenders financier "
+    "borrow borrows borrowed borrowing",
     "fee fees charge charges charged levy levied",
     "close closes closed closing closure foreclose foreclosed foreclosure preclose preclosure",
     "income incomes earning earnings salary salaries",
@@ -566,6 +567,10 @@ _RESULT_WORDS = frozenset(
 )
 
 
+# How a computed figure is put to the reader ("you would pay about ...", "you can borrow up to ...").
+_ADDRESSING = frozenset("you your yours yourself would could will might about around approximately roughly".split())
+
+
 def _number(fact) -> Decimal | None:
     """A fact's number: "93.98 lakh" -> 9398000, "180 months" -> 180; None for a date."""
     try:
@@ -670,6 +675,12 @@ def _derived(fact, evidence_facts: list, given: list) -> bool:
                 candidates.append(a * b / 100)
             if a_family == b_family and a_unit == b_unit:
                 candidates += [a + b, abs(a - b)]
+            # "EMIs of Rs. 1,07,767 over 15 years come to Rs. 1,93,98,060": a monthly figure over the
+            # question's period, in months.
+            for (x_family, x, x_unit), (y_family, y, _y_unit) in (((a_family, a, a_unit), (b_family, b, b_unit)),
+                                                                   ((b_family, b, b_unit), (a_family, a, a_unit))):
+                if family == "value" and x_family == "duration" and y_family == "value" and x_unit in ("year", "month"):
+                    candidates.append(y * (x * 12 if x_unit == "year" else x))
             if a_family == "value" and b_family == "value":
                 candidates.append(a * b)
                 if b:
@@ -747,7 +758,7 @@ def validate_claims(
         # The result (or a step) of a calculation recomputed over the evidence this claim cites.
         mine = [c for c in calculations or () if set(c.evidence_ids) & set(known)]
         # ... or of one the claim writes out itself ("₹35,000 / ₹60,000 × 100 = 58.33%"), recomputed the same way.
-        written = written_arithmetic(text, figures_in(question) | figures_in(cited_text)) if "=" in text else set()
+        written = written_arithmetic(text, figures_in(question) | figures_in(cited_text))
         computed = [f for f in facts if f not in stated and f not in derived and (n := _number(f)) is not None
                     and ((mine and any(matches(n, c) for c in mine)) or any(near(n, v) for v in written))]
         applied = False  # the claim applies a rule to the reader's own figure
@@ -776,14 +787,15 @@ def validate_claims(
                 result.problems.append(f"'{fact.raw}' is not in the cited evidence")
 
         claim_words = _content_words(text)
-        if computed:
-            claim_words -= _RESULT_WORDS
+        # A recomputed figure is put in the question's words ("you would pay", "you can borrow"), around
+        # figures that were all checked: those words count as supported.
+        echoed = (_RESULT_WORDS | _ADDRESSING | _content_words(question)) if computed or derived else frozenset()
         if claim_words:
             labels = " ".join(evidence[e].label for e in known)
             # Word forms count ("deposits" supports "deposit", "reported" supports "reporting"), as in
             # every other term check: applying a rule restates it in other forms of its own words.
             source = TermIndex(f"{cited_text}\n{labels}")
-            support = sum(1 for w in claim_words if source.mentions(w)) / len(claim_words)
+            support = sum(1 for w in claim_words if w in echoed or source.mentions(w)) / len(claim_words)
             if support < MIN_SUPPORT:
                 result.valid = False
                 result.problems.append(f"weak support ({support:.0%} of terms found in evidence)")

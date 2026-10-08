@@ -96,35 +96,71 @@ def checked_calculations(raw: object, evidence: dict, question: str) -> list[Cal
     return checked
 
 
-# Arithmetic a claim writes out itself: "₹35,000 / ₹60,000 × 100 = 58.33%", "(53,883 × 180) − 50,00,000 =
-# 46,98,940". Currency marks are dropped; "x" between figures is a multiplication; "N%" is N / 100.
-_CURRENCY = re.compile(r"₹|\b(?:rs|inr)\b\.?", re.I)
-_WRITTEN = re.compile(r"([\d.,\s*/+\-()%]+?)\s*=\s*(\d[\d,]*(?:\.\d+)?)\s*(%?)")
-_TIMES = re.compile(r"(?<=[\d)%])\s*[x×]\s*(?=[\d(])", re.I)
-_OPERATOR = re.compile(r"[\d)%]\s*[*/+\-]\s*[\d(]")
+# Arithmetic a claim writes out itself, as people write it: "Rs. 1,07,767 × 180 months − Rs. 1 crore = Rs.
+# 93,98,060", "(₹53,883 × 180) − (₹1,06,358 × 60) ≈ ₹33.17 lakh", "50% of income: 50% × Rs. 60,000 − Rs.
+# 10,000 = Rs. 20,000", "₹35,000 / ₹60,000 × 100 = 58.33%". A figure keeps its currency mark, unit and scale
+# ("lakh", "crore", "k"); "N%" is N / 100; operators may be words ("minus", "times", "divided by").
+_FIGURE = (r"(?:₹|(?:rs|inr)\b\.?)?\s*\d[\d,]*(?:\.\d+)?"
+           r"(?:\s*(?:%|per\s*cent\b|lakhs?\b|lacs?\b|crores?\b|cr\b|thousand\b|k\b|months?\b|years?\b|yrs?\b|"
+           r"weeks?\b|days?\b))?")
+_OPERATOR_WORD = r"(?:[×x*/÷+\-−–]|plus\b|minus\b|less\b|times\b|multiplied\s+by\b|divided\s+by\b)"
+_WORKED_RUN = rf"\(*\s*{_FIGURE}\s*\)*(?:\s*{_OPERATOR_WORD}\s*\(*\s*{_FIGURE}\s*\)*)+"
+_WORKED = re.compile(
+    rf"({_WORKED_RUN})\s*(?:=|≈|equals\b|is\b|comes\s+to\b|gives\b)\s*"
+    rf"(?:about\s+|approximately\s+|approx\.?\s+|roughly\s+|around\s+|~\s*)?({_FIGURE})", re.I)
+_WORKED_TOKEN = re.compile(rf"({_FIGURE})|({_OPERATOR_WORD})|([()])", re.I)
+_FIGURE_PARTS = re.compile(r"(?:₹|(?:rs|inr)\.?)?\s*(\d[\d,]*(?:\.\d+)?)\s*(.*)", re.I)
+_SCALE = (("crore", 10**7), ("cr", 10**7), ("lakh", 10**5), ("lac", 10**5), ("thousand", 1000), ("k", 1000))
+_AS_OPERATOR = {"×": "*", "x": "*", "*": "*", "times": "*", "multiplied by": "*", "/": "/", "÷": "/",
+                "divided by": "/", "+": "+", "plus": "+", "-": "-", "−": "-", "–": "-", "minus": "-", "less": "-"}
+
+
+def _figure(raw: str) -> tuple[Decimal, Decimal, bool]:
+    """(the number as written, its value, whether it is a percentage): "Rs. 1 crore" -> (1, 10000000, False),
+    "50%" -> (50, 50, True), "180 months" -> (180, 180, False)."""
+    match = _FIGURE_PARTS.match(raw.strip())
+    number = Decimal(match.group(1).replace(",", ""))
+    unit = " ".join(match.group(2).lower().split())
+    if unit.startswith(("%", "per")):
+        return number, number, True
+    for word, scale in _SCALE:
+        if unit.startswith(word):
+            return number, number * scale, False
+    return number, number, False
 
 
 def written_arithmetic(text: str, grounded: set[Decimal]) -> set[Decimal]:
-    """The figures of each calculation a claim writes out ("A / B × 100 = C") whose stated result is right
-    and whose figures are all grounded (the evidence's, the question's, or a unit conversion): its
-    result and every figure and step in it. Empty when there is none, or it is wrong."""
-    plain = _TIMES.sub(" * ", _CURRENCY.sub("", text)).replace("×", "*").replace("÷", "/").replace("−", "-")
+    """The figures of each calculation a claim writes out ("A × B − C = D") whose stated result is right and
+    whose figures are all grounded (the evidence's, the question's, or a unit conversion): its result and
+    every figure and step in it. Empty when there is none, or it is wrong."""
+    allowed = grounded | CONSTANTS
     accepted: set[Decimal] = set()
-    for match in _WRITTEN.finditer(plain):
-        expression = re.sub(r"^[^\d(]+", "", match.group(1)).strip()  # "No, 35,000 / ..." starts at the figure
-        if not _OPERATOR.search(expression) or len(expression) > MAX_EXPRESSION_CHARS:
-            continue
-        expression = re.sub(r"(\d[\d,]*(?:\.\d+)?)\s*%", r"(\1 / 100)", _DIGIT_COMMA.sub("", expression))
+    for match in _WORKED.finditer(text):
+        expression, literals, figures = [], set(), set()
         try:
-            stated = Decimal(match.group(2).replace(",", ""))
+            for figure, operator_word, bracket in _WORKED_TOKEN.findall(match.group(1)):
+                if figure:
+                    number, value, percent = _figure(figure)
+                    if number not in allowed and value not in allowed:
+                        raise _Rejected(f"{figure} is not a figure of the evidence or the question")
+                    literal = value / 100 if percent else value
+                    expression.append(f"({literal})")
+                    literals.add(literal)
+                    figures |= {number, value}
+                elif operator_word:
+                    expression.append(_AS_OPERATOR[" ".join(operator_word.lower().split())])
+                else:
+                    expression.append(bracket)
+            if len(expression) > MAX_EXPRESSION_CHARS:
+                continue
+            stated_number, stated, stated_percent = _figure(match.group(2))
             values: set[Decimal] = set()
-            used: list[Decimal] = []
-            result = _evaluate(ast.parse(expression, mode="eval").body, grounded | CONSTANTS, values, used)
-        except (SyntaxError, _Rejected, InvalidOperation, DivisionByZero, ZeroDivisionError, RecursionError):
+            result = _evaluate(ast.parse(" ".join(expression), mode="eval").body, literals, values, [])
+        except (SyntaxError, KeyError, _Rejected, InvalidOperation, DivisionByZero, ZeroDivisionError, RecursionError):
             continue
-        # "35,000 / 60,000 = 58.33%": a share written as a percentage.
-        if near(stated, result) or (match.group(3) and near(stated, result * 100)):
-            accepted |= values | set(used) | {result, stated}
+        # "35,000 / 60,000 = 58.33%" or "× 100 = 58.33%": a share written as a percentage.
+        if near(stated, result) or (stated_percent and (near(stated, result * 100) or near(stated / 100, result))):
+            accepted |= figures | literals | values | {result, stated, stated_number}
     return accepted
 
 
