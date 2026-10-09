@@ -26,7 +26,9 @@ from decimal import Decimal, InvalidOperation
 
 from app.core.stemming import stem
 from app.modules.citations.numerics import extract_numeric_facts
-from app.modules.rag.calculate import Calculation, figures_in, matches, near, written_arithmetic
+from app.modules.rag.calculate import (
+    Calculation, approximate_before, figures_in, matches, near, states_value, written_arithmetic, wrong_arithmetic,
+)
 from app.modules.rag.query_plan import normal_label, without_version_refs
 
 # Fraction of a claim's content words that must appear in the cited evidence.
@@ -374,6 +376,8 @@ class ClaimResult:
     # own figure phrased in a way these patterns do not recognise. Its citations, figures, versions,
     # variants and negations all passed, so its meaning can be judged instead (RAGService._judge).
     wording_only: bool = False
+    # States a figure arithmetic produced (recomputed, or one step on the question's and evidence's figures).
+    arithmetic: bool = False
 
 
 def _content_words(text: str) -> set[str]:
@@ -714,6 +718,7 @@ def validate_claims(
     given_values |= {f"{f.value} {unit}" for f in given if f.kind == "number" for unit in ("year", "month", "day")}
     premises = premise_values(without_version_refs(question))  # "the policy says the rate is 2%": correct only
     results = []
+    carried: set[Decimal] = set()  # results earlier claims of this answer established
     for raw in raw_claims:
         text = _DANGLING_MARK.sub("", " ".join(_CITATION_MARKS.sub("", str(raw.get("text", ""))).split()))
         cited = [e for e in dict.fromkeys(raw.get("evidence_ids") or []) if isinstance(e, str)]
@@ -762,12 +767,23 @@ def validate_claims(
         derived = [f for f in facts if f not in stated and _derived(f, evidence_facts, given)]
         # The result (or a step) of a calculation recomputed over the evidence this claim cites.
         mine = [c for c in calculations or () if set(c.evidence_ids) & set(known)]
-        # ... or of one the claim writes out itself ("₹35,000 / ₹60,000 × 100 = 58.33%"), recomputed the same way.
-        written = written_arithmetic(text, figures_in(question) | figures_in(cited_text))
+        # ... or of one the claim writes out itself ("₹35,000 / ₹60,000 × 100 = 58.33%"), recomputed the same way,
+        # which may build on a result an earlier claim of this answer established ("Rs 60,000 − Rs 25,000").
+        grounded = figures_in(question) | figures_in(cited_text) | carried
+        written = written_arithmetic(text, grounded)
+        derived += [f for f in facts if f not in stated and f not in derived and (n := _number(f)) is not None
+                    and _from_carried(n, carried, given)]
         computed = [f for f in facts if f not in stated and f not in derived and (n := _number(f)) is not None
-                    and ((mine and any(matches(n, c) for c in mine)) or any(near(n, v) for v in written))]
+                    and ((mine and any(matches(n, c, raw=f.raw, approximate=approximate_before(text, f.start))
+                                       for c in mine))
+                         or any(states_value(f.raw, n, v, approximate=approximate_before(text, f.start))
+                                for v in written))]
         applied = False  # the claim applies a rule to the reader's own figure
         hard = False  # a failure no rewording explains (see ClaimResult.wording_only)
+        if wrong := wrong_arithmetic(text, grounded):
+            # "63,815 × 60 = 63,81,480": a false equation is false however true each of its figures is.
+            result.valid, hard = False, True
+            result.problems.append(f"the calculation {wrong[0]} is wrong")
         for fact in facts:
             result.numbers_checked += 1
             if fact in stated or fact in derived or fact in computed:
@@ -830,5 +846,27 @@ def validate_claims(
             result.valid, hard = False, True
             result.problems.append("reverses the negation of the source sentence")
         result.wording_only = not result.valid and not hard
+        result.arithmetic = bool(derived or computed)
+        if result.valid:
+            # What this claim established may be a step for the next: "50% of Rs 1,20,000 is Rs 60,000."
+            carried |= {n for f in derived + computed if (n := _number(f)) is not None}
         results.append(result)
     return results
+
+
+def _from_carried(value: Decimal, carried: set[Decimal], given: list) -> bool:
+    """One step on a result an earlier claim established: "Rs 60,000 − Rs 25,000 leaves Rs 35,000", with Rs
+    60,000 established earlier and Rs 25,000 the question's figure (or another established result)."""
+    if not carried:
+        return False
+    others = list(carried) + [m[1] for f in given if (m := _magnitude(f)) and m[0] in ("value", "percent")]
+    for a in carried:
+        for b in others:
+            if b == a:
+                continue
+            candidates = [a + b, abs(a - b), a * b]
+            if b:
+                candidates.append(a / b)
+            if any(abs(value - c) <= Decimal("0.5") for c in candidates):
+                return True
+    return False

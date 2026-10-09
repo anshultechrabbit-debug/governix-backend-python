@@ -45,13 +45,40 @@ def asks_for_calculation(question: str) -> bool:
 
 def leads_with_result(text: str, calculation: "Calculation") -> bool:
     """The direct answer must state the output, not merely repeat an operand in Calculation.values."""
-    facts = extract_numeric_facts(text)
+    facts = [f for f in extract_numeric_facts(text) if f.kind != "date"]
     if not facts:
         return False
+    first = facts[0]
     try:
-        return near(Decimal(facts[0].value.partition(" ")[0]), calculation.result)
+        value = Decimal(first.value.partition(" ")[0])
     except InvalidOperation:
         return False
+    approximate = approximate_before(text, first.start)
+    return (states_value(first.raw, value, calculation.result, approximate=approximate)
+            or (first.kind == "percent" and states_value(first.raw, value, calculation.result * 100,
+                                                          approximate=approximate)))
+
+
+def final_calculation(content: dict, evidence: dict, question: str) -> "Calculation | None":
+    """The calculation that answers the question, recomputed, with a claim citing its evidence that states
+    its result: the last one the model listed in "calculations" (only when every listed one checks out: a
+    failed final step never falls back on an earlier one), or else the last one a claim writes out itself
+    ("Rs 1,20,000 × 50% − Rs 25,000 = Rs 35,000"). None when neither is there."""
+    claims = [c for c in content.get("claims") or [] if isinstance(c, dict)]
+    if not claims:
+        return None
+    raw = content.get("calculations")
+    checked = checked_calculations(raw, evidence, question)
+    candidates = []
+    if checked and isinstance(raw, list) and len(checked) == len(raw):
+        candidates.append(checked[-1])
+    if written := calculations_in(claims, evidence, question):
+        candidates.append(written[-1])
+    for final in candidates:
+        if any(set(final.evidence_ids).issubset(c.get("evidence_ids") or [])
+               and states_result(str(c.get("text") or ""), final) for c in claims):
+            return final
+    return None
 
 
 def has_calculated_answer(content: dict, evidence: dict, question: str) -> bool:
@@ -59,15 +86,7 @@ def has_calculated_answer(content: dict, evidence: dict, question: str) -> bool:
 
     Claim order and an optional summary are presentation, not proof of arithmetic.
     """
-    raw = content.get("calculations")
-    checked = checked_calculations(raw, evidence, question)
-    claims = content.get("claims") or []
-    # Never silently use a preceding step when the requested final step failed verification.
-    if not checked or len(checked) != len(raw) or not claims:
-        return False
-    final = checked[-1]
-    return any(set(final.evidence_ids).issubset(claim.get("evidence_ids") or [])
-               and states_result(str(claim.get("text") or ""), final) for claim in claims)
+    return final_calculation(content, evidence, question) is not None
 
 
 def states_result(text: str, calculation: "Calculation") -> bool:
@@ -76,7 +95,9 @@ def states_result(text: str, calculation: "Calculation") -> bool:
         return True
     for match in _WORKED.finditer(text):
         _number, stated, _percent = _figure(match.group(2))
-        if near(stated, calculation.result) and written_arithmetic(match.group(0), set(calculation.values)):
+        approximate = approximate_before(text, match.start(2))
+        if (states_value(match.group(2), stated, calculation.result, approximate=approximate)
+                and written_arithmetic(match.group(0), set(calculation.values))):
             return True
     return False
 
@@ -188,20 +209,37 @@ def _figure(raw: str) -> tuple[Decimal, Decimal, bool]:
     return number, number, False
 
 
-def written_arithmetic(text: str, grounded: set[Decimal]) -> set[Decimal]:
-    """The figures of each calculation a claim writes out ("A × B − C = D") whose stated result is right and
-    whose figures are all grounded (the evidence's, the question's, or a unit conversion): its result and
-    every figure and step in it. Empty when there is none, or it is wrong."""
+@dataclass(frozen=True)
+class _Worked:
+    """One calculation a claim writes out, recomputed."""
+    equation: str  # as written: "Rs. 1,07,767 × 180 months − Rs. 1 crore = Rs. 93,98,060"
+    grounded: bool  # every figure is the evidence's, the question's, a unit conversion or an earlier result
+    right: bool  # the stated result is the recomputed one, to the precision it is written in
+    result: Decimal | None
+    values: frozenset[Decimal]  # every figure, step and result
+
+
+# "650 - 699 is 11.15%", "28 - 65 years": a range written with a hyphen, not a subtraction.
+_RANGE = re.compile(r"^\s*\(?\s*([\d,.]+)\s*[-–]\s*([\d,.]+)\s*\)?\s*$")
+
+
+def _worked(text: str, grounded: set[Decimal]) -> list[_Worked]:
+    """Every calculation written out in `text`, each step able to use the results of the ones before it
+    ("50% × Rs 1,20,000 = Rs 60,000; Rs 60,000 − Rs 25,000 = Rs 35,000")."""
     allowed = grounded | CONSTANTS
-    accepted: set[Decimal] = set()
+    found: list[_Worked] = []
     for match in _WORKED.finditer(text):
-        expression, literals, figures = [], set(), set()
+        run = re.sub(r"(?:₹|\b(?:rs|inr)\b\.?)", "", match.group(1), flags=re.I)
+        if (rng := _RANGE.match(run)) and Decimal(rng.group(1).replace(",", "") or 0) < Decimal(
+                rng.group(2).replace(",", "").rstrip(".") or 0):
+            continue
+        expression, literals, figures, grounded_here = [], set(), set(), True
         try:
             for figure, operator_word, bracket in _WORKED_TOKEN.findall(match.group(1)):
                 if figure:
                     number, value, percent = _figure(figure)
                     if number not in allowed and value not in allowed and not (percent and value / 100 in allowed):
-                        raise _Rejected(f"{figure} is not a figure of the evidence or the question")
+                        grounded_here = False
                     literal = value / 100 if percent else value
                     expression.append(f"({literal})")
                     literals.add(literal)
@@ -217,10 +255,51 @@ def written_arithmetic(text: str, grounded: set[Decimal]) -> set[Decimal]:
             result = _evaluate(ast.parse(" ".join(expression), mode="eval").body, literals, values, [])
         except (SyntaxError, KeyError, _Rejected, InvalidOperation, DivisionByZero, ZeroDivisionError, RecursionError):
             continue
+        approximate = approximate_before(text, match.start(2))
+        raw = match.group(2)
         # "35,000 / 60,000 = 58.33%" or "× 100 = 58.33%": a share written as a percentage.
-        if near(stated, result) or (stated_percent and (near(stated, result * 100) or near(stated / 100, result))):
-            accepted |= figures | literals | values | {result, stated, stated_number}
-    return accepted
+        right = (states_value(raw, stated, result, approximate=approximate)
+                 or (stated_percent and (states_value(raw, stated, result * 100, approximate=approximate)
+                                         or near(stated / 100, result))))
+        found.append(_Worked(" ".join(match.group(0).split()), grounded_here, right, result,
+                             frozenset(figures | literals | values | {result, stated, stated_number})))
+        if grounded_here and right:
+            allowed |= {result, stated}  # a later step may use this one's result
+    return found
+
+
+def written_arithmetic(text: str, grounded: set[Decimal]) -> set[Decimal]:
+    """The figures of each calculation a claim writes out ("A × B − C = D") whose stated result is right and
+    whose figures are all grounded (the evidence's, the question's, or a unit conversion): its result and
+    every figure and step in it. Empty when there is none, or it is wrong."""
+    return set().union(*(w.values for w in _worked(text, grounded) if w.grounded and w.right))
+
+
+def wrong_arithmetic(text: str, grounded: set[Decimal]) -> list[str]:
+    """The calculations a claim writes out over grounded figures whose stated result is not the recomputed
+    one ("63,815 × 60 = 63,81,480", "53,883 × 180 = 97,00,940"): a false statement however true each
+    figure in it is."""
+    return [w.equation for w in _worked(text, grounded) if w.grounded and not w.right]
+
+
+def calculations_in(claims: list, evidence: dict, question: str) -> list[Calculation]:
+    """The calculations the claims write out themselves, right and grounded in the question and the evidence
+    each claim cites: the answer's arithmetic when the model put it in its sentences, not in
+    "calculations". In claim order, so the last is the final step."""
+    asked = figures_in(question)
+    found = []
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        ids = tuple(dict.fromkeys(e for e in claim.get("evidence_ids") or [] if isinstance(e, str) and e in evidence))
+        if not ids:
+            continue
+        grounded = asked | set().union(*(figures_in(evidence[e].text) for e in ids))
+        for worked in _worked(str(claim.get("text") or ""), grounded):
+            if worked.grounded and worked.right and worked.result is not None:
+                found.append(Calculation(result=worked.result, values=worked.values, evidence_ids=ids,
+                                         shown=worked.equation))
+    return found
 
 
 def _evaluate(node: ast.AST, grounded: set[Decimal], values: set[Decimal], used: list[Decimal]) -> Decimal:
@@ -272,6 +351,42 @@ def near(value: Decimal, target: Decimal) -> bool:
     return abs(value - target) <= max(Decimal("0.01"), abs(target) * TOLERANCE)
 
 
-def matches(value: Decimal, calculation: Calculation) -> bool:
-    """A figure a claim states is the calculation's result, or one of its steps, perhaps rounded."""
-    return any(near(value, v) for v in calculation.values)
+# "about Rs 93.98 lakh", "approximately 54%", "~Rs 2,425": a figure its writer marks as rounded.
+_APPROXIMATE = re.compile(r"(?:\babout|\bapproximately|\bapprox\.?|\broughly|\baround|\bnearly|~)\s*(?:₹|rs\.?|inr)?\s*$",
+                          re.I)
+
+
+def step_of(raw: str) -> Decimal:
+    """The smallest difference a figure as written can show: "Rs. 96,98,940" -> 1, "93.98 lakh" -> 1000,
+    "58.33%" -> 0.01."""
+    match = _FIGURE_PARTS.match(raw.strip())
+    if not match:
+        return Decimal(1)
+    digits = match.group(1).replace(",", "")
+    step = Decimal(1).scaleb(-len(digits.partition(".")[2]))
+    unit = " ".join(match.group(2).lower().split())
+    for word, scale in _SCALE:
+        if unit.startswith(word):
+            return step * scale
+    return step
+
+
+def states_value(raw: str, value: Decimal, target: Decimal, *, approximate: bool = False) -> bool:
+    """A figure written as `raw` (worth `value`) states `target`: to the precision it is written in, give or
+    take its last digit's rounding ("Rs. 52,971" for 52,971.2, "93.98 lakh" for 93,98,060), or within 0.5%
+    when its writer marks it as approximate. "Rs. 97,00,940" does not state 96,98,940."""
+    if approximate:
+        return near(value, target)
+    return abs(value - target) <= step_of(raw) + Decimal("0.005")
+
+
+def approximate_before(text: str, start: int) -> bool:
+    return bool(_APPROXIMATE.search(text[max(0, start - 20):start]))
+
+
+def matches(value: Decimal, calculation: Calculation, *, raw: str | None = None, approximate: bool = False) -> bool:
+    """A figure a claim states is the calculation's result, or one of its steps: rounded no further than it is
+    written ("93.98 lakh"), or within 0.5% when marked approximate. Without `raw`, within 0.5%."""
+    if raw is None:
+        return any(near(value, v) for v in calculation.values)
+    return any(states_value(raw, value, v, approximate=approximate) for v in calculation.values)

@@ -47,7 +47,7 @@ from app.modules.documents.model import Document, DocumentStatus
 from app.modules.policies.model import Policy, PolicyStatus, PolicyVersion, VersionStatus
 from app.modules.rag.claim_stream import ClaimStream
 from app.modules.rag.calculate import (
-    Calculation, asks_for_calculation, checked_calculations, has_calculated_answer, states_result, near,
+    Calculation, asks_for_calculation, checked_calculations, final_calculation, states_result, near,
 )
 from app.modules.rag.injection import strip_instructions
 from app.modules.rag.evidence import (
@@ -57,9 +57,10 @@ from app.modules.rag.evidence import (
 )
 from app.infrastructure.ai.llm.local import LocalLLM
 from app.modules.rag.prompts import (
-    MEANING_CHECK_PROMPT, MEANING_CHECK_SCHEMA, OUTPUT_SCHEMA, SUMMARY_CHECK_PROMPT, SUMMARY_CHECK_SCHEMA, SYSTEM_PROMPT,
+    MEANING_CHECK_PROMPT, MEANING_CHECK_SCHEMA, OUTPUT_SCHEMA, REASONING_CHECK_PROMPT, REASONING_CHECK_SCHEMA,
+    SUMMARY_CHECK_PROMPT, SUMMARY_CHECK_SCHEMA, SYSTEM_PROMPT,
     TRANSLATE_PROMPT, TRANSLATE_SCHEMA,
-    build_user_prompt, comparison_text,
+    COMPUTE_PROMPT, COMPUTE_SCHEMA, build_user_prompt, comparison_text, evidence_block,
 )
 from app.modules.rag.query_plan import COMPARISON_WORDS, QueryClass, QueryPlan, normal_label, plan_query, version_mentions, without_version_refs
 from app.modules.rag.select import (
@@ -169,7 +170,12 @@ HISTORY_KEY_CHARS = 300
 #   v62    accept verified working before its result and decimal percentages; order the verified
 #          result claim first, and retain it when an optional summary fails validation
 #   v63    worked percentages and decimal-rate expressions share the same grounded value
-ANSWER_CACHE_VERSION = "v63"
+#   v64    reasoning accuracy: working written in a claim counts as the calculation; figures compared at the
+#          precision written; false equations removed; results chain across claims; method and Yes/No checked
+#          (_check_reasoning) with one retry; change-over-time questions read every version; third-person cases
+#   v65    a calculation answer that never works out the figure gets one short compute call (_computed_answer);
+#          dates are not terms; "Q." / "Q63:" labels dropped
+ANSWER_CACHE_VERSION = "v65"
 # No supported answer in the version in force: worth looking one version back.
 # Earlier versions answer only what the version in force does not cover. An answer it gave that the
 # checks then withheld (ANSWER_FAILED_VALIDATION, ANSWER_OFF_TOPIC) means it covers the subject:
@@ -503,6 +509,10 @@ class RAGService:
         self._named_policies: dict[str, list[uuid.UUID]] = {}
         # Instructions to the assistant found in the question and set aside (rag/injection.py).
         self._ignored_instructions: list[str] = []
+        # What the reasoning check found wrong in the last attempt, for its one retry (_check_reasoning).
+        self._reasoning_feedback = ""
+        # The last attempt answered a calculation question without working out the figure (_computed_answer).
+        self._missing_calculation = False
 
     # --- public -----------------------------------------------------------------
 
@@ -673,6 +683,9 @@ class RAGService:
                 turn.model_copy(update={"question": strip_instructions(turn.question)[0],
                                         "answer": strip_instructions(turn.answer)[0] if turn.answer else turn.answer})
                 for turn in request.history]})
+        if (unlabelled := _QUESTION_LABEL.sub("", request.question, count=1)) != request.question and has_words(unlabelled):
+            # "Q. For a loan ...", "Q63: What is ...": a test sheet's numbering, not part of the question.
+            request = request.model_copy(update={"question": unlabelled})
         if (plain := from_form(request.question)) != request.question:
             # "Age: 35 / Income: ₹60,000 / Version: 6 / Question: ...": the reader's case and the question as
             # one message ("My age is 35 and ... Do I ... in Version 6?").
@@ -898,9 +911,11 @@ class RAGService:
         timings: dict[str, float], started: float,
     ) -> Generator[tuple[str, Any], None, AnswerResponse]:
         """Generate the answer from `evidence`, streaming each claim once the answer is on topic."""
-        if asks_for_calculation(request.question):
+        if checks_reasoning(request.question):
             # An operand is a grounded number too, but must never flash as the answer while the
-            # requested result is still being calculated. Check the whole response before showing it.
+            # requested result is still being calculated; nor may a conclusion about the reader's case
+            # ("Yes, you qualify") show before its reasoning is checked. Check the whole response first.
+            computed_once = False
             for correction in (False, True):
                 attempt.llm_result = None
                 for part in self._generate_stream(principal, request, plan, evidence, correction=correction):
@@ -909,7 +924,20 @@ class RAGService:
                 try:
                     return self._validated_answer(principal, request, plan, evidence, attempt.llm_result)
                 except _NoAnswer as exc:
-                    if correction or exc.reason != "ANSWER_FAILED_VALIDATION":
+                    if exc.reason != "ANSWER_FAILED_VALIDATION":
+                        raise
+                    if getattr(self, "_missing_calculation", False) and not computed_once and attempt.llm_result:
+                        # The answer gave the rule but never worked out the figure ("The maximum FOIR is 50%"):
+                        # one short call that only does that, checked exactly like any answer.
+                        computed_once, self._missing_calculation = True, False
+                        if (computed := self._computed_answer(request.question, plan, evidence, attempt.llm_result)):
+                            attempt.llm_result = computed
+                            try:
+                                return self._validated_answer(principal, request, plan, evidence, computed)
+                            except _NoAnswer as again:
+                                if again.reason != "ANSWER_FAILED_VALIDATION":
+                                    raise
+                    if correction:
                         raise
             raise _NoAnswer("ANSWER_FAILED_VALIDATION")
         # Claims are held back until together they are on topic: the final answer
@@ -1371,6 +1399,69 @@ class RAGService:
         missing = [t for t in weights if t in set(evidence.missing_terms)]
         return 1 - sum(weights[t] for t in missing) / total, missing
 
+    def _computed_answer(self, question: str, plan: QueryPlan, evidence: EvidenceSet, previous: LLMResult) -> LLMResult | None:
+        """The answer worked out by a short call that does only that: the expression and the result sentence
+        for the rule the evidence states and the question's figures, with the previous attempt's other claims
+        (the rule, the inputs) after it. None when the model gives no calculation or is unavailable. It is
+        checked exactly like any answer (recomputed, grounded, validated, reasoning checked)."""
+        fenced = question.replace("<<<", "‹‹‹").replace(">>>", "›››")
+        passages = "\n\n".join(evidence_block(item) for item in evidence.items)
+        try:
+            result = self._llm_factory().generate_json(
+                COMPUTE_PROMPT,
+                f"Question:\n<<<\n{fenced}\n>>>\n\nAnswer scope: {plan.explanation}.\n\nEvidence:\n\n{passages}",
+                COMPUTE_SCHEMA, context={"task": "compute"},
+            )
+        except LLMUnavailableError:
+            return None
+        content = result.content or {}
+        expression = " ".join(str(content.get("expression") or "").split())
+        claim = " ".join(str(content.get("claim") or "").split())
+        ids = [e for e in content.get("evidence_ids") or [] if isinstance(e, str)]
+        if not expression or not claim or not ids:
+            return None
+        earlier = previous.content or {}
+        return LLMResult(
+            content={
+                "insufficient_evidence": False,
+                "calculations": [{"expression": expression, "evidence_ids": ids}],
+                "claims": [{"text": claim, "evidence_ids": ids}]
+                + [c for c in earlier.get("claims") or [] if isinstance(c, dict)],
+                "summary": " ".join(str(content.get("summary") or "").split()),
+                "conflicts": earlier.get("conflicts") or [],
+            },
+            model=result.model, input_tokens=(result.input_tokens or 0) + (previous.input_tokens or 0),
+            output_tokens=(result.output_tokens or 0) + (previous.output_tokens or 0),
+        )
+
+    def _check_reasoning(self, question: str, valid: list, texts: dict[str, EvidenceText],
+                         final: Calculation | None) -> tuple[bool, str] | None:
+        """(right, what is wrong) for an answer that applies the documents' rules to the question's case: the
+        method (the right rule or formula, used completely on the question's figures, giving the quantity
+        asked for) and the conclusion (every Yes/No or within/exceeds follows from the figures). One model
+        call. None, so the answer stands on its recomputed arithmetic, when the check is off or no model
+        gives a verdict."""
+        if not valid or not getattr(self.settings, "RAG_MEANING_CHECK", False):
+            return None
+        cited = list(dict.fromkeys(e for r in valid for e in r.evidence_ids if e in texts))
+        statements = "\n".join(f"- {r.text}" for r in valid)
+        passages = "\n\n".join(f"({e}) {texts[e].text}" for e in cited)
+        message = f"Question: {question}\n\nAnswer statements:\n{statements}"
+        if final is not None:
+            message += f"\n\nFinal calculation (recomputed, arithmetic correct): {final.shown}"
+        try:
+            check = self._llm_factory().generate_json(
+                REASONING_CHECK_PROMPT, f"{message}\n\nPassages:\n{passages}", REASONING_CHECK_SCHEMA,
+                context={"task": "reasoning_check"},
+            )
+        except LLMUnavailableError:
+            return None
+        content = check.content or {}
+        if not isinstance(content.get("method_correct"), bool) or not isinstance(content.get("conclusion_consistent"), bool):
+            return None  # the quoting stand-in, or a malformed reply: no verdict
+        right = content["method_correct"] and content["conclusion_consistent"]
+        return right, " ".join(str(content.get("correction") or "").split())[:400]
+
     def _judge(self, question: str, results: list, texts: dict[str, EvidenceText]) -> dict[int, tuple[bool, bool]]:
         """(supported, answers) for each claim, judged by meaning in one model call, keyed by id(claim).
 
@@ -1492,13 +1583,19 @@ class RAGService:
             if evidence.comparison:
                 context_items.insert(0, {"id": "D1", "text": comparison_text(evidence.comparison)})
             prompt = build_user_prompt(question, plan, evidence)
-            if correction:
+            if correction and asks_for_calculation(question):
                 prompt += ("\n\nThe previous attempt failed calculation validation. Recompute from the original "
                            "case inputs and the applicable cited rule. Put the full expression for the requested "
                            "quantity last in calculations. Start the first claim and summary with that result "
                            "and its unit, before showing the working. An existing obligation, original amount, "
                            "or intermediate cap is not the requested result. Do not copy an input as the answer. "
                            "If the rule or necessary inputs are unavailable, set insufficient_evidence true.")
+            elif correction:
+                prompt += ("\n\nThe previous attempt's reasoning failed the check. Apply each cited rule to the "
+                           "question's figures completely and state only the conclusion that follows from them.")
+            if correction and getattr(self, "_reasoning_feedback", ""):
+                # What the reasoning check found wrong in the previous attempt.
+                prompt += f"\nThe reasoning check found: {self._reasoning_feedback}"
             for part in llm.stream_json(
                 SYSTEM_PROMPT, prompt, OUTPUT_SCHEMA,
                 context={"question": question, "evidence": context_items, "conflicts": evidence.conflicts},
@@ -1664,8 +1761,11 @@ class RAGService:
             # The model read the evidence and found no answer in it. Claims it wrote anyway are about
             # something nearby (the home loan LTV for a gold loan question): true, but not an answer.
             raise _NoAnswer("INSUFFICIENT_EVIDENCE")
-        if asks_for_calculation(request.question) and not has_calculated_answer(content, texts, request.question):
+        # The calculation that answers: listed in "calculations", or written out in a claim; recomputed either way.
+        final = final_calculation(content, texts, request.question) if asks_for_calculation(request.question) else None
+        if asks_for_calculation(request.question) and final is None:
             logger.info("Calculation answer withheld: no cited claim states the recomputed final result")
+            self._missing_calculation = True  # _write then asks for the calculation alone
             raise _NoAnswer("ANSWER_FAILED_VALIDATION")
         # "How much total interest on Rs 1 crore over 15 years?": arithmetic the model wrote, recomputed.
         calculations = checked_calculations(content.get("calculations"), texts, request.question)
@@ -1723,15 +1823,25 @@ class RAGService:
             # Several versions read together (the earlier-version fallback): the newest one that states
             # the rule answers; an older wording of it is not the current rule.
             valid = _newest_claims(valid, items, key_terms(self._subject(request.question)))
-        if asks_for_calculation(request.question):
-            final = calculations[-1]
+        if final is not None:
             result_claims = [r for r in valid if set(final.evidence_ids).issubset(r.evidence_ids)
                              and states_result(r.text, final)]
             if not result_claims:
                 logger.info("Calculation result failed claim validation: %s", checks)
                 raise _NoAnswer("ANSWER_FAILED_VALIDATION")
-            # Lead with the checked answer, even when the model wrote the rule or inputs first.
-            valid = result_claims + [r for r in valid if r not in result_claims]
+            # Lead with the checked answer, even when the model wrote the rule or inputs first; state it once,
+            # preferring the claim that shows its working ("... is Rs 20,000: 50% × Rs 60,000 − Rs 10,000 = ...").
+            result_claims.sort(key=lambda r: "=" not in r.text)
+            valid = result_claims[:1] + [r for r in valid if r not in result_claims]
+        if checks_reasoning(request.question):
+            # The arithmetic is recomputed, but not whether it is the right arithmetic ("50% × Rs 1,20,000" for
+            # the most permissible EMI, leaving out Rs 25,000 of existing EMIs), nor whether a "Yes" follows
+            # from the figures beside it. One check by meaning; a wrong method is retried once (see _write).
+            verdict = self._check_reasoning(request.question, valid, texts, final)
+            if verdict is not None and not verdict[0]:
+                self._reasoning_feedback = verdict[1]
+                logger.info("Reasoning check failed: %s", verdict[1])
+                raise _NoAnswer("ANSWER_FAILED_VALIDATION")
         numbering: dict[str, int] = {}
         for result in valid:
             for evidence_id in result.evidence_ids:
@@ -1742,10 +1852,12 @@ class RAGService:
             claims.append(computed)
             checks.append("Computed the difference from the two cited figures")
         for calculation in _calculations_used(calculations, claims, numbering):
+            checks.append(f"Recomputed {calculation.shown}")
+            if any("=" in c.text and states_result(c.text, calculation) for c in claims):
+                continue  # a claim already shows this working
             # The arithmetic behind a figure no document prints, shown so the reader can check it.
             claims.append(Claim(text=f"Calculation: {calculation.shown}.",
                                 citations=[numbering[e] for e in calculation.evidence_ids if e in numbering]))
-            checks.append(f"Recomputed {calculation.shown}")
         if self.settings.RAG_ANSWER_MODE == "select":
             # What a writing model would have said around the quoted rules.
             if premise := premise_claim(request.question, claims):
@@ -1786,10 +1898,9 @@ class RAGService:
             warnings.append(f"This answer does not check {' or '.join(unchecked)} from your question, so it may "
                             "be incomplete. Ask about it on its own before relying on the answer.")
             summary = None
-        if asks_for_calculation(request.question):
+        if final is not None:
             # The final result claim must survive every existing rule/citation check too. A valid
             # calculation in the preamble cannot rescue an answer whose actual result was removed.
-            final = calculations[-1]
             if not claims or not states_result(claims[0].text, final):
                 raise _NoAnswer("ANSWER_FAILED_VALIDATION")
             if summary and not states_result(summary, final):
@@ -2280,6 +2391,19 @@ def _names_clause(text: str, clause: str) -> bool:
 
 
 _CLAIM_WORD = re.compile(r"[a-z][a-z0-9]{2,}")
+
+
+# A question's own label: "Q. ...", "Q63: ...", "Question 4) ...", "12. ...".
+_QUESTION_LABEL = re.compile(r"^\s*(?:q(?:uestion)?\s*\d{0,4}\s*[.:)\-]|\d{1,3}\s*[.)])\s+", re.I)
+
+
+def checks_reasoning(question: str) -> bool:
+    """The answer applies the documents' rules to a case the question states with figures ("What is the
+    maximum permissible EMI for income Rs 1,20,000 and obligations Rs 25,000?", "Is age 25 eligible?", "I
+    earn Rs 70,000 and pay Rs 20,000 in EMIs. Can I take a new EMI of Rs 16,000?"): its method and its
+    conclusion are checked before it is shown (RAGService._check_reasoning)."""
+    return asks_for_calculation(question) or (
+        applies_to_reader(question) and any(f.kind != "date" for f in extract_numeric_facts(question)))
 
 
 def _calculations_used(calculations: list[Calculation], claims: list[Claim], numbering: dict[str, int]) -> list[Calculation]:

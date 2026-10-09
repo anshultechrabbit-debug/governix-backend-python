@@ -23,8 +23,8 @@ from app.modules.categories.model import Category
 from app.modules.citations.numerics import extract_numeric_facts, sentence_at
 from app.modules.rag.injection import strip_instructions
 from app.modules.rag.query_plan import (
-    COMPARISON_WORDS, PERIOD_WORDS, WHEN_INTRODUCED_WORDS, asks_when_introduced, asks_which_period, compares_versions,
-    without_version_refs,
+    COMPARISON_WORDS, OVER_TIME_WORDS, PERIOD_WORDS, WHEN_INTRODUCED_WORDS, asks_over_time, asks_when_introduced,
+    asks_which_period, compares_versions, without_version_refs,
 )
 from app.modules.rag.validation import TermIndex
 from app.modules.documents.model import Document, DocumentStatus
@@ -130,6 +130,8 @@ QUESTION_TERMS = frozenset(
     # 'authority', 'sanction') — those must remain as gate terms so evidence is actually checked.
     # Only add words the reader uses to frame the ask that no evidence passage is expected to contain.
     "whose anyone timeline "
+    # how to work the answer out ("Using the policy FOIR cap, what is ..."): the rule it names is the subject
+    "using "
     # Advice and judgement ("should I", "which is better", "is it worth it", "what do you recommend"): how
     # the reader wants the options weighed, not what they are. The answer gives what the documents say
     # about each option; the documents are not expected to use these words.
@@ -143,7 +145,9 @@ QUESTION_TERMS = frozenset(
     "fast faster fastest quicker soon sooner speed speedy turnaround tat "
     # Asking for more of the same subject ("what additional documents", "any extra charges", "what else"):
     # the subject is the word they qualify, which stays a term; the documents simply list the items.
-    "additional additionally extra further else".split()
+    "additional additionally extra further else "
+    # How the answer is to be worked out ("under the policy formula"): the rule it names is the subject.
+    "formula formulas".split()
 )
 # "Do I meet the minimum-income criterion?", "Am I eligible?", "Do I satisfy the EMI condition?": when the
 # question states the reader's own case, these words ask for the yes or no of applying a rule to it, and
@@ -164,6 +168,8 @@ READER_OUTCOME_WORDS = frozenset(
 CLOSED_CLASS_TERMS = frozenset(
     # auxiliary verbs the search's stop words miss ("which period had ...", "were they ...")
     "had were been "
+    # personal pronouns: "Is he eligible?" names a person the case already described
+    "he she him her his hers they them theirs "
     # quantifiers, determiners
     "all any both each either every neither none other another such same own whole entire several "
     "few more most less least only also "
@@ -238,6 +244,8 @@ def key_terms(question: str) -> list[str]:
         framing = framing | COMPARISON_WORDS | WHEN_INTRODUCED_WORDS
     if asks_which_period(question):  # "Which period had the lowest EMI?": the subject is the EMI
         framing = framing | PERIOD_WORDS
+    if asks_over_time(question):  # "Has the late payment penalty increased?": the subject is the penalty
+        framing = framing | OVER_TIME_WORDS | PERIOD_WORDS | COMPARISON_WORDS
     if applies_to_reader(question):  # "If my income is Rs 49,000, do I meet the criterion?"
         framing = framing | READER_OUTCOME_WORDS
     question = without_version_refs(question)
@@ -245,12 +253,15 @@ def key_terms(question: str) -> list[str]:
     return [
         t for t in query_terms(question)
         if t not in GENERIC_TERMS and t not in QUESTION_TERMS and t not in CLOSED_CLASS_TERMS and t not in framing
-        and t not in given and not _HYPHENATED_FIGURE.fullmatch(t) and (not t.isdigit() or len(t) >= 2)
+        and t not in given and not _HYPHENATED_FIGURE.fullmatch(t) and not _DATE_TOKEN.fullmatch(t)
+        and (not t.isdigit() or len(t) >= 2)
     ]
 
 
 # "a 25-year loan", "a 60-day notice": a figure the reader states, as one word.
 _HYPHENATED_FIGURE = re.compile(r"\d+(?:\.\d+)?[-/](?:years?|months?|weeks?|days?|yrs?|annum|mo)", re.I)
+# "2019-08-15", "15/08/2019", "15-08-19": a date chooses the version in force; no passage repeats it.
+_DATE_TOKEN = re.compile(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}")
 
 
 def _readers_figures(question: str) -> set[str]:
@@ -276,7 +287,13 @@ _CONDITION = re.compile(
     re.I,
 )
 _ABOUT_READER = re.compile(
-    r"^\s*(?:and\s+|also\s+)?(?:i|i'm|i’m|im|i've|i’ve|i'd|i’d|my|we|we're|we’re|our|as\s+an?)\b", re.I
+    r"^\s*(?:and\s+|also\s+)?(?:i|i'm|i’m|im|i've|i’ve|i'd|i’d|my|we|we're|we’re|our|as\s+an?"
+    # A case told in the third person: "A borrower has net monthly income Rs 1,20,000 ...", "An applicant
+    # aged 27 earns ...". Not a rule about such a person ("The borrower must submit ...").
+    r"|(?:a|an|the|this|one)\s+(?:borrower|applicant|co-applicant|customer|client|person|individual|employee|"
+    r"guarantor|nri|salaried\s+\w+|self-employed\s+\w+)s?\b"
+    r"(?!\s+(?:must|shall|should|may|needs?\s+to|has\s+to|is\s+required|are\s+required)\b))\b",
+    re.I,
 )
 # A clause that asks rather than tells: "can I get a loan", "what rate applies". It ends the reader's
 # situation ("I am 27, earn Rs 65,000, can I get a loan?").

@@ -35,8 +35,30 @@ _COMPARE = re.compile(
 # "the unreconciled position difference" or "changes in address" are subjects of a rule.
 _VERSION_CONTEXT = re.compile(
     r"\b(?:versions?|latest|previous|earlier|older|newer|current|revised|revision|amended|amendment|"
-    r"updated|update|last\s+year|over\s+time|edition)\b",
+    r"updated|update|last\s+year|over\s+time|edition|recently|most\s+recent)\b",
     re.I,
+)
+# "Has the late payment penalty increased?", "What was the lowest rate ever offered?", "Is the tenure shorter now
+# than before?", "Compare the fee then and now": how something moved across the versions. The version in
+# force alone says only where it is now.
+_OVER_TIME = re.compile(
+    r"\bover\s+(?:time|the\s+years|the\s+versions|the\s+editions)\b"
+    r"|\b(?:lowest|highest|cheapest|costliest|best|worst|maximum|minimum|longest|shortest|largest|smallest)\b"
+    r"[^?.]{0,40}\bever\b"
+    r"|\bever\s+(?:been|offered|charged|allowed|lower|higher|cheaper)\b"
+    r"|\b(?:than|compared\s+(?:to|with)|versus|vs\.?)\s+(?:before|earlier|previously|in\s+the\s+past|the\s+past|"
+    r"older\s+(?:guides?|versions?|editions?)|(?:the\s+)?earlier\s+(?:guides?|versions?|editions?))\b"
+    r"|\b(?:then\s+and\s+now|now\s+and\s+then|before\s+and\s+(?:after|now)|earlier\s+and\s+now|past\s+and\s+present)\b"
+    r"|\b(?:has|have)\s+(?:the\s+|my\s+|our\s+|your\s+)?(?:[\w-]+\s+){0,5}?(?:gone\s+(?:up|down)|increased|"
+    r"decreased|risen|fallen|dropped|reduced|changed|become\s+\w+)\b"
+    r"|\bhow\s+(?:has|have)\b[^?]{0,60}\b(?:changed|moved|evolved)\b",
+    re.I,
+)
+# Words that ask how something moved, not what it is ("gone up", "than before", "ever").
+OVER_TIME_WORDS = frozenset(
+    "time times ever before earlier previously past now then history historically gone up down increased "
+    "increase decreased decrease risen rose fallen fell dropped reduced changed change become became stricter "
+    "looser evolved moved".split()
 )
 # "... in each edition, and which edition sets the higher figure?": one subject, looked up in
 # every version. The version in force alone can only ever answer for one of them.
@@ -60,7 +82,9 @@ COMPARISON_WORDS = frozenset(
     "amended amendment amendments updated update updates over time year years two both same "
     # what happened to a rule ("introduced", "removed"), and how the policy moved ("became stricter")
     "introduced introduce added removed deleted dropped withdrawn inserted original originally "
-    "became become becomes strict stricter strictness lenient looser loose tighter tightened relaxed evolved".split()
+    "became become becomes strict stricter strictness lenient looser loose tighter tightened relaxed evolved "
+    # when ("what changed most recently?")
+    "recently recent".split()
 )
 # "When did the 50% EMI-to-income rule start?", "Since when is Flexi-EMI offered?", "When was the fee
 # raised?", "Which version first added ...?": when something appeared, changed or ended. The version in
@@ -167,6 +191,10 @@ def plan_query(
     if not labels and _ACROSS.search(question):
         return QueryPlan(QueryClass.ACROSS_VERSIONS, "all",
                          explanation="Question asks about every version; each passage is labelled with its version")
+    if not labels and asks_over_time(question) and not (_COMPARE.search(question) and _VERSION_CONTEXT.search(question)):
+        return QueryPlan(QueryClass.ACROSS_VERSIONS, "all",
+                         explanation="Question asks how something changed over time; every version is searched, "
+                                     "oldest first, each passage labelled with its version")
     if not labels and asks_which_period(question):
         return QueryPlan(QueryClass.ACROSS_VERSIONS, "all",
                          explanation="Question asks which period had a figure; every version is searched, oldest "
@@ -230,6 +258,11 @@ def normal_label(label: str) -> str:
 def asks_when_introduced(question: str) -> bool:
     """ "When did the 50% EMI-to-income rule start?", "Since when is Flexi-EMI offered?"."""
     return bool(_WHEN_INTRODUCED.search(question))
+
+
+def asks_over_time(question: str) -> bool:
+    """ "Has the penalty increased?", "the lowest rate ever", "shorter now than before", "then and now"."""
+    return bool(_OVER_TIME.search(question))
 
 
 def asks_which_period(question: str) -> bool:

@@ -127,6 +127,40 @@ Where it applies:
 - **Backstop.** Every claim is still checked against the documents, so an injection that slips past
   cannot add an unsupported statement.
 
+## Reasoning accuracy (v64)
+
+Builds on v60-v63's calculation path (the result must be recomputed and lead the answer, with one retry):
+- **Working in a sentence counts.** `calculate.final_calculation` takes the model's last `calculations`
+  entry (when every listed entry checks out), or else the last equation a claim writes itself
+  (`calculations_in`). Both are recomputed and grounded.
+- **Figures are compared at the precision written** (`states_value`): "Rs 96,98,940" must match to the
+  rupee, and "93.98 lakh" to Rs 1,000. "about/approximately ..." keeps the 0.5% margin.
+- **False equations are removed.** A claim containing one ("53,883 × 180 = 97,00,940") is a hard
+  failure (`wrong_arithmetic`). A hyphenated range ("650 - 699") is not read as subtraction.
+- **Results chain.** A claim may use a result an earlier claim established ("50% of Rs 1,20,000 is Rs
+  60,000", then "Rs 60,000 − Rs 25,000 = Rs 35,000"). The same holds within one claim's equations.
+- **Method and conclusion are checked** (`RAGService._check_reasoning`, `REASONING_CHECK_PROMPT`).
+  - Applies to every case question with figures (`checks_reasoning`): calculations, eligibility Yes/No,
+    "can I take a new EMI".
+  - One model call asks whether the right rule was applied completely (no needed input left out, the
+    right row and column, the asked quantity rather than an intermediate cap), and whether every
+    Yes/No follows.
+  - If not, the answer is retried once, with the check's correction in the prompt. Then it is refused.
+  - With no verdict, the recomputed answer stands.
+- **Change over time** ("Has the penalty increased?", "lowest rate ever", "shorter now than before",
+  "then and now") routes to `ACROSS_VERSIONS` (`query_plan.asks_over_time`). The prompt asks for the
+  earliest and latest figures with their versions, and only this document's versions.
+  - "What changed most recently?" goes to the latest-change comparison.
+- **Third-person cases** ("A borrower has ...", "An applicant aged 27 ...") are the reader's case
+  (`_ABOUT_READER`).
+- **Compute call (v65).** gpt-4o-mini often answers a calculation question with only the rule ("The
+  maximum FOIR is 50%"). When an attempt has no recomputable final figure (`_missing_calculation`), one
+  short call (`_computed_answer`, `COMPUTE_PROMPT`) asks only for the expression and a result sentence.
+  The result is validated, recomputed and reasoning-checked like any answer.
+  - The result is stated once, preferring the claim that shows its working. No separate "Calculation:"
+    line is added when a claim already shows it.
+- Dates ("2019-08-15") are never key terms; they choose the version. "Q." / "Q63:" labels are dropped.
+
 ## "Not found" answers (v58)
 
 For the reasons in `NOT_FOUND_REASONS`, `service._explain_not_found` builds the message from what was read:
