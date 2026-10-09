@@ -3,7 +3,9 @@ from decimal import Decimal
 
 import pytest
 
-from app.modules.rag.calculate import asks_for_calculation, checked_calculations, has_calculated_answer
+from app.modules.rag.calculate import (
+    asked_quantity, asks_for_calculation, checked_calculations, has_calculated_answer, restated_result, wrongly_stated,
+)
 from app.modules.rag.claim_stream import ClaimStream
 from app.modules.rag.validation import EvidenceText, validate_claims
 
@@ -323,3 +325,68 @@ def test_wrong_or_ungrounded_arithmetic_is_removed_and_never_judged_by_meaning(c
 
     [result] = validate_claims([{"text": claim, "evidence_ids": ["E3"]}], FAMILY, key_terms(TOTAL), TOTAL)
     assert not result.valid and not result.wording_only
+
+
+FOIR = {"E1": EvidenceText("E1", "3.3 The maximum Fixed Obligation to Income Ratio (FOIR) is 60% of net monthly "
+                                 "income. Maximum permissible EMI = FOIR x net monthly income - existing monthly "
+                                 "obligations.")}
+FOIR_QUESTION = ("A borrower has net monthly income of Rs 200,000 and existing monthly obligations of Rs 65,000. "
+                 "Using the policy FOIR cap, what is the maximum permissible EMI?")
+
+
+@pytest.mark.parametrize("claim, stated", [
+    # The result after its working, in words: the calculation is the field's.
+    ("After subtracting existing obligations of Rs 65,000 from 60% of Rs 2,00,000, the maximum permissible EMI "
+     "is Rs 55,000.", True),
+    ("60% of the Rs 2,00,000 income is Rs 1,20,000; less Rs 65,000 of obligations, the maximum EMI is Rs 55,000.", True),
+    # An operand or an intermediate step is never the result, nor is a figure the recomputation does not give.
+    ("Your existing obligations of Rs 65,000 are deducted from 60% of your income.", False),
+    ("The FOIR cap of 60% on Rs 2,00,000 allows Rs 1,20,000 of EMIs.", False),
+    ("After subtracting Rs 65,000, the maximum permissible EMI is Rs 56,000.", False),
+])
+def test_a_result_stated_after_its_working_counts_but_an_operand_never_does(claim, stated):
+    content = {"calculations": [{"expression": "0.6 * 200000 - 65000", "evidence_ids": ["E1"]}],
+               "claims": [{"text": claim, "evidence_ids": ["E1"]}]}
+    assert has_calculated_answer(content, FOIR, FOIR_QUESTION) is stated
+
+
+@pytest.mark.parametrize("expression", [
+    "0.60 * 200000 - 65000 = 55000",  # the result written into the expression
+    "0.6 * 200000 = 120000 - 65000 = 55000",  # a chain of steps
+    "60% x 2,00,000 - 65,000",  # a percentage sign, "x" and Indian grouping
+])
+def test_an_expression_written_with_its_result_is_recomputed(expression):
+    content = {"calculations": [{"expression": expression, "evidence_ids": ["E1"]}],
+               "claims": [{"text": "The maximum permissible EMI is Rs. 55,000.", "evidence_ids": ["E1"]}]}
+    assert has_calculated_answer(content, FOIR, FOIR_QUESTION)
+
+
+def test_a_wrong_result_written_into_an_expression_is_reported_with_the_right_one():
+    raw = [{"expression": "0.60 × 200000 - 65000 = 65000", "evidence_ids": ["E1"]}]
+    assert not checked_calculations(raw, FOIR, FOIR_QUESTION)
+    [(shown, stated)] = wrongly_stated(raw, FOIR, FOIR_QUESTION)
+    assert shown.endswith("= 55,000") and stated == Decimal("65000")
+
+
+@pytest.mark.parametrize("claims", [
+    [],  # the result never stated
+    ["The maximum permissible EMI is Rs 35,000: 60% × Rs 200,000 − Rs 65,000 = Rs 35,000."],  # arithmetic wrong
+    ["The maximum permissible EMI is Rs. 65,000."],  # an input given as the result
+])
+def test_a_valid_calculation_misstated_by_the_model_is_stated_from_its_recomputation(claims):
+    content = {"calculations": [{"expression": "0.60 * 200000 - 65000", "evidence_ids": ["E1"]}],
+               "claims": [{"text": c, "evidence_ids": ["E1"]} for c in
+                          [*claims, "The maximum FOIR is 60% of net monthly income."]]}
+    restated, final = restated_result(content, FOIR, FOIR_QUESTION)
+    texts = [c["text"] for c in restated["claims"]]
+    assert texts[0] == "The maximum permissible EMI is Rs 55,000: 0.60 × 2,00,000 − 65,000 = 55,000."
+    assert not any("35,000" in t or "is Rs. 65,000" in t for t in texts)
+    assert final.result == Decimal("55000")
+
+
+def test_no_result_is_stated_for_an_ungrounded_calculation_or_a_non_money_quantity():
+    ungrounded = {"calculations": [{"expression": "0.65 * 200000 - 65000", "evidence_ids": ["E1"]}], "claims": []}
+    assert restated_result(ungrounded, FOIR, FOIR_QUESTION) is None
+    assert asked_quantity("What is the remaining tenure if I prepay Rs 5 lakh?") == "remaining tenure"
+    tenure = {"calculations": [{"expression": "0.60 * 200000 - 65000", "evidence_ids": ["E1"]}], "claims": []}
+    assert restated_result(tenure, FOIR, "What is the remaining tenure for Rs 200,000 less Rs 65,000?") is None

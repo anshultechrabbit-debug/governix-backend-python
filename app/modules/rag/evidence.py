@@ -157,6 +157,10 @@ READER_OUTCOME_WORDS = frozenset(
     "meet meets met satisfy satisfies satisfied fulfil fulfill fulfils fulfills fulfilled qualify qualifies "
     "qualified eligible ineligible eligibility criterion criteria condition conditions requirement requirements "
     "stated "
+    # "Do these stated thresholds pass?", "Is my score above the cut-off?": the reader's words for setting a
+    # figure against a rule's bound; the rule itself says "minimum", "maximum" or "at least". ("Failed" and
+    # "cleared" stay terms: a failed transaction or a cleared cheque is what a rule is about.)
+    "threshold thresholds cutoff cut-off pass passes passed passing "
     # "Is credit score 650 in the 650-699 bracket?", "Which slab does Rs 45 lakh fall in?": what the reader
     # calls a table's band; the table itself just lists "650 - 699".
     "bracket brackets band bands slab slabs tier tiers bucket buckets range ranges fall falls lie lies "
@@ -275,7 +279,9 @@ def key_terms(question: str) -> list[str]:
     if asks_over_time(question):  # "Has the late payment penalty increased?": the subject is the penalty
         framing = framing | OVER_TIME_WORDS | PERIOD_WORDS | COMPARISON_WORDS
     if applies_to_reader(question):  # "If my income is Rs 49,000, do I meet the criterion?"
-        framing = framing | READER_OUTCOME_WORDS
+        # "A borrower has a score of 725 ...": the borrower is the reader, as "I" is; the policy may say
+        # "applicant", and a claim may say "the borrower's score" as it says "your score".
+        framing = framing | READER_OUTCOME_WORDS | readers_names(question)
     question = without_version_refs(question)
     # "a user says ... can you confirm that claim?": who said it and the asking frame the claim.
     question = _CLAIM_TO_CONFIRM.sub(" ", question)
@@ -327,6 +333,17 @@ _ABOUT_READER = re.compile(
     r"(?!\s+(?:must|shall|should|may|needs?\s+to|has\s+to|is\s+required|are\s+required)\b))\b",
     re.I,
 )
+def readers_names(question: str) -> frozenset[str]:
+    """What a case told in the third person calls the reader ("a borrower has ...", "an applicant aged 27"):
+    the noun stands for the reader, as "I" does, not for a subject the evidence must name."""
+    names = set()
+    for clause in re.split(r"[.;:?!,]", question):
+        if (match := _ABOUT_READER.match(clause)) and (words := re.findall(r"[a-z][a-z-]*", match.group(0).lower())):
+            if words[0] in ("a", "an", "the", "this", "one"):
+                names.update(w for w in words[1:] if w not in ("salaried", "self-employed"))
+    return frozenset(names | {n[:-1] for n in names if n.endswith("s")} | {n + "s" for n in names})
+
+
 # A clause that asks rather than tells: "can I get a loan", "what rate applies". It ends the reader's
 # situation ("I am 27, earn Rs 65,000, can I get a loan?").
 _ASKS = re.compile(

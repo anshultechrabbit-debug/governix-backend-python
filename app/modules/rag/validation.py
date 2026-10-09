@@ -109,6 +109,7 @@ _FRAMING = frozenset(
     "includes included contains "
     # The outcome of a rule applied to the reader's case ("so you do not qualify", "meets the minimum").
     "qualify qualifies qualified eligible ineligible meet meets met satisfy satisfies satisfied "
+    "threshold thresholds cutoff cut-off pass passes passed fail fails "
     # A figure placed in a table's row ("650 falls in the 650 - 699 band"): the table only lists the row.
     "falls fall lies belongs band bands bracket brackets slab slabs tier tiers bucket buckets".split()
 )
@@ -412,6 +413,8 @@ def _flips_polarity(claim: str, cited_text: str, *, outcome: bool = False) -> bo
     claim = _CONTRAST.sub(
         lambda m: " " if (facts := extract_numeric_facts(m.group(0))) and all(f.value not in stated for f in facts)
         else m.group(0), claim)
+    # "No, the minimum credit score is 700": the answer to the question, then the rule as the source states it.
+    claim = _ANSWER_WORD.sub("", claim, count=1)
     words = _content_words(claim)
     if not words:
         return False
@@ -427,11 +430,30 @@ def _flips_polarity(claim: str, cited_text: str, *, outcome: bool = False) -> bo
     if claim_negated and not source_negated and _negations_quoted(claim, cited_text):
         return False  # its negation comes from another sentence it combines ("... does not have updated address")
     if claim_negated and not source_negated:
-        if outcome:
+        if outcome or not _negates_stated_part(claim, sentences[best_index]):
+            # The reader's outcome ("a score of 724 does not meet the minimum of 725"), or a negation of something
+            # the sentence does not say ("Life insurance is not mandatory" of "... is optional").
             return False
         # The next sentences may carry the short answer of a question-and-answer pair ("... income? Ans. No.").
         return not _negated(" ".join(sentences[best_index + 1:best_index + 3]))
     return source_negated and not claim_negated and _restates_negated_part(claim, sentences[best_index])
+
+
+# A yes/no answer word before the rule it rests on ("No, the minimum ...", "Yes. Life insurance is optional").
+_ANSWER_WORD = re.compile(r"^\s*(?:yes|no|correct|incorrect|true|false)\s*[,.:;!—–-]+\s*", re.I)
+
+
+def _negates_stated_part(claim: str, sentence: str) -> bool:
+    """The claim negates what the sentence states ("Life insurance is not optional" of "... is optional"), not
+    something it does not say ("... is not mandatory" of "... is optional": the same rule in other words)."""
+    stated = TermIndex(sentence)
+    cleaned = _NOT_NEGATION.sub(" ", claim)
+    for match in _NEGATION.finditer(cleaned):
+        clause = re.split(r"[,;:.]|\b(?:but|and|while|whereas|so|as|because)\b", cleaned[match.end():match.end() + 60])[0]
+        following = [w for w in _WORD.findall(clause.lower()) if w not in _STOP and w not in _FRAMING][:3]
+        if not following or any(stated.mentions(w) for w in following):
+            return True
+    return False
 
 
 def _restates_negated_part(claim: str, sentence: str) -> bool:
@@ -699,7 +721,10 @@ def _derived(fact, evidence_facts: list, given: list) -> bool:
                 if family == "percent":
                     # "Rs. 35,000 is 58.33% of Rs. 60,000": one figure as a share of the other.
                     candidates += [x * 100 for x in (a / b if b else None, b / a if a else None) if x is not None]
-            if candidates and family in ("value", "percent", "duration") and any(_close(value, c) for c in candidates):
+            # A result no different from one of its operands derives nothing: "725" is not 725 + 2.2 (a section
+            # number) rounded, it is 725 itself, and the question's figure stays the reader's, not the policy's.
+            if candidates and family in ("value", "percent", "duration") and any(
+                    _close(value, c) and not _close(c, a) and not _close(c, b) for c in candidates):
                 return True
     return False
 
@@ -716,6 +741,8 @@ def validate_claims(
     given_values = {f.value for f in given}
     # "I am 27" restated as "27 years": the reader's bare number with the unit its rule uses.
     given_values |= {f"{f.value} {unit}" for f in given if f.kind == "number" for unit in ("year", "month", "day")}
+    # And the other way: "is 22 years old" restated as "an age of 22".
+    given_values |= {f.value.partition(" ")[0] for f in given if f.kind == "duration"}
     premises = premise_values(without_version_refs(question))  # "the policy says the rate is 2%": correct only
     results = []
     carried: set[Decimal] = set()  # results earlier claims of this answer established
@@ -842,6 +869,12 @@ def validate_claims(
                 text, cited_versions, cited_text, evidence, [evidence[e] for e in known])):
             result.valid, hard = False, True
             result.problems.append(wrong)
+        # The reader's figure applied to the rule, even where it also works out from the evidence's figures (any
+        # figure of the question does: "No, a credit score of 724 does not meet the minimum of 725"). Not one the
+        # evidence states itself: "your 725 does not meet the minimum of 725" reverses the rule.
+        applied = applied or any(
+            f not in stated and f.value in given_values and f.value not in premises and _given_in_context(text, f)
+            for f in facts)
         if _flips_polarity(text, cited_text, outcome=applied):
             result.valid, hard = False, True
             result.problems.append("reverses the negation of the source sentence")

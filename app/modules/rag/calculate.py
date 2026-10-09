@@ -81,6 +81,62 @@ def final_calculation(content: dict, evidence: dict, question: str) -> "Calculat
     return None
 
 
+# What a calculation question asks for, in its own words: "what is the maximum permissible EMI?", "calculate the
+# total interest", "how much total interest will I pay". Never a figure; a few words at most.
+_DETERMINER = r"(?:the|my|our|their|his|her|its|your|this|that)"
+_ENDS_QUANTITY = (r"(?=\s*(?:\?|$|[,;:.]|\b(?:for|if|under|as\s+per|per|when|in|on|with|after|before|given|using|"
+                  r"at|from|over|by|that|which|i|we|you|they|he|she)\b))")
+_ASKED_QUANTITY = (
+    re.compile(rf"\bwhat\s+(?:is|was|would\s+be|will\s+be|should\s+be)\s+{_DETERMINER}\s+"
+               rf"(?P<x>[a-z][a-z-]*(?:\s+[a-z][a-z-]*){{0,6}}?){_ENDS_QUANTITY}", re.I),
+    re.compile(rf"\b(?:calculate|compute|determine|work\s+out|find)\s+{_DETERMINER}\s+"
+               rf"(?P<x>[a-z][a-z-]*(?:\s+[a-z][a-z-]*){{0,6}}?){_ENDS_QUANTITY}", re.I),
+    re.compile(r"\bhow\s+much\s+(?P<x>[a-z][a-z-]*(?:\s+[a-z][a-z-]*){0,4}?)\s+"
+               r"(?=(?:will|would|can|could|do|does|did|is|are|should|must|shall|may|might)\b)", re.I),
+)
+_CURRENCY = re.compile(r"₹|\b(?:rs|inr)\b\.?", re.I)
+# A quantity measured in time, a count or a proportion ("remaining tenure", "number of EMIs", "FOIR ratio"): its
+# unit (months, %, a fraction) is not the question's currency, so its sentence is left to the model.
+_NOT_MONEY = re.compile(r"\b(?:tenure|term|period|months?|years?|weeks?|days?|number|count|ratio|percentage|percent|"
+                        r"rate|share|proportion|times)\b", re.I)
+# A division in a result sentence's working only by a unit (per cent, months a year): a share or ratio ("35,000 ÷
+# 60,000 × 100") has a unit of its own, which the question's words do not give.
+_UNIT_DIVISION = re.compile(r"÷\s*(?!(?:100|12|52|365|1,000|1,00,000|1,00,00,000)\b)")
+
+
+def asked_quantity(question: str) -> str | None:
+    """The quantity a calculation question asks for, as it words it ("maximum permissible EMI")."""
+    for pattern in _ASKED_QUANTITY:
+        if match := pattern.search(question):
+            return " ".join(match.group("x").split())
+    return None
+
+
+def restated_result(content: dict, evidence: dict, question: str) -> tuple[dict, "Calculation"] | None:
+    """The model chose the calculation, but its sentences never state the recomputed result, or misstate it
+    ("0.60 * 200000 - 65000" in "calculations", and "The maximum permissible EMI is Rs 35,000" in a claim): the
+    result stated in the question's words with the working ("The maximum permissible EMI is Rs 55,000: 0.60 ×
+    2,00,000 − 65,000 = 55,000."), ahead of the model's other claims, less those giving the quantity another
+    figure. Only when every listed calculation checks out and the question names the quantity; a share or
+    ratio (divided by another figure) is left alone. The method is still for the reasoning check to judge."""
+    raw = content.get("calculations")
+    checked = checked_calculations(raw, evidence, question)
+    if not checked or not isinstance(raw, list) or len(checked) != len(raw):
+        return None
+    final = checked[-1]
+    quantity = asked_quantity(question)
+    if not quantity or _NOT_MONEY.search(quantity) or _UNIT_DIVISION.search(final.shown) or final.result < 0:
+        return None
+    currency = "Rs " if _CURRENCY.search(question) else ""
+    claim = {"text": f"The {quantity} is {currency}{indian(final.result)}: {final.shown}.",
+             "evidence_ids": list(final.evidence_ids)}
+    named = quantity.lower()
+    others = [c for c in content.get("claims") or [] if isinstance(c, dict) and not (
+        named in str(c.get("text") or "").lower()
+        and (figures := figures_in(str(c.get("text") or ""))) and final.result not in figures)]
+    return {**content, "claims": [claim, *others]}, final
+
+
 def has_calculated_answer(content: dict, evidence: dict, question: str) -> bool:
     """The final calculation must be recomputed and stated by a claim citing its evidence.
 
@@ -99,7 +155,22 @@ def states_result(text: str, calculation: "Calculation") -> bool:
         if (states_value(match.group(2), stated, calculation.result, approximate=approximate)
                 and written_arithmetic(match.group(0), set(calculation.values))):
             return True
+    if calculation.inputs and calculation.result not in calculation.inputs:
+        # "After taking the Rs 65,000 of obligations off 60% of Rs 2,00,000, the maximum EMI is Rs 55,000": the
+        # result stated after its working, in words. A figure the calculation starts from is never its result.
+        return any(_states(fact, text, calculation.result) for fact in extract_numeric_facts(text)
+                   if fact.kind != "date")
     return False
+
+
+def _states(fact, text: str, result: Decimal) -> bool:
+    try:
+        value = Decimal(fact.value.partition(" ")[0])
+    except InvalidOperation:
+        return False
+    approximate = approximate_before(text, fact.start)
+    return (states_value(fact.raw, value, result, approximate=approximate)
+            or (fact.kind == "percent" and states_value(fact.raw, value, result * 100, approximate=approximate)))
 
 
 @dataclass(frozen=True)
@@ -108,6 +179,7 @@ class Calculation:
     values: frozenset[Decimal]  # the result, every intermediate result and every figure used
     evidence_ids: tuple[str, ...]
     shown: str  # "1,07,767 × (15 × 12) − 1,00,00,000 = 93,98,060"
+    inputs: frozenset[Decimal] = frozenset()  # the figures it starts from (1,07,767, 15, 12, 1,00,00,000)
 
 
 class _Rejected(Exception):
@@ -137,9 +209,14 @@ def figures_in(text: str) -> set[Decimal]:
     return figures
 
 
-def checked_calculations(raw: object, evidence: dict, question: str) -> list[Calculation]:
+def checked_calculations(raw: object, evidence: dict, question: str,
+                         wrong: list[tuple[str, Decimal]] | None = None) -> list[Calculation]:
     """The model's calculations that evaluate, over figures the cited evidence or the question states.
-    `evidence` maps evidence ids to objects with a `text`. Anything else is dropped, never repaired."""
+    `evidence` maps evidence ids to objects with a `text`. Anything else is dropped, never repaired.
+
+    An expression may carry its result ("0.60 * 200000 - 65000 = 55000", or a chain "0.6 * 200000 = 120000 -
+    65000 = 55000"): the steps are recomputed and a stated result must be the recomputed one. One that is not
+    ("... = 65000") is dropped and, with `wrong`, reported as (the right working, the figure stated)."""
     if not isinstance(raw, list):
         return []
     asked = figures_in(question)
@@ -159,21 +236,63 @@ def checked_calculations(raw: object, evidence: dict, question: str) -> list[Cal
         for previous in checked:
             if set(previous.evidence_ids).issubset(ids):
                 grounded.add(previous.result)
+        steps = [step.strip() for step in _STATED_AS.split(_plain(expression)) if step.strip()]
+        values: set[Decimal] = set()
+        used: list[Decimal] = []
+        tree, result, mismatch = None, None, None
         try:
-            tree = ast.parse(_DIGIT_COMMA.sub("", expression.replace("×", "*").replace("÷", "/")
-                                              .replace("−", "-")), mode="eval")
-            if not isinstance(tree.body, ast.BinOp):
-                continue  # copying an input is not a calculation
-            values: set[Decimal] = set()
-            used: list[Decimal] = []
-            result = _evaluate(tree.body, grounded, values, used)
+            for step in steps:
+                parsed = ast.parse(step, mode="eval")
+                if not isinstance(parsed.body, ast.BinOp):
+                    # "= 55000": the result written after the working, which must be the recomputed one.
+                    stated = _evaluate_literal(parsed.body)
+                    if result is not None and not states_value(step, stated, result):
+                        mismatch = stated
+                    continue  # copying an input alone is not a calculation
+                result = _evaluate(parsed.body, grounded, values, used)
+                grounded = grounded | {result}  # the next step of a chain may use it
+                tree = parsed
         except (SyntaxError, _Rejected, InvalidOperation, DivisionByZero, ZeroDivisionError, RecursionError):
             continue
-        if not used or len(used) > MAX_FIGURES:
+        if tree is None or result is None or not used or len(used) > MAX_FIGURES:
+            continue
+        shown = f"{_show(tree.body)} = {indian(result)}"
+        if mismatch is not None:
+            if wrong is not None:
+                wrong.append((shown, mismatch))
             continue
         checked.append(Calculation(result=result, values=frozenset(values | set(used) | {result}),
-                                   evidence_ids=ids, shown=f"{_show(tree.body)} = {indian(result)}"))
+                                   evidence_ids=ids, shown=shown, inputs=frozenset(used)))
     return checked
+
+
+def wrongly_stated(raw: object, evidence: dict, question: str) -> list[tuple[str, Decimal]]:
+    """The calculations whose stated result is not the recomputed one: (the right working, the figure stated)."""
+    wrong: list[tuple[str, Decimal]] = []
+    checked_calculations(raw, evidence, question, wrong)
+    return wrong
+
+
+# "= 55000", "≈ 55000": a result written into an expression.
+_STATED_AS = re.compile(r"=|≈")
+
+
+def _plain(expression: str) -> str:
+    """An expression as Python reads it: "0.60 × Rs 2,00,000 − 65,000" -> "0.60 * 200000 - 65000", "60%" ->
+    "(60 / 100)", "0.6 x 200000" -> "0.6 * 200000"."""
+    text = re.sub(r"₹|\b(?:rs|inr)\b\.?", " ", expression, flags=re.I)
+    text = text.replace("×", "*").replace("÷", "/").replace("−", "-").replace("–", "-")
+    text = re.sub(r"(?<=[\d)\s])[xX](?=[\s\d(])", "*", text)
+    text = _DIGIT_COMMA.sub("", text)
+    return re.sub(r"(\d+(?:\.\d+)?)\s*%", r"(\1 / 100)", text)
+
+
+def _evaluate_literal(node: ast.AST) -> Decimal:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+        return Decimal(str(node.value))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return -_evaluate_literal(node.operand)
+    raise _Rejected("not a number")
 
 
 # Arithmetic a claim writes out itself, as people write it: "Rs. 1,07,767 × 180 months − Rs. 1 crore = Rs.
@@ -217,6 +336,7 @@ class _Worked:
     right: bool  # the stated result is the recomputed one, to the precision it is written in
     result: Decimal | None
     values: frozenset[Decimal]  # every figure, step and result
+    inputs: frozenset[Decimal] = frozenset()  # the figures it starts from, as written and as meant
 
 
 # "650 - 699 is 11.15%", "28 - 65 years": a range written with a hyphen, not a subtraction.
@@ -262,7 +382,8 @@ def _worked(text: str, grounded: set[Decimal]) -> list[_Worked]:
                  or (stated_percent and (states_value(raw, stated, result * 100, approximate=approximate)
                                          or near(stated / 100, result))))
         found.append(_Worked(" ".join(match.group(0).split()), grounded_here, right, result,
-                             frozenset(figures | literals | values | {result, stated, stated_number})))
+                             frozenset(figures | literals | values | {result, stated, stated_number}),
+                             frozenset(figures | literals)))
         if grounded_here and right:
             allowed |= {result, stated}  # a later step may use this one's result
     return found
@@ -298,7 +419,8 @@ def calculations_in(claims: list, evidence: dict, question: str) -> list[Calcula
         for worked in _worked(str(claim.get("text") or ""), grounded):
             if worked.grounded and worked.right and worked.result is not None:
                 found.append(Calculation(result=worked.result, values=worked.values, evidence_ids=ids,
-                                         shown=worked.equation))
+                                         shown=worked.equation,
+                                         inputs=worked.inputs))
     return found
 
 

@@ -146,3 +146,40 @@ def test_a_share_of_the_readers_income_is_checked_arithmetic():
 
     assert valid("No, your EMIs of Rs. 35,000 are 58.33% of your Rs. 60,000 income, above the 50% maximum.")
     assert not valid("No, your EMIs are 62% of your income, above the 50% maximum.")
+
+
+THRESHOLDS = ("For a loan sanctioned on 2026-06-15, a borrower has a score of 725, is 23 years old, is self-employed "
+              "with 2 years of business vintage, and requests a loan of Rs 10 lakh. Do these stated thresholds pass?")
+
+
+def test_the_readers_frame_and_their_name_in_a_third_person_case_are_not_required():
+    terms = key_terms(THRESHOLDS)
+    assert not {"borrower", "thresholds", "pass", "stated"} & set(terms)
+    assert {"score", "vintage"} <= set(terms)
+    assert "threshold" in key_terms("What is the minimum credit score threshold?")  # no reader's case
+    assert "borrower" in key_terms("The borrower must submit which documents?")  # a rule about borrowers
+
+
+ELIGIBILITY = EvidenceText("E1", (
+    "2.1 The minimum age of the applicant at the time of application is 23 years. The maximum age of the "
+    "applicant at loan maturity is 70 years.\n2.2 The minimum credit score required is 725. Applications below "
+    "this score are declined.\n2.3 Self-employed applicants must have a minimum business vintage of 2 years."
+), label="Mortgage Loan Policy > 2 Eligibility")
+
+
+@pytest.mark.parametrize("claim", [
+    "The borrower's credit score of 725 meets the minimum credit score of 725.",
+    "The 2 years of business vintage pass the minimum business vintage threshold of 2 years.",
+    "The borrower's age of 22 is below the minimum age of 23 years at application.",
+])
+def test_a_third_person_case_checked_against_its_rule_is_supported(claim):
+    question = THRESHOLDS.replace("is 23 years old", "is 22 years old") if "22" in claim else THRESHOLDS
+    [result] = validate_claims([{"text": claim, "evidence_ids": ["E1"]}], {"E1": ELIGIBILITY},
+                               key_terms(question), question)
+    assert result.valid, result.problems
+
+
+def test_a_figure_neither_the_reader_nor_the_rule_gives_is_still_invented():
+    [result] = validate_claims([{"text": "The borrower's credit score of 690 meets the minimum.", "evidence_ids": ["E1"]}],
+                               {"E1": ELIGIBILITY}, key_terms(THRESHOLDS), THRESHOLDS)
+    assert not result.valid and not result.wording_only

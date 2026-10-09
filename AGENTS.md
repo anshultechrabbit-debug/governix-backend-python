@@ -160,6 +160,28 @@ Builds on v60-v63's calculation path (the result must be recomputed and lead the
   - The result is stated once, preferring the claim that shows its working. No separate "Calculation:"
     line is added when a claim already shows it.
 - Dates ("2019-08-15") are never key terms; they choose the version. "Q." / "Q63:" labels are dropped.
+- **The result may come after its working (v68).** `calculate.states_result` also accepts a claim that states
+  the recomputed result anywhere ("After subtracting Rs 65,000 from 60% of Rs 2,00,000, the maximum EMI is Rs
+  55,000"), but only when the result is not one of the calculation's inputs (`Calculation.inputs`). An operand
+  or an intermediate step ("allows Rs 1,20,000 of EMIs") still never counts as the answer.
+- **Expressions written with their result (v69).** gpt-4o-mini often writes `"0.60 * 200000 - 65000 = 55000"`
+  in `calculations`. `checked_calculations` splits on "="/"≈", recomputes each step (a chain "0.6 * 200000 =
+  120000 - 65000 = 55000" works) and reads "60%", "x" and Indian grouping. A stated result must equal the
+  recomputed one; a wrong one ("= 65000") is dropped, reported by `wrongly_stated`, told to the retry ("Your
+  calculation gives ... = 55,000, not 65,000") and its claims are not reused by `_computed_answer`.
+- **The model's arithmetic is never needed (v70).** gpt-4o-mini picks the right expression but often misstates
+  its result ("Rs 35,000" or "Rs. 65,000" for 0.60 × 2,00,000 − 65,000). When every listed calculation checks out
+  but no claim states the recomputed result, `calculate.restated_result` writes it in the question's words
+  (`asked_quantity`: "what is the maximum permissible EMI?" → "The maximum permissible EMI is Rs 55,000: 0.60 ×
+  2,00,000 − 65,000 = 55,000.") and drops the model's claims that give that quantity another figure.
+  - Only for money: not for a tenure, period, count, rate or share (`_NOT_MONEY`), nor a division by another
+    figure (a ratio). "Rs" only when the question uses a currency.
+  - The method stays the reasoning check's to judge (an expression that forgets the obligations is a wrong
+    method, caught there).
+- **Every attempt is in the audit trail (v68).** A no-answer's `plan.checks` lists each written attempt
+  ("Attempt 2: ..."): what validation removed, a failed reasoning check, `insufficient_evidence`, or "No claim
+  states a recomputed result" with the calculations and claims the model wrote. Read `audit_events`
+  (`action='ai.query'`) to see why a UI question was refused, instead of re-running it.
 
 ## "Not found" answers (v58)
 
@@ -253,6 +275,21 @@ come from ACL-filtered evidence, so they never name a document the reader can't 
   - Don't make these words required again for reader-case questions. A correct claim ("Rs. 49,000 is
     below the Rs. 60,000 minimum") is then withheld as off topic because it doesn't say "meet", and a
     claim saying "criterion" fails the subject check.
+  - (v67) "threshold(s)", "cut-off" and "pass(es/ed)" are reader outcome words too ("Do these stated
+    thresholds pass?"). "Failed" and "cleared" are not: a failed transaction or a cleared cheque is a subject.
+  - (v67) In a third-person case the noun for the reader ("a borrower has ...", "an applicant aged 27",
+    `evidence.readers_names`) is framing like "I": the policy may say "applicant", and "the borrower's score"
+    is the reader's figure, as "your score" is.
+  - (v67) The reader's duration may be restated as a bare number ("is 22 years old" → "an age of 22"), as a
+    bare number may gain its unit ("I am 27" → "27 years").
+  - (v67) A claim that puts several of the reader's figures in one sentence cannot be tied to its rows
+    (`_unbound_numbers`, a hard failure). The prompt forbids it; the retry is told what removed each claim
+    (`_reasoning_feedback` now also carries validation problems) and to write one claim per figure.
+  - (v67) A figure equal to a minimum or maximum meets it. A rule the question gives no figure for (age at
+    maturity without a tenure) is "not checked", never met or failed; the reasoning check does not count it
+    as a missing input.
+  - (v67) A withheld answer's checks are kept in the audit trail (`plan.checks` of the no-answer), so a UI
+    failure can be diagnosed from `audit_events` without re-running it.
   - "additional", "extra", "further" and "else" are additive framing (in `QUESTION_TERMS`). The word they
     qualify stays a term.
   - A yes/no question ("Is/Can/Does/Am ...", `evidence.asks_yes_no`) that gives a bare figure ("Is age 25
