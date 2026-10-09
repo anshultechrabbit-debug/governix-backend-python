@@ -30,6 +30,56 @@ _PRECEDENCE = {ast.Add: 1, ast.Sub: 1, ast.Mult: 2, ast.Div: 2}
 _NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
 _DIGIT_COMMA = re.compile(r"(?<=\d),(?=\d)")
 
+# Numerical case questions, independent of policy vocabulary or document-specific aliases.
+_QUANTITY_ASK = re.compile(
+    r"\b(?:how\s+much|calculate|compute|determine|what\s+(?:is|would\s+be|will\s+be)\s+"
+    r"(?:the\s+)?(?:maximum|minimum|total|remaining|net))\b", re.I)
+
+
+def asks_for_calculation(question: str) -> bool:
+    """A quantity requested for supplied inputs, rather than a request to quote a policy limit."""
+    inputs = [f for f in extract_numeric_facts(question) if f.kind in ("amount", "percent", "duration", "quantity")]
+    return bool(_QUANTITY_ASK.search(question) and (len(inputs) >= 2 or
+                (inputs and re.search(r"\bformula\b", question, re.I))))
+
+
+def leads_with_result(text: str, calculation: "Calculation") -> bool:
+    """The direct answer must state the output, not merely repeat an operand in Calculation.values."""
+    facts = extract_numeric_facts(text)
+    if not facts:
+        return False
+    try:
+        return near(Decimal(facts[0].value.partition(" ")[0]), calculation.result)
+    except InvalidOperation:
+        return False
+
+
+def has_calculated_answer(content: dict, evidence: dict, question: str) -> bool:
+    """The final calculation must be recomputed and stated by a claim citing its evidence.
+
+    Claim order and an optional summary are presentation, not proof of arithmetic.
+    """
+    raw = content.get("calculations")
+    checked = checked_calculations(raw, evidence, question)
+    claims = content.get("claims") or []
+    # Never silently use a preceding step when the requested final step failed verification.
+    if not checked or len(checked) != len(raw) or not claims:
+        return False
+    final = checked[-1]
+    return any(set(final.evidence_ids).issubset(claim.get("evidence_ids") or [])
+               and states_result(str(claim.get("text") or ""), final) for claim in claims)
+
+
+def states_result(text: str, calculation: "Calculation") -> bool:
+    """A direct result or a correctly worked equation, never an operand merely mentioned in working."""
+    if leads_with_result(text, calculation):
+        return True
+    for match in _WORKED.finditer(text):
+        _number, stated, _percent = _figure(match.group(2))
+        if near(stated, calculation.result) and written_arithmetic(match.group(0), set(calculation.values)):
+            return True
+    return False
+
 
 @dataclass(frozen=True)
 class Calculation:
@@ -59,6 +109,8 @@ def figures_in(text: str) -> set[Decimal]:
         except InvalidOperation:
             continue
         figures.add(value)
+        if fact.kind == "percent":
+            figures.add(value / 100)  # 50% and 0.5 express the same grounded rate
         if fact.kind == "duration" and unit == "year":
             figures.add(value * 12)
     return figures
@@ -81,9 +133,16 @@ def checked_calculations(raw: object, evidence: dict, question: str) -> list[Cal
         grounded = asked | CONSTANTS
         for evidence_id in ids:
             grounded |= figures_in(evidence[evidence_id].text)
+        # A later step may use an earlier exact result only with all its supporting citations.
+        # Do not share results between unrelated passages or accept a model's unverified intermediate.
+        for previous in checked:
+            if set(previous.evidence_ids).issubset(ids):
+                grounded.add(previous.result)
         try:
             tree = ast.parse(_DIGIT_COMMA.sub("", expression.replace("×", "*").replace("÷", "/")
                                               .replace("−", "-")), mode="eval")
+            if not isinstance(tree.body, ast.BinOp):
+                continue  # copying an input is not a calculation
             values: set[Decimal] = set()
             used: list[Decimal] = []
             result = _evaluate(tree.body, grounded, values, used)
@@ -141,7 +200,7 @@ def written_arithmetic(text: str, grounded: set[Decimal]) -> set[Decimal]:
             for figure, operator_word, bracket in _WORKED_TOKEN.findall(match.group(1)):
                 if figure:
                     number, value, percent = _figure(figure)
-                    if number not in allowed and value not in allowed:
+                    if number not in allowed and value not in allowed and not (percent and value / 100 in allowed):
                         raise _Rejected(f"{figure} is not a figure of the evidence or the question")
                     literal = value / 100 if percent else value
                     expression.append(f"({literal})")

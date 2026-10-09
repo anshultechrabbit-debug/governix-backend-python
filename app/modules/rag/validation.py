@@ -496,7 +496,12 @@ def _column_heading(text: str, line_start: int, line_end: int, start: int) -> st
         heading = line
     if not heading:
         return ""
-    return heading.split("|")[text[line_start:start].count("|")].strip()
+    cells = heading.split("|")
+    own = cells[text[line_start:start].count("|")].strip()
+    # The first column's heading names what every row is ("Loan (Rs. lakh)" over 30 / 50 / 100): each cell of
+    # a row is beside it too, or a figure in "50 | Rs. 106,358 | Rs. 66,214" is "not stated for loan".
+    first = cells[0].strip()
+    return " ".join(dict.fromkeys(c for c in (own, first) if c))
 
 
 # A bare number that is a measured value rather than a clause reference: "against threshold 17.8".

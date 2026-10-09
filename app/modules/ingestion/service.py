@@ -2,6 +2,8 @@ import uuid
 from typing import Any
 
 from sqlalchemy import select
+
+from app.core.config import get_settings
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import NotFoundError
@@ -11,6 +13,7 @@ from app.modules.categories.model import Category
 from app.modules.documents.model import Document
 from app.modules.documents.repository import DocumentRepository
 from app.modules.ingestion.model import Decision, DocumentAnalysis
+from app.modules.ingestion.analysis.analyzer import pending_date_metadata
 from app.modules.ingestion.schema import AnalysisRead
 from app.modules.policies.model import Policy, PolicyVersion, VersionStatus
 
@@ -39,6 +42,7 @@ class AnalysisService:
         analysis = self.session.get(DocumentAnalysis, document_id) if document else None
         if analysis is None:
             raise NotFoundError("Analysis not available yet.")
+        detected = pending_date_metadata(self.session, document, analysis, get_settings())
 
         matched = None
         if analysis.matched_policy_id:
@@ -65,7 +69,7 @@ class AnalysisService:
         )
         return AnalysisRead(
             document_id=analysis.document_id,
-            detected=analysis.detected,
+            detected=detected,
             suggested_name=analysis.suggested_name,
             name_confidence=analysis.name_confidence,
             suggested_category_id=analysis.suggested_category_id,
@@ -85,7 +89,7 @@ class AnalysisService:
             reviewed_by_id=analysis.reviewed_by_id,
             reviewed_at=analysis.reviewed_at,
             resolution=analysis.resolution,
-            suggested_initial_version=self._suggested_version(analysis),
+            suggested_initial_version=self._suggested_version(analysis, detected),
         )
 
     def _related_policy_id(self, analysis: DocumentAnalysis) -> uuid.UUID | str | None:
@@ -140,8 +144,8 @@ class AnalysisService:
         }
 
     @staticmethod
-    def _suggested_version(analysis: DocumentAnalysis) -> dict[str, Any] | None:
-        detected = analysis.detected or {}
+    def _suggested_version(analysis: DocumentAnalysis, detected: dict | None = None) -> dict[str, Any] | None:
+        detected = detected if detected is not None else analysis.detected or {}
         label = (detected.get("version_label") or {}).get("value")
         if analysis.decision in (Decision.NEW_POLICY, Decision.EXISTING_POLICY_AMENDMENT):
             label = label or "1"

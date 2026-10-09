@@ -14,6 +14,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.database import translate_unique_violation
+from app.core.config import get_settings
 from app.core.exceptions import ConflictError, NotFoundError, ValidationError
 from app.infrastructure.queue.base import Queue
 from app.modules.audit.service import record_event
@@ -27,6 +28,7 @@ from app.modules.documents.model import Document, DocumentStatus
 from app.modules.documents.repository import DocumentRepository
 from app.modules.ingestion import pipeline, progress
 from app.modules.ingestion.analysis.metadata import normalize_title
+from app.modules.ingestion.analysis.analyzer import pending_date_metadata
 from app.modules.ingestion.model import Decision, DocumentAnalysis, ReviewStatus, Stage
 from app.modules.ingestion.schema import PolicyInput, RelationshipInput, VersionInput
 from app.modules.policies.model import (
@@ -102,6 +104,7 @@ class ConfirmationService:
         reason = (request.reason or "").strip() or (document.duplicate_override_reason or "").strip() or None
         if request.action == "reject":
             return self._reject(principal, document, analysis, reason)
+        analysis.detected = pending_date_metadata(self.session, document, analysis, get_settings())
         if self._reissue(analysis, request):
             # A new version of the very policy the copy belongs to is what a reissue is:
             # confirming it is the decision, recorded with the reviewer in the audit log.

@@ -46,7 +46,9 @@ from app.modules.citations.numerics import extract_numeric_facts
 from app.modules.documents.model import Document, DocumentStatus
 from app.modules.policies.model import Policy, PolicyStatus, PolicyVersion, VersionStatus
 from app.modules.rag.claim_stream import ClaimStream
-from app.modules.rag.calculate import Calculation, checked_calculations, near
+from app.modules.rag.calculate import (
+    Calculation, asks_for_calculation, checked_calculations, has_calculated_answer, states_result, near,
+)
 from app.modules.rag.injection import strip_instructions
 from app.modules.rag.evidence import (
     EvidenceItem, EvidenceSet, applies_to_reader, asks_yes_no, build_evidence, coverage_of, describes_readers_case,
@@ -160,7 +162,14 @@ HISTORY_KEY_CHARS = 300
 #   v58    no-answers say what was read (nearest sections and documents) and suggest questions about them
 #   v59    "how much" arithmetic: working written in a claim as people write it (Rs., lakh/crore, months, %,
 #          minus/times, "is"/"≈") recomputed; EMI × months a single step; formulas for the whole family
-ANSWER_CACHE_VERSION = "v59"
+#   v60    computed quantities lead with the result; chained arithmetic keeps its citations;
+#          summaries are checked with the same verified calculations as their supporting claims
+#   v61    numerical case answers must lead with the verified final result, not an operand;
+#          hold their partial claims and retry an incomplete calculation once before refusing
+#   v62    accept verified working before its result and decimal percentages; order the verified
+#          result claim first, and retain it when an optional summary fails validation
+#   v63    worked percentages and decimal-rate expressions share the same grounded value
+ANSWER_CACHE_VERSION = "v63"
 # No supported answer in the version in force: worth looking one version back.
 # Earlier versions answer only what the version in force does not cover. An answer it gave that the
 # checks then withheld (ANSWER_FAILED_VALIDATION, ANSWER_OFF_TOPIC) means it covers the subject:
@@ -889,6 +898,20 @@ class RAGService:
         timings: dict[str, float], started: float,
     ) -> Generator[tuple[str, Any], None, AnswerResponse]:
         """Generate the answer from `evidence`, streaming each claim once the answer is on topic."""
+        if asks_for_calculation(request.question):
+            # An operand is a grounded number too, but must never flash as the answer while the
+            # requested result is still being calculated. Check the whole response before showing it.
+            for correction in (False, True):
+                attempt.llm_result = None
+                for part in self._generate_stream(principal, request, plan, evidence, correction=correction):
+                    if isinstance(part, LLMResult):
+                        attempt.llm_result = part
+                try:
+                    return self._validated_answer(principal, request, plan, evidence, attempt.llm_result)
+                except _NoAnswer as exc:
+                    if correction or exc.reason != "ANSWER_FAILED_VALIDATION":
+                        raise
+            raise _NoAnswer("ANSWER_FAILED_VALIDATION")
         # Claims are held back until together they are on topic: the final answer
         # applies the same check, and a claim shown and then withdrawn reads as a
         # glitch ("an answer for a second, then no answer").
@@ -1450,9 +1473,11 @@ class RAGService:
         if remaining <= 0:
             raise _NoAnswer("DEADLINE_EXCEEDED")
 
-    def _generate_stream(self, principal, request, plan: QueryPlan, evidence: EvidenceSet) -> Iterator[dict | LLMResult]:
+    def _generate_stream(self, principal, request, plan: QueryPlan, evidence: EvidenceSet, *,
+                         correction: bool = False) -> Iterator[dict | LLMResult]:
         """Yield each claim that validates, as the model finishes it, then the LLMResult."""
-        if self.settings.RAG_ANSWER_MODE == "select" and evidence.comparison is None:
+        if (self.settings.RAG_ANSWER_MODE == "select" and evidence.comparison is None
+                and not asks_for_calculation(request.question)):
             yield from self._select_stream(principal, request, plan, evidence)
             return
         question = request.question
@@ -1466,8 +1491,16 @@ class RAGService:
             context_items = [{"id": i.id, "text": i.full_text} for i in evidence.items]
             if evidence.comparison:
                 context_items.insert(0, {"id": "D1", "text": comparison_text(evidence.comparison)})
+            prompt = build_user_prompt(question, plan, evidence)
+            if correction:
+                prompt += ("\n\nThe previous attempt failed calculation validation. Recompute from the original "
+                           "case inputs and the applicable cited rule. Put the full expression for the requested "
+                           "quantity last in calculations. Start the first claim and summary with that result "
+                           "and its unit, before showing the working. An existing obligation, original amount, "
+                           "or intermediate cap is not the requested result. Do not copy an input as the answer. "
+                           "If the rule or necessary inputs are unavailable, set insufficient_evidence true.")
             for part in llm.stream_json(
-                SYSTEM_PROMPT, build_user_prompt(question, plan, evidence), OUTPUT_SCHEMA,
+                SYSTEM_PROMPT, prompt, OUTPUT_SCHEMA,
                 context={"question": question, "evidence": context_items, "conflicts": evidence.conflicts},
             ):
                 if isinstance(part, LLMResult):
@@ -1631,6 +1664,9 @@ class RAGService:
             # The model read the evidence and found no answer in it. Claims it wrote anyway are about
             # something nearby (the home loan LTV for a gold loan question): true, but not an answer.
             raise _NoAnswer("INSUFFICIENT_EVIDENCE")
+        if asks_for_calculation(request.question) and not has_calculated_answer(content, texts, request.question):
+            logger.info("Calculation answer withheld: no cited claim states the recomputed final result")
+            raise _NoAnswer("ANSWER_FAILED_VALIDATION")
         # "How much total interest on Rs 1 crore over 15 years?": arithmetic the model wrote, recomputed.
         calculations = checked_calculations(content.get("calculations"), texts, request.question)
         results = validate_claims(content.get("claims", []), texts, key_terms(self._subject(request.question)),
@@ -1687,6 +1723,15 @@ class RAGService:
             # Several versions read together (the earlier-version fallback): the newest one that states
             # the rule answers; an older wording of it is not the current rule.
             valid = _newest_claims(valid, items, key_terms(self._subject(request.question)))
+        if asks_for_calculation(request.question):
+            final = calculations[-1]
+            result_claims = [r for r in valid if set(final.evidence_ids).issubset(r.evidence_ids)
+                             and states_result(r.text, final)]
+            if not result_claims:
+                logger.info("Calculation result failed claim validation: %s", checks)
+                raise _NoAnswer("ANSWER_FAILED_VALIDATION")
+            # Lead with the checked answer, even when the model wrote the rule or inputs first.
+            valid = result_claims + [r for r in valid if r not in result_claims]
         numbering: dict[str, int] = {}
         for result in valid:
             for evidence_id in result.evidence_ids:
@@ -1733,13 +1778,22 @@ class RAGService:
 
         answer = " ".join(f"{c.text} [{', '.join(map(str, c.citations))}]" for c in claims)
         summary = self._summary(request.question, content.get("summary"), valid, texts, claims,
-                                subject=self._subject(request.question))
+                                subject=self._subject(request.question),
+                                calculations=_calculations_used(calculations, claims, numbering))
         if unchecked := _unchecked_figures(request.question, claims):
             # "I am 27, earn Rs 65,000 and have a 760 score": an answer that checks the income and the score
             # but not the age reads as a "yes" it is not. Say so, and give no overall verdict.
             warnings.append(f"This answer does not check {' or '.join(unchecked)} from your question, so it may "
                             "be incomplete. Ask about it on its own before relying on the answer.")
             summary = None
+        if asks_for_calculation(request.question):
+            # The final result claim must survive every existing rule/citation check too. A valid
+            # calculation in the preamble cannot rescue an answer whose actual result was removed.
+            final = calculations[-1]
+            if not claims or not states_result(claims[0].text, final):
+                raise _NoAnswer("ANSWER_FAILED_VALIDATION")
+            if summary and not states_result(summary, final):
+                summary = None  # the UI shows the verified result claim when there is no summary
         warnings += self._version_warnings(request.question, plan, sources, evidence)
         if llm_result and llm_result.model == LocalLLM.model_id and self.settings.LLM_PROVIDER != "local":
             warnings.insert(0, "The AI service was unavailable, so this answer quotes the documents directly.")
@@ -2006,7 +2060,7 @@ class RAGService:
         )
 
     def _summary(self, question: str, text, valid: list, texts: dict[str, EvidenceText], claims: list[Claim],
-                 subject: str | None = None) -> str | None:
+                 subject: str | None = None, calculations: list[Calculation] | None = None) -> str | None:
         """The plain-words answer, or None. It is dropped, never repaired, when it fails.
 
         It must pass the claim checks against the evidence its claims cite, and then
@@ -2018,7 +2072,8 @@ class RAGService:
         if not isinstance(text, str) or not text.strip():
             return None
         cited = list(dict.fromkeys(e for r in valid for e in r.evidence_ids))
-        [result] = validate_claims([{"text": text, "evidence_ids": cited}], texts, key_terms(subject or question), question)
+        [result] = validate_claims([{"text": text, "evidence_ids": cited}], texts, key_terms(subject or question),
+                                   question, calculations)
         if not result.valid and not result.wording_only:
             return None  # a failure of wording alone ("bracket") is left to the meaning check below
         if result.valid and restates(result.text, [claim.text for claim in claims]):

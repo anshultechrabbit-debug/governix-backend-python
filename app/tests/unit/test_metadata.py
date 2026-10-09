@@ -73,6 +73,40 @@ def test_extracts_policy_identity_from_first_page():
     assert meta.department.value == "Credit Department"
 
 
+@pytest.mark.parametrize("separator", [" | ", "\n", "\t", ": "])
+def test_effective_date_in_table_does_not_come_from_superseded_version(separator):
+    text = ("Mortgage Loan Policy\nVersion 2.0\n"
+            f"Effective date{separator}01-Jan-2020\n"
+            "Supersedes | Version 1.0 (effective 01-Apr-2019)")
+    meta = extract_metadata([], text, 10.0, None)
+    assert meta.effective_date == date(2020, 1, 1)
+    assert "01-Jan-2020" in meta.effective_date_evidence
+    assert "2019" not in meta.effective_date_evidence
+
+
+@pytest.mark.parametrize("reference", [
+    "Supersedes | Version 1.0 (effective 01-Apr-2019)",
+    "Supersedes\nVersion 1.0 (effective 01-Apr-2019)",
+    "Previous version effective 01-Apr-2019",
+])
+def test_historical_effective_date_is_skipped_even_when_it_comes_first(reference):
+    text = reference + "\nEffective date | 01-Jan-2020"
+    meta = extract_metadata([], text, 10.0, None)
+    assert meta.effective_date == date(2020, 1, 1)
+
+
+def test_historical_date_alone_is_not_the_new_documents_effective_or_cover_date():
+    text = "Supersedes | Version 1.0 (effective 01-Apr-2019)"
+    meta = extract_metadata(lines((text, 10)), text, 10.0, None)
+    assert meta.effective_date is None
+    assert meta.issue_date is None
+
+
+def test_invalid_labelled_date_does_not_hide_a_later_valid_date():
+    meta = extract_metadata([], "Effective date | 31-Feb-2020\nEffective date | 01-Mar-2020", 10.0, None)
+    assert meta.effective_date == date(2020, 3, 1)
+
+
 def test_filename_like_pdf_title_is_ignored():
     meta = extract_metadata(lines(("Some body text in a normal font.", 10)), "Body.", 10.0, "loan_policy_final_v7")
     assert meta.title.value is None

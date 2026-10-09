@@ -21,7 +21,14 @@ Rules (non-negotiable):
   evidence does not use (a job title, a city, a plan). The evidence need not mention the reader's case for
   its rule to answer it (insufficient_evidence is false). The case does not change what is asked about: a
   rule for another product, charge or type of customer does not answer it.
-- "How much" questions that need arithmetic (a total, interest paid, a saving, a difference, a share, the
+- Any question asking for a computed quantity ("how much", "what is the maximum/minimum", "calculate",
+  or "determine"), including a third-person case such as "a borrower has", needs the numerical result,
+  not just the policy formula or a list of inputs. Treat supplied case figures as inputs, not policy facts.
+  When the evidence supplies the applicable rule and all inputs are available, lead the first claim and
+  summary with the final amount and its unit; show the full substituted expression in that claim.
+  Do not stop at an intermediate cap when the requested result also requires subtracting obligations.
+  If an input or applicable rule is missing, ask for it instead of assuming it.
+- Questions that need arithmetic (a total, interest paid, a saving, a difference, a share, the
   room left for new EMIs, a fee on an amount, the most that can be borrowed) are answered by computing from
   figures the evidence or the question states, never by estimating. Show the working inside the claim that
   states the result, as "A × B − C = D", with figures written as in the evidence or question ("Total interest
@@ -35,7 +42,13 @@ Rules (non-negotiable):
   (Rs. 1 crore is the 100 row). At the same rate and tenure an EMI is proportional to the amount borrowed
   (Rs. 40 lakh: Rs. 53,883 × 40 ÷ 50). Convert units only with 12 (months a year), 100 (per cent), a lakh
   and a crore. Never estimate a figure the evidence does not give (an EMI for a rate or tenure the table
-  has no column for); "calculations" is [] when no arithmetic is needed.
+  has no column for); "calculations" is [] when no arithmetic is needed. Write percentages in expressions
+  as N / 100, not N. For multiple steps, preferably write the full expression using original inputs;
+  a step using a prior result must cite all evidence supporting that earlier step as well.
+  Put the complete calculation of the requested quantity last in calculations, after any intermediate
+  steps. Its result must be the first number in both the first claim and summary, with its unit, followed
+  by the working. A number appearing among the inputs is not proof that it is the answer: apply the
+  cited formula and label the output correctly. Never substitute an existing obligation for a new limit.
 - When the question asks for the reader's own figure ("What will my EMI be?", "How much can I borrow?",
   "What rate will I get?") but does not give what it depends on (the loan amount, tenure, credit score,
   income), say what it depends on, give the evidence's figures for one or two of the cases it lists ("At
@@ -371,8 +384,9 @@ def build_user_prompt(question: str, plan: QueryPlan, evidence: EvidenceSet) -> 
         parts.append("Detected conflicts between sources (mention them):\n" + "\n".join(
             f"- {c['description']} ({', '.join(c['evidence_ids'])})" for c in evidence.conflicts
         ))
-    parts.append("Return JSON with claims (one sentence each, with evidence_ids), summary (the direct answer in "
-                 "plain words), insufficient_evidence and conflicts.")
+    parts.append("Return JSON in this order: insufficient_evidence, calculations (expressions with evidence_ids; "
+                 "[] only when no arithmetic is needed), claims (one sentence each, with evidence_ids), "
+                 "summary (the direct answer, including the final numerical result when asked), and conflicts.")
     return "\n\n".join(parts)
 
 

@@ -3,7 +3,7 @@ from decimal import Decimal
 
 import pytest
 
-from app.modules.rag.calculate import checked_calculations
+from app.modules.rag.calculate import asks_for_calculation, checked_calculations, has_calculated_answer
 from app.modules.rag.claim_stream import ClaimStream
 from app.modules.rag.validation import EvidenceText, validate_claims
 
@@ -19,6 +19,191 @@ EMI_TABLE = EvidenceText("E3", (
 EVIDENCE = {"E3": EMI_TABLE}
 TOTAL = "How much total interest on Rs 1 crore over 15 years?"
 SAVING = "How much interest do I save with 5 years instead of 15 on Rs 50 lakh?"
+
+
+CASE = ("A borrower has net monthly income Rs 1,20,000 and existing monthly obligations Rs 25,000. "
+        "What is the maximum permissible EMI under the policy formula?")
+CASE_EVIDENCE = {"E1": EvidenceText("E1", "Maximum permissible EMI = 50% of net monthly income minus "
+                                  "existing monthly obligations.")}
+
+# The actual retrieved Loan Quantum passage contains other limits and table rows as well as the formula.
+QUANTUM = (
+    "3 Loan Quantum\n\n3.1 Minimum loan amount: Rs 10 lakh. Maximum loan amount: Rs 5.0 crore per borrower.\n\n"
+    "3.2 The maximum Loan-to-Value (LTV) ratio depends on the loan amount requested: up to Rs 30 lakh: 80%; "
+    "above Rs 30 lakh and up to Rs 75 lakh: 75%; above Rs 75 lakh: 70%.\n\n"
+    "Table 2: Maximum LTV by loan amount\n\nLoan amount requested | Maximum LTV\n\n"
+    "Loan amount requested: Up to Rs 30 lakh | Maximum LTV: 80%\n\n"
+    "Loan amount requested: Above Rs 30 lakh and up to Rs 75 lakh | Maximum LTV: 75%\n\n"
+    "Loan amount requested: Above Rs 75 lakh | Maximum LTV: 70%\n\n"
+    "3.3 The maximum Fixed Obligation to Income Ratio (FOIR) is 60% of net monthly income. "
+    "Maximum permissible EMI = FOIR x net monthly income - existing monthly obligations."
+)
+
+
+@pytest.mark.parametrize("expression", ["0.6 * 120000 - 25000", "60 / 100 * 120000 - 25000"])
+@pytest.mark.parametrize("claim", [
+    "The maximum permissible EMI is Rs 47,000.",
+    "Maximum permissible EMI: 60% × Rs 1,20,000 − Rs 25,000 = Rs 47,000.",
+    "The maximum permissible EMI is Rs 47,000 (60% × Rs 1,20,000 − Rs 25,000).",
+])
+def test_retrieved_formula_accepts_correct_result_in_both_answer_checks(expression, claim):
+    from app.modules.rag.evidence import key_terms
+
+    evidence = {"E1": EvidenceText("E1", QUANTUM, versions=frozenset({"7.0"}))}
+    content = {"calculations": [{"expression": expression, "evidence_ids": ["E1"]}],
+               "claims": [{"text": claim, "evidence_ids": ["E1"]}],
+               "summary": "The maximum permissible EMI is Rs 47,000."}
+    assert has_calculated_answer(content, evidence, CASE)
+    checked = checked_calculations(content["calculations"], evidence, CASE)
+    [result] = validate_claims(content["claims"], evidence, key_terms(CASE), CASE, checked)
+    assert result.valid, result.problems
+
+
+@pytest.mark.parametrize("rate, amount", [(50, 35000), (60, 47000)])
+@pytest.mark.parametrize("summary", ["correct", "wrong", "missing"])
+def test_calculated_result_survives_final_answer_assembly(monkeypatch, rate, amount, summary):
+    from datetime import date
+    from types import SimpleNamespace
+    from app.infrastructure.ai.llm.base import LLMResult
+    from app.modules.rag import service as service_module
+    from app.modules.rag.calculate import indian
+    from app.modules.rag.query_plan import plan_query
+    from app.modules.rag.schema import AskRequest, Source
+
+    passage = QUANTUM.replace("60%", f"{rate}%")
+    texts = {"E1": EvidenceText("E1", passage, versions=frozenset({"7.0"}))}
+    source = SimpleNamespace(policy_name="Mortgage Loan Policy", document_title="Mortgage Loan Policy",
+                             policy_id=None, version_id=None, version_label="7.0", effective_from=date(2024, 10, 1))
+    item = SimpleNamespace(id="E1", source=source)
+    evidence = SimpleNamespace(by_id=lambda: {"E1": item}, items=[item], comparison=None, injections=[],
+                               conflicts=[], unrelated=set(), top_score=1.0)
+    service = service_module.RAGService.__new__(service_module.RAGService)
+    service.settings = SimpleNamespace(RAG_ANSWER_MODE="generate", LLM_PROVIDER="local")
+    service._subjects = {}
+    monkeypatch.setattr(service_module, "_evidence_texts", lambda _e: texts)
+    monkeypatch.setattr(service, "_verify_citations", lambda _p, ids, _items: ids)
+    monkeypatch.setattr(service, "_judge", lambda *_args: {})
+    monkeypatch.setattr(service, "_off_topic", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service, "_close_in_meaning", lambda _items: True)
+    monkeypatch.setattr(service, "_version_warnings", lambda *_args: [])
+    monkeypatch.setattr(service, "_earlier_version_notes", lambda *_args: [])
+    monkeypatch.setattr(service, "_source", lambda n, e, *_args: Source(number=n, evidence_id=e, excerpt=passage))
+    result = indian(Decimal(amount))
+    content = {"calculations": [{"expression": f"{rate / 100} * 120000 - 25000", "evidence_ids": ["E1"]}],
+               "claims": [
+                   {"text": f"The maximum FOIR is {rate}% of net monthly income.", "evidence_ids": ["E1"]},
+                   {"text": f"Maximum permissible EMI: {rate}% × Rs 1,20,000 − Rs 25,000 = Rs {result}.",
+                    "evidence_ids": ["E1"]}],
+               "summary": (f"The maximum permissible EMI is Rs {result}." if summary == "correct" else
+                           "The maximum permissible EMI is Rs 25,000." if summary == "wrong" else "")}
+    request = AskRequest(question=CASE)
+    response = service._validated_answer(None, request, plan_query(CASE), evidence,
+                                         LLMResult(content=content, model="fake"))
+    assert response.status == "answered"
+    assert f"= Rs {result}" in response.claims[0].text
+    assert response.summary is None or response.summary == f"The maximum permissible EMI is Rs {result}."
+
+
+@pytest.mark.parametrize("question", [CASE, TOTAL, SAVING,
+    "Income Rs 90,000, obligations Rs 11,000. Calculate the remaining allowance.",
+])
+def test_numeric_case_questions_require_a_computed_answer(question):
+    assert asks_for_calculation(question)
+
+
+@pytest.mark.parametrize("question", [
+    "What is the maximum permissible EMI?", "Is age 25 eligible?", "What changed in Version 2?",
+])
+def test_policy_lookups_and_eligibility_are_not_forced_to_calculate(question):
+    assert not asks_for_calculation(question)
+
+
+@pytest.mark.parametrize("first, summary, accepted", [
+    ("The maximum permissible EMI is Rs 35,000: 50% × Rs 1,20,000 − Rs 25,000 = Rs 35,000.",
+     "The maximum permissible EMI is Rs 35,000.", True),
+    ("The maximum permissible EMI is Rs 25,000.", "The maximum permissible EMI is Rs 25,000.", False),
+    # Summary validation handles the bad summary separately; it must not hide the valid claim.
+    ("The maximum permissible EMI is Rs 35,000.", "The maximum permissible EMI is Rs 25,000.", True),
+    ("Maximum permissible EMI: 50% × Rs 1,20,000 − Rs 25,000 = Rs 35,000.", "", True),
+    ("The cap is Rs 60,000.", "The maximum permissible EMI is Rs 35,000.", False),
+])
+def test_direct_answer_must_use_the_result_not_an_operand_or_intermediate(first, summary, accepted):
+    content = {"calculations": [{"expression": "50 / 100 * 120000 - 25000", "evidence_ids": ["E1"]}],
+               "claims": [{"text": first, "evidence_ids": ["E1"]}], "summary": summary}
+    assert has_calculated_answer(content, CASE_EVIDENCE, CASE) is accepted
+
+
+def test_result_claim_can_follow_the_rule_and_intermediate_cap():
+    content = {"calculations": [{"expression": "0.5 * 120000 - 25000", "evidence_ids": ["E1"]}],
+               "claims": [
+                   {"text": "The total obligations cap is 50% of income.", "evidence_ids": ["E1"]},
+                   {"text": "The cap is Rs 60,000.", "evidence_ids": ["E1"]},
+                   {"text": "Maximum permissible EMI: 50% × Rs 1,20,000 − Rs 25,000 = Rs 35,000.",
+                    "evidence_ids": ["E1"]},
+               ], "summary": ""}
+    assert has_calculated_answer(content, CASE_EVIDENCE, CASE)
+
+
+def test_decimal_rate_is_grounded_only_when_the_percentage_is_stated():
+    raw = [{"expression": "0.5 * 120000 - 25000", "evidence_ids": ["E1"]}]
+    [calculation] = checked_calculations(raw, CASE_EVIDENCE, CASE)
+    assert calculation.result == Decimal("35000")
+    different_rate = {"E1": EvidenceText("E1", "Maximum obligations are 40% of income.")}
+    assert checked_calculations(raw, different_rate, CASE) == []
+
+
+@pytest.mark.parametrize("text", [
+    "Maximum permissible EMI: 50% × Rs 1,20,000 − Rs 25,000 = Rs 25,000.",
+    "Maximum permissible EMI: 50% × Rs 1,20,000 − Rs 35,000 = Rs 25,000.",
+])
+def test_wrong_working_is_not_accepted_just_because_it_mentions_the_right_result(text):
+    content = {"calculations": [{"expression": "50 / 100 * 120000 - 25000", "evidence_ids": ["E1"]}],
+               "claims": [{"text": text, "evidence_ids": ["E1"]}], "summary": ""}
+    assert not has_calculated_answer(content, CASE_EVIDENCE, CASE)
+
+
+def test_missing_or_invalid_final_calculation_cannot_be_rescued_by_an_input():
+    content = {"claims": [{"text": "The maximum permissible EMI is Rs 25,000.", "evidence_ids": ["E1"]}],
+               "summary": "The maximum permissible EMI is Rs 25,000."}
+    assert not has_calculated_answer(content, CASE_EVIDENCE, CASE)
+    content["calculations"] = [{"expression": "25000", "evidence_ids": ["E1"]}]
+    assert not has_calculated_answer(content, CASE_EVIDENCE, CASE)
+    content["calculations"] = [
+        {"expression": "50 / 100 * 120000", "evidence_ids": ["E1"]},
+        {"expression": "60000 - 26000", "evidence_ids": ["E1"]},
+    ]
+    content["claims"][0]["text"] = content["summary"] = "The maximum permissible EMI is Rs 60,000."
+    assert not has_calculated_answer(content, CASE_EVIDENCE, CASE)
+
+
+@pytest.mark.parametrize("corrected", [True, False])
+def test_calculation_response_is_held_and_retried_only_once(corrected):
+    from types import SimpleNamespace
+    from app.infrastructure.ai.llm.base import LLMResult
+    from app.modules.rag.service import RAGService, _Attempt, _NoAnswer
+
+    calls = []
+
+    def generate(*args, correction=False):
+        calls.append(correction)
+        yield {"text": "The maximum permissible EMI is Rs 25,000.", "citations": [1]}
+        yield LLMResult(content={"corrected": correction and corrected}, model="fake")
+
+    def validate(principal, request, plan, evidence, result):
+        if not result.content["corrected"]:
+            raise _NoAnswer("ANSWER_FAILED_VALIDATION")
+        return "verified answer"
+
+    service = SimpleNamespace(_generate_stream=generate, _validated_answer=validate)
+    stream = RAGService._write(service, None, SimpleNamespace(question=CASE), None, None, _Attempt(), {}, 0)
+    if corrected:
+        with pytest.raises(StopIteration) as done:
+            next(stream)  # no provisional answer is yielded
+        assert done.value.value == "verified answer"
+    else:
+        with pytest.raises(_NoAnswer):
+            next(stream)
+    assert calls == [False, True]
 
 
 def _calculate(expression: str, question: str):
@@ -69,6 +254,28 @@ def test_the_calculations_are_read_before_the_claims_stream():
     assert stream.preamble() == {}  # the claims have not begun
     stream.feed('"evidence_ids": ["E3"]}], "claims": [{"text": "Total interest is Rs. 93,98,060.", ')
     assert stream.preamble()["calculations"][0]["expression"] == "107767 * 180 - 10000000"
+
+
+def test_later_calculation_can_use_a_verified_result_with_its_evidence():
+    evidence = {"E1": EvidenceText("E1", "Maximum monthly obligations are 40% of net income.")}
+    question = "A borrower has income Rs 90,000 and obligations Rs 11,000. What is the remaining allowance?"
+    calculations = checked_calculations([
+        {"expression": "40 / 100 * 90000", "evidence_ids": ["E1"]},
+        {"expression": "36000 - 11000", "evidence_ids": ["E1"]},
+    ], evidence, question)
+    assert [c.result for c in calculations] == [Decimal("36000"), Decimal("25000")]
+
+
+def test_chained_calculation_cannot_borrow_an_unrelated_or_unverified_result():
+    evidence = {"E1": EvidenceText("E1", "The cap is 40% of income."),
+                "E2": EvidenceText("E2", "A separate policy applies.")}
+    question = "Income Rs 90,000; obligations Rs 11,000."
+    calculations = checked_calculations([
+        {"expression": "40 / 100 * 90000", "evidence_ids": ["E1"]},
+        {"expression": "36000 - 11000", "evidence_ids": ["E2"]},
+        {"expression": "37000 - 11000", "evidence_ids": ["E1"]},
+    ], evidence, question)
+    assert [c.result for c in calculations] == [Decimal("36000")]
 
 
 @pytest.mark.parametrize("claim, right", [

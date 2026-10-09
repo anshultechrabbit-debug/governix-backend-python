@@ -94,6 +94,25 @@ def _stated(session: Session, document: Document, settings: Settings, body_font_
     return meta.version_label.value, meta.effective_date
 
 
+def pending_date_metadata(session: Session, document: Document, analysis: DocumentAnalysis, settings: Settings) -> dict:
+    """Refresh only unconfirmed date detections from stored text, without models or re-ingestion.
+
+    Return a projection for review; the confirmation transaction persists it. Confirmed timelines
+    and the reviewer's other identity/category suggestions are untouched.
+    """
+    detected = dict(analysis.detected or {})
+    if analysis.review_status != ReviewStatus.PENDING:
+        return detected
+    # Legacy uploads without retained extracted pages cannot be re-read here.
+    if not session.scalar(select(DocumentPage.page_number).where(DocumentPage.document_id == document.id).limit(1)):
+        return detected
+    meta = _read_metadata(session, document, settings, 0.0)[0]
+    detected.update(effective_date=meta.effective_date.isoformat() if meta.effective_date else None,
+                    effective_date_evidence=meta.effective_date_evidence,
+                    issue_date=meta.issue_date.isoformat() if meta.issue_date else None)
+    return detected
+
+
 def _version_key(label: str | None) -> tuple | str | None:
     """"v2.0", "2", "Version 2.0.0" -> (2,); a label without numbers compares as text."""
     if not label:

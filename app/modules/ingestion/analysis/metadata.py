@@ -24,13 +24,37 @@ VERSION = re.compile(
 )
 REVISION = re.compile(r"\b(?:revision|rev\.?)\s*(?:no\.?|number)?\s*[:\-]?\s*(\d{1,3})\b", re.I)
 EFFECTIVE = re.compile(
-    rf"\b(?:effective\s*(?:from|date|on|w\.?e\.?f\.?)?|with\s+effect\s+from|w\.?\s?e\.?\s?f\.?)\s*[:\-]?\s*(?:from\s+)?({DATE_FRAGMENT})",
+    rf"\b(?:effective\s*(?:from|date|on|w\.?e\.?f\.?)?|with\s+effect\s+from|w\.?\s?e\.?\s?f\.?)\s*[:|\-]?\s*(?:from\s+)?({DATE_FRAGMENT})",
     re.I,
 )
 ISSUE_DATE = re.compile(
     rf"(?:\bdated|\bdate\s+of\s+issue|\bissue\s+date|\bissued\s+on|^\s*date)\s*[:\-]?\s*({DATE_FRAGMENT})",
     re.I | re.M,
 )
+_HISTORICAL_DATE = re.compile(
+    r"\b(?:supersedes?|superseded|replaces?|replaced|supersession|previous|prior|earlier|old)\b", re.I)
+
+
+def effective_date_detection(text: str, date_order: str) -> tuple[date | None, str | None]:
+    """Read the document's own labelled date, excluding dates attributed to replaced documents.
+
+    Table cells may be separated by a pipe, spaces, or a line break. Keep the row's
+    attribution instead of taking the first occurrence of 'effective' anywhere in the text.
+    """
+    for match in EFFECTIVE.finditer(text):
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        prefix = text[line_start:match.start()]
+        # An extracted table can put its row label on the preceding line.
+        previous = text[:line_start].rstrip().rsplit("\n", 1)[-1]
+        if _HISTORICAL_DATE.search(prefix) or re.fullmatch(
+                    r"\s*(?:supersedes?|replaces?|previous\s+version|prior\s+version)\s*[:|]?\s*",
+                    previous, re.I):
+            continue
+        if parsed := parse_date(match[1], date_order):
+            return parsed, " ".join(match[0].split())
+    return None, None
+
+
 ISSUER = re.compile(r"\b(?:issued\s+by|issuing\s+(?:authority|department)|owner)\s*[:\-]\s*([^\n]{2,100})", re.I)
 DEPARTMENT = re.compile(r"\b(?:department|dept\.?)\s*[:\-]\s*([^\n]{2,80})", re.I)
 DEPARTMENT_NAME = re.compile(r"\b([A-Z][A-Za-z&]+(?:\s+[A-Z][A-Za-z&]+){0,3}\s+Department)\b")
@@ -177,9 +201,7 @@ def extract_metadata(
     if match := REVISION.search(opening_text):
         meta.revision_number = Detected(match[1], 0.85, "text", match[0])
 
-    if match := EFFECTIVE.search(opening_text):
-        meta.effective_date = parse_date(match[1], date_order)
-        meta.effective_date_evidence = " ".join(match[0].split())
+    meta.effective_date, meta.effective_date_evidence = effective_date_detection(opening_text, date_order)
     if match := ISSUE_DATE.search(opening_text):
         meta.issue_date = parse_date(match[1], date_order)
     if meta.issue_date is None:
@@ -212,11 +234,14 @@ def extract_metadata(
 
 def cover_date(first_page_lines: list[list], date_order: str = "DMY") -> date | None:
     """A cover line that is only a date ("OCTOBER 2024", "1 July 2025") is the publication date."""
-    for line in first_page_lines[:40]:
+    for index, line in enumerate(first_page_lines[:40]):
         text = " ".join(line[1].split()).strip(" ,.")
         if not text or len(text) > 30:
             continue
-        if (parsed := parse_date(text, date_order)) is not None:
+        preceding = " ".join(item[1] for item in first_page_lines[max(0, index - 2):index])
+        if _HISTORICAL_DATE.search(preceding):
+            continue
+        if re.fullmatch(DATE_FRAGMENT, text, re.I) and (parsed := parse_date(text, date_order)) is not None:
             return parsed
         if (match := MONTH_YEAR.fullmatch(text)) is not None:
             return date(int(match["year"]), MONTHS[match["month"].lower()], 1)
