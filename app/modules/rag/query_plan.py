@@ -12,7 +12,9 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from enum import StrEnum
 
-from app.modules.ingestion.analysis.dates import parse_date, parse_month_year
+from app.modules.ingestion.analysis.dates import (
+    DATE_FRAGMENT, MONTH_YEAR, MONTHS, parse_date, parse_dates, parse_month_year,
+)
 
 
 class QueryClass(StrEnum):
@@ -141,6 +143,8 @@ class QueryPlan:
     diff: bool = False
     # "When did X start / change?": answered from the earliest version that states it.
     since: bool = False
+    # "Compare a loan sanctioned on 2026-06-15 with one on 2025-06-15": the versions in force on each date.
+    as_of_dates: list[date] = field(default_factory=list)
 
     def describe(self) -> dict:
         return {
@@ -184,6 +188,14 @@ def plan_query(
         # "What changed in version 2.0?": that version and the one it is compared with.
         return QueryPlan(QueryClass.COMPARISON, "versions", version_labels=labels,
                          explanation=f"Question asks how version {labels[0]} differs from another version")
+    dates = [] if labels or asks_which_period(question) else dates_in_question(question, date_order, today)
+    if len(dates) >= 2:
+        # "Compare a loan sanctioned on 2026-06-15 with one on 2025-06-15": the version in force on each
+        # date, each read on its own. One date alone stays an as-of question below.
+        shown = ", ".join(d.isoformat() for d in dates[:MAX_COMPARED_VERSIONS])
+        return QueryPlan(QueryClass.COMPARISON, "versions", as_of_dates=dates[:MAX_COMPARED_VERSIONS],
+                         explanation=f"Question compares the versions in force on {shown}; each passage is "
+                                     "labelled with its version and the period it was in force")
     if not labels and asks_when_introduced(question):
         return QueryPlan(QueryClass.ACROSS_VERSIONS, "all", since=True,
                          explanation="Question asks when something started or changed; every version is searched, "
@@ -218,6 +230,28 @@ def plan_query(
         return QueryPlan(QueryClass.CURRENT, "as_of", as_of=today,
                          explanation="No date given; using the version currently in force")
     return QueryPlan(QueryClass.CURRENT, "as_of", as_of=today, explanation="Using the version currently in force")
+
+
+# "... with one sanctioned today", "different from now", "vs the current version": today is the other date.
+_AGAINST_NOW = re.compile(
+    r"\b(?:with|to|and|from|vs\.?|versus|than)\s+(?:(?:the\s+)?(?:one|a\s+loan|loans)\s+(?:\w+\s+)?)?"
+    r"(?:today|now|at\s+present|currently|(?:the\s+)?current\s+(?:one|version|policy|rules?|guide|edition))\b",
+    re.I,
+)
+
+
+def dates_in_question(question: str, date_order: str = "DMY", today: date | None = None) -> list[date]:
+    """Every date the question asks about, in the order written: full dates ("2025-06-15", "15 June 2025"),
+    then months ("March 2026", taken at month end). One date set against now ("compared with today") adds
+    today. Bare years are left out: "between 2020 and 2024" is a period, not two dates."""
+    found = parse_dates(question, date_order)
+    for match in MONTH_YEAR.finditer(re.sub(DATE_FRAGMENT, " ", question, flags=re.I)):
+        year, month = int(match["year"]), MONTHS[match["month"].lower()]
+        found.append(date(year, month, calendar.monthrange(year, month)[1]))
+    found = list(dict.fromkeys(found))
+    if len(found) == 1 and _AGAINST_NOW.search(question):
+        found.append(today or datetime.now(UTC).date())
+    return found
 
 
 def _date_in_question(question: str, date_order: str) -> date | None:
@@ -276,4 +310,5 @@ def compares_versions(question: str) -> bool:
     return bool(
         (_COMPARE.search(question) and (_VERSION_REF.search(question) or _VERSION_CONTEXT.search(question)))
         or _ACROSS.search(question) or _WHICH_PERIOD.search(question)
+        or len(dates_in_question(question)) >= 2
     )

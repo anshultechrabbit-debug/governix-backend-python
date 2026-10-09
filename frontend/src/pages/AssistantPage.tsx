@@ -398,6 +398,7 @@ const NOT_FOUND_HEADINGS: Record<string, string> = {
   INSUFFICIENT_EVIDENCE: "Your documents don’t answer this directly",
   ANSWER_FAILED_VALIDATION: "Your documents don’t answer this directly",
   ANSWER_OFF_TOPIC: "Your documents don’t answer this directly",
+  CLAIM_NOT_CONFIRMED: "Not confirmed by your documents",
 };
 
 function NoAnswer({ reason, onRetry }: { reason: Answer["no_answer"]; onRetry: () => void }) {

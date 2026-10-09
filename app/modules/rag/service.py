@@ -51,7 +51,8 @@ from app.modules.rag.calculate import (
 )
 from app.modules.rag.injection import strip_instructions
 from app.modules.rag.evidence import (
-    EvidenceItem, EvidenceSet, applies_to_reader, asks_yes_no, build_evidence, coverage_of, describes_readers_case,
+    EvidenceItem, EvidenceSet, applies_to_reader, asks_to_confirm, asks_yes_no, build_evidence, coverage_of,
+    describes_readers_case,
     is_document_question, key_terms,
     situation_figures, situation_terms,
 )
@@ -175,7 +176,9 @@ HISTORY_KEY_CHARS = 300
 #          (_check_reasoning) with one retry; change-over-time questions read every version; third-person cases
 #   v65    a calculation answer that never works out the figure gets one short compute call (_computed_answer);
 #          dates are not terms; "Q." / "Q63:" labels dropped
-ANSWER_CACHE_VERSION = "v65"
+#   v66    two or more dates in a question compare the versions in force on each (plan.as_of_dates);
+#          "a user says the policy permits X, can you confirm?" answers Yes/No from a rule, or CLAIM_NOT_CONFIRMED
+ANSWER_CACHE_VERSION = "v66"
 # No supported answer in the version in force: worth looking one version back.
 # Earlier versions answer only what the version in force does not cover. An answer it gave that the
 # checks then withheld (ANSWER_FAILED_VALIDATION, ANSWER_OFF_TOPIC) means it covers the subject:
@@ -1179,6 +1182,20 @@ class RAGService:
         """
         versions = self._searchable_versions(principal, [])
         today = datetime.now(UTC).date()
+        if plan.as_of_dates and not plan.version_ids:
+            # "Compare a loan sanctioned on 2026-06-15 with one on 2025-06-15": the version of each policy
+            # in force on each date (of the policies the question names, when it names any).
+            pool = [(v, n) for v, n in versions if v.policy_id in referenced] if referenced else versions
+            covered = [on for on in plan.as_of_dates if any(_in_force(v, on) for v, _ in pool)]
+            if len(covered) < 2:
+                # One date with a version in force ("born on 1990-05-01, sanctioned on 2025-06-15"): nothing to
+                # compare; the question is about the rules in force on that date.
+                on = covered[0] if covered else plan.as_of_dates[-1]
+                plan.query_class = QueryClass.HISTORICAL if on < today else QueryClass.CURRENT
+                plan.mode, plan.as_of, plan.as_of_dates = "as_of", on, []
+                plan.explanation = f"As in force on {on.isoformat()}"
+                return
+            plan.version_ids = [v.id for v, _ in pool if any(_in_force(v, on) for on in covered)]
         if plan.version_labels and not plan.version_ids:
             wanted = {normal_label(label) for label in plan.version_labels}
             if referenced:
@@ -1283,6 +1300,10 @@ class RAGService:
             return [dataclasses.replace(filters, policy_ids=[p]) for p in named[:MAX_SIDES]]
         if plan.query_class is QueryClass.COMPARISON and filters.version_scope.mode == "versions":
             versions = filters.version_scope.version_ids
+            if plan.as_of_dates and (policy := next(
+                    (c.policy_id for c in candidates or [] if c.policy_id and c.version_id in set(versions)), None)):
+                # The dates' versions of every policy: those of the policy whose passage matched best.
+                versions = [v.id for v, _ in self._searchable_versions(principal, [policy]) if v.id in set(versions)]
         elif (plan.query_class in (QueryClass.CURRENT, QueryClass.HISTORICAL)
               and filters.version_scope.mode == "versions" and len(filters.version_scope.version_ids) > 1):
             versions = filters.version_scope.version_ids  # earlier versions searched together (fallback)
@@ -1958,8 +1979,14 @@ class RAGService:
                 select(PolicyVersion.id, PolicyVersion.version_label).where(PolicyVersion.id.in_(plan.version_ids))
             ).all())
             cited_versions = {s.version_id for s in sources}
-            uncovered = [labels[v] for v in plan.version_ids if v in labels and v not in cited_versions]
-            if uncovered and len(uncovered) < len(plan.version_ids):
+            compared = plan.version_ids
+            if plan.as_of_dates:
+                # The dates' versions of every policy were searched; only the cited policies' were compared.
+                cited_policies = {s.policy_id for s in sources}
+                compared = list(self.session.scalars(select(PolicyVersion.id).where(
+                    PolicyVersion.id.in_(plan.version_ids), PolicyVersion.policy_id.in_(cited_policies))).all())
+            uncovered = [labels[v] for v in compared if v in labels and v not in cited_versions]
+            if uncovered and len(uncovered) < len(compared):
                 warnings.append("Nothing in " + " or ".join(f"Version {label}" for label in uncovered)
                                 + " addresses this, so it could not be compared.")
             for odd in unrelated_versions(self.session, plan.version_ids).values():
@@ -2271,7 +2298,13 @@ class RAGService:
                 "policy to make it quicker."
             ),
         }
-        explained = None if no_answer.message else _explain_not_found(no_answer.reason, evidence)
+        reason = no_answer.reason
+        claim = reason in NOT_FOUND_REASONS and not no_answer.message and asks_to_confirm(request.question)
+        explained = None if no_answer.message else _explain_not_found(reason, evidence, claim=claim)
+        if claim:
+            # "A user says the policy permits X. Can you confirm?": nothing read says X, so it is not confirmed.
+            no_answer = _NoAnswer("CLAIM_NOT_CONFIRMED",
+                                  missing_terms=[] if reason == "ANSWER_OFF_TOPIC" else no_answer.missing_terms)
         return AnswerResponse(
             question=request.question, status="no_answer", answer=None, claims=[], sources=[],
             conflicts=[], warnings=[],
@@ -2426,10 +2459,12 @@ MAX_NEARBY_TOPICS = 3
 _NOT_A_TOPIC = re.compile(r"^(?:front\s+matter|contents|table\s+of\s+contents|index|annexures?)$", re.I)
 
 
-def _explain_not_found(reason: str, evidence: EvidenceSet) -> tuple[str, list[str]] | None:
+def _explain_not_found(reason: str, evidence: EvidenceSet, *, claim: bool = False) -> tuple[str, list[str]] | None:
     """A no-answer that says what was read and what to ask instead: the documents and sections that came
     closest ("Pricing and Fee Schedule in the Home Loan Guide"), and questions about what they do cover.
-    None for a reason that is not about the documents lacking the answer."""
+    None for a reason that is not about the documents lacking the answer.
+
+    `claim`: the question asks to confirm what someone says the documents state, and they do not state it."""
     if reason not in NOT_FOUND_REASONS:
         return None
     topics: list[tuple[str, str]] = []  # (section, document), closest first
@@ -2444,7 +2479,10 @@ def _explain_not_found(reason: str, evidence: EvidenceSet) -> tuple[str, list[st
     where = " and ".join(f"the {d}" if not d.lower().startswith("the ") else d for d in documents[:2])
     headings = [f"“{section}”" for section, _ in topics]
     read = headings[0] if len(headings) == 1 else ", ".join(headings[:-1]) + " and " + headings[-1] if headings else ""
-    if not topics:
+    if claim:
+        message = ("I can't confirm that claim: nothing in the documents you can access says it." if not topics
+                   else f"I can't confirm that claim. I read {read} in {where}, and nothing there says it.")
+    elif not topics:
         message = ("I didn't find anything on this in the documents you can access, and I only answer from what "
                    "they say.")
     elif reason in ("KEY_TERMS_NOT_FOUND", "NO_RELEVANT_DOCUMENTS", "LOW_RELEVANCE"):

@@ -52,6 +52,20 @@ def parse_date(text: str, order: str = "DMY") -> date | None:
     return best[1] if best else None
 
 
+def parse_dates(text: str, order: str = "DMY") -> list[date]:
+    """Every complete date in `text`, in the order written, each once."""
+    found: list[tuple[int, date]] = []
+    taken: list[tuple[int, int]] = []
+    for pattern in PATTERNS:
+        for match in pattern.finditer(text):
+            if any(start < match.end() and match.start() < end for start, end in taken):
+                continue  # part of a date another pattern already read
+            if parsed := _build(match, order):
+                found.append((match.start(), parsed))
+                taken.append(match.span())
+    return list(dict.fromkeys(d for _, d in sorted(found)))
+
+
 def parse_month_year(text: str) -> tuple[int, int] | None:
     """'March 2025' -> (2025, 3). Used for historical questions."""
     match = MONTH_YEAR.search(text)

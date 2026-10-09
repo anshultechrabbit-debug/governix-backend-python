@@ -113,3 +113,28 @@ def test_minor_versions_stay_distinct():
     from app.modules.rag.query_plan import normal_label
 
     assert normal_label("2.1") != normal_label("2.10")
+
+
+@pytest.mark.parametrize("question, dates", [
+    ("Compare a loan sanctioned on 2026-06-15 with one sanctioned on 2025-06-15: what is the applicable "
+     "credit-score threshold in each period?", [date(2026, 6, 15), date(2025, 6, 15)]),
+    ("What was the processing fee in March 2024 and in March 2026?", [date(2024, 3, 31), date(2026, 3, 31)]),
+    ("Is the minimum score for a loan sanctioned on 15/06/2025 different from now?", [date(2025, 6, 15), TODAY]),
+    ("Compare the threshold on 2025-06-15 with one sanctioned today.", [date(2025, 6, 15), TODAY]),
+])
+def test_two_dates_compare_the_versions_in_force_on_each(question, dates):
+    plan = plan_query(question, today=TODAY)
+    assert plan.query_class is QueryClass.COMPARISON and plan.as_of_dates == dates
+
+
+@pytest.mark.parametrize("question", [
+    "What is the current fee for a loan sanctioned on 2025-06-15?",
+    "My loan was sanctioned on 2025-06-15; is my current EMI higher than the cap?",
+])
+def test_one_date_stays_an_as_of_question(question):
+    plan = plan_query(question, today=TODAY)
+    assert plan.query_class is QueryClass.HISTORICAL and plan.as_of == date(2025, 6, 15) and not plan.as_of_dates
+
+
+def test_a_range_of_years_is_a_period_not_two_dates():
+    assert not plan_query("What changed between 2020 and 2024?", today=TODAY).as_of_dates

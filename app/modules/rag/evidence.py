@@ -21,10 +21,11 @@ from app.modules.auth.acl import can_see
 from app.modules.auth.permissions import Principal
 from app.modules.categories.model import Category
 from app.modules.citations.numerics import extract_numeric_facts, sentence_at
+from app.modules.ingestion.analysis.dates import DATE_FRAGMENT, MONTH_YEAR
 from app.modules.rag.injection import strip_instructions
 from app.modules.rag.query_plan import (
     COMPARISON_WORDS, OVER_TIME_WORDS, PERIOD_WORDS, WHEN_INTRODUCED_WORDS, asks_over_time, asks_when_introduced,
-    asks_which_period, compares_versions, without_version_refs,
+    asks_which_period, compares_versions, dates_in_question, without_version_refs,
 )
 from app.modules.rag.validation import TermIndex
 from app.modules.documents.model import Document, DocumentStatus
@@ -234,6 +235,29 @@ class EvidenceSet:
         return {item.id: item for item in self.items}
 
 
+# "A user says the policy permits X. Can you confirm?", "Is it true that ...?", "Verify this claim": the reader
+# asks whether the documents back a statement someone made. "Can you confirm the fee?" asks for the fee.
+_CLAIM_TO_CONFIRM = re.compile(
+    r"\bis\s+it\s+(?:true|correct|right|accurate)\s+(?:that|to\s+say)\b"
+    r"|\b(?:confirm|verify|validate|check|corroborate)\s+(?:this|that|the|their|his|her|my|such\s+an?)?\s*"
+    r"(?:claim|statement|assertion|allegation)s?\b"
+    r"|\b(?:confirm|verify)\s+(?:that|whether|if)\s+(?:the|this|our|your)\s+(?:policy|document|guide|rules?|bank)\b"
+    r"|\b(?:someone|somebody|a\s+(?:user|customer|client|colleague|borrower|friend|agent|person|caller|staff\s+member)|"
+    r"(?:my|our)\s+(?:colleague|friend|manager|agent|branch|officer|relationship\s+manager|advisor|adviser))\s+"
+    r"(?:says?|said|claims?|claimed|told\s+me|tells\s+me|insists?|insisted)\b",
+    re.I,
+)
+
+
+def asks_to_confirm(question: str) -> bool:
+    """ "A user says the policy permits X. Can you confirm that claim?", "Is it true that ...?"."""
+    return bool(_CLAIM_TO_CONFIRM.search(question))
+
+
+# "... different from now?", "... with one sanctioned today": today is one of the dates compared.
+_TODAY_WORDS = frozenset("today currently presently".split())
+
+
 def key_terms(question: str) -> list[str]:
     """Subject terms the evidence must contain. Numbers of two or more digits count:
     "170 schemes" or "in 2050" must be in the evidence, not only nearby words. "Version 2.0"
@@ -244,11 +268,19 @@ def key_terms(question: str) -> list[str]:
         framing = framing | COMPARISON_WORDS | WHEN_INTRODUCED_WORDS
     if asks_which_period(question):  # "Which period had the lowest EMI?": the subject is the EMI
         framing = framing | PERIOD_WORDS
+    if len(dates_in_question(question)) >= 2:
+        # "... on 2026-06-15 and on 2025-06-15: the threshold in each period?", "... different from now?": the
+        # subject is the threshold; the dates, and how it moved between them, choose the versions.
+        framing = framing | PERIOD_WORDS | OVER_TIME_WORDS | _TODAY_WORDS
     if asks_over_time(question):  # "Has the late payment penalty increased?": the subject is the penalty
         framing = framing | OVER_TIME_WORDS | PERIOD_WORDS | COMPARISON_WORDS
     if applies_to_reader(question):  # "If my income is Rs 49,000, do I meet the criterion?"
         framing = framing | READER_OUTCOME_WORDS
     question = without_version_refs(question)
+    # "a user says ... can you confirm that claim?": who said it and the asking frame the claim.
+    question = _CLAIM_TO_CONFIRM.sub(" ", question)
+    # "in March 2024 and in March 2026", "on 15 June 2025": a date chooses the version; no passage repeats it.
+    question = MONTH_YEAR.sub(" ", re.sub(DATE_FRAGMENT, " ", question, flags=re.I))
     given = _readers_figures(question)
     return [
         t for t in query_terms(question)

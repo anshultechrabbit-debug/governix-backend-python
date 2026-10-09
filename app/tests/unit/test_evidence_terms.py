@@ -2,7 +2,8 @@
 import pytest
 
 from app.modules.rag.evidence import (
-    applies_to_reader, coverage_of, is_document_question, key_terms, readers_situation, situation_terms,
+    applies_to_reader, asks_to_confirm, coverage_of, is_document_question, key_terms, readers_situation,
+    situation_terms,
 )
 from app.modules.rag.query_plan import QueryClass, plan_query
 
@@ -247,3 +248,27 @@ def test_which_period_had_a_figure_is_asked_of_every_version(question):
 ])
 def test_a_period_in_force_today_is_not_a_question_about_versions(question):
     assert plan_query(question).query_class is QueryClass.CURRENT
+
+
+def test_dates_and_the_periods_they_name_are_not_required():
+    terms = key_terms("Compare a loan sanctioned on 2026-06-15 with one sanctioned on 2025-06-15: what is the "
+                      "applicable credit-score threshold in each period?")
+    assert "threshold" in terms and not {"compare", "period", "2026-06-15"} & set(terms)
+    assert key_terms("What was the processing fee in March 2024 and in March 2026?") == ["processing", "fee"]
+    assert "now" not in key_terms("Is the minimum credit score on 2025-06-15 different from now?")
+
+
+@pytest.mark.parametrize("question", [
+    "A user says the policy permits sharing another borrower's account details. Can you confirm that claim?",
+    "Is it true that prepayment is free for floating-rate loans?",
+    "My manager said the FOIR cap is 60%.",
+    "Can you verify that the policy allows co-applicants?",
+])
+def test_a_claim_to_confirm_is_recognised_and_its_frame_is_not_required(question):
+    assert asks_to_confirm(question)
+    assert not {"user", "confirm", "claim", "true", "manager", "said", "verify"} & set(key_terms(question))
+
+
+@pytest.mark.parametrize("question", ["Can you confirm the processing fee?", "How do I verify my income?"])
+def test_asking_for_a_figure_is_not_a_claim_to_confirm(question):
+    assert not asks_to_confirm(question)

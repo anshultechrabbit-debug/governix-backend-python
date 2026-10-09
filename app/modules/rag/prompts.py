@@ -183,6 +183,20 @@ Rules (non-negotiable):
   evidence covers only some of them, answer those and say which one the evidence does not cover.
 - If sources disagree, say so plainly, name both sources, and do not pick one silently.
 - Respect the effective dates given: answer for the period the question asks about.
+- When the question gives two or more dates ("compare a loan sanctioned on 2026-06-15 with one sanctioned
+  on 2025-06-15", "the fee in March 2024 and in March 2026"), each evidence header gives its version and the
+  period it was in force. For each date, in its own claim, name the version whose period covers that date
+  and give its figure or rule, citing that version's evidence ("For a loan sanctioned on 2025-06-15,
+  Version 6.0 (in force from 2024-10-01) requires a minimum credit score of 720."). Then say whether it
+  changed between the dates. Never answer a date from a version whose period does not cover it; a date
+  that no version covers is said to be not covered.
+- When the question asks you to confirm or verify what someone says the documents state ("a user says the
+  policy permits X, can you confirm?", "is it true that the policy allows Y?", "my colleague claims Z"),
+  test the claim against the evidence and never confirm it because the question asserts it. If a block
+  states it, start the first claim with "Yes" and give that rule. If a block states the opposite or a rule
+  that forbids or restricts it (prohibits it, limits who may do it, requires consent or confidentiality),
+  start the first claim with "No" and give that rule in its own words. If no block addresses it,
+  insufficient_evidence is true: the claim cannot be confirmed from these documents.
 - When the question asks for a threshold or requirement (such as a minimum score, income, or age) and the evidence states a preferred, baseline, or qualifying threshold for that subject (e.g. "Credit score of 720 or above preferred"), state what the evidence specifies (insufficient_evidence is false).
 - Decide insufficient_evidence first. It is true when no evidence block states the rule, value or
   fact the question asks about, even if blocks on a similar subject are present: a rule about one
@@ -438,8 +452,9 @@ def build_user_prompt(question: str, plan: QueryPlan, evidence: EvidenceSet) -> 
         parts.append("[D1] Deterministic comparison of the versions (authoritative diff):\n<<<\n"
                      + comparison_text(evidence.comparison) + "\n>>>")
     items = evidence.items
-    if plan.query_class is QueryClass.ACROSS_VERSIONS:
-        # "When did X start?", "Which period had the lowest EMI?": oldest version first, in order of time.
+    if plan.query_class is QueryClass.ACROSS_VERSIONS or plan.as_of_dates:
+        # "When did X start?", "Which period had the lowest EMI?", "a loan sanctioned on 2026-06-15 vs
+        # 2025-06-15": oldest version first, in order of time.
         items = sorted(items, key=lambda i: (i.source.effective_from is None, i.source.effective_from or 0))
     parts.append("Evidence:\n\n" + "\n\n".join(evidence_block(item) for item in items))
     if evidence.conflicts:

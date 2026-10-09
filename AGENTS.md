@@ -174,6 +174,10 @@ the nearest section headings and documents in the evidence. "Front matter" and c
   to quote it."
 - Off topic (`ANSWER_OFF_TOPIC`): "The closest passages ... are about something other than what you
   asked."
+- Claim not confirmed (v66, `CLAIM_NOT_CONFIRMED`): any of the reasons above, for a question that asks to
+  confirm what someone says (`evidence.asks_to_confirm`): "I can't confirm that claim. I read “Data privacy
+  and record keeping” in the Mortgage Loan Policy, and nothing there says it." Heading: "Not confirmed by
+  your documents".
 
 Suggestions are questions about those sections ("What does the Home Loan Guide say in “Who Can Apply”?").
 When nothing came close, the generic tips in `SUGGESTIONS` are used.
@@ -279,6 +283,30 @@ come from ACL-filtered evidence, so they never name a document the reader can't 
   - "When is the EMI due?" and "When does X start?" are rules in force and stay `CURRENT`.
   - For the Home Loan Guide, the 50% EMI cap first appears in v5 and Flexi-EMI in v7. v4-v6 say
     "flexible EMI dates", a different feature.
+- **Two or more dates** (v66: "Compare a loan sanctioned on 2026-06-15 with one sanctioned on 2025-06-15:
+  what is the credit-score threshold in each period?", "the fee in March 2024 and in March 2026", "... on
+  2025-06-15, different from now?"):
+  - `query_plan.dates_in_question` reads full dates, then months (at month end). It adds today only when one
+    date is set against now (`_AGAINST_NOW`: "with one sanctioned today", "different from now", "vs the
+    current version"). Bare years are left out: "between 2020 and 2024" is a period.
+  - Two or more dates route to `COMPARISON` with `plan.as_of_dates` (version labels and which-period
+    questions win). `_plan_comparison` takes each policy's version in force on each date, from the named
+    policies if any. If only one date has a version in force (a date of birth in a form), it becomes an
+    as-of question on that date.
+  - `_sides` narrows to the policy of the best-matching passage and searches its versions one by one.
+    Evidence is listed oldest first.
+  - The prompt says: one claim per date, naming the version whose period covers it, then whether it
+    changed. Dates, month names, period words and "now/today" are not key terms.
+  - Mortgage Loan Policy: min score v6.0 (2024-10-01 to 2026-04-01) 720, v7.0 725.
+- **Confirming a claim** (v66: "A user says the policy permits sharing another borrower's details. Can you
+  confirm?", "Is it true that ...?", "My manager said ..."):
+  - `evidence.asks_to_confirm` recognises the frame: someone says or claims, "is it true that", or
+    confirm/verify a claim or statement. "Can you confirm the fee?" just asks for the fee.
+  - `key_terms` drops the frame ("a user says", "confirm that claim").
+  - The prompt says: answer "Yes" with the rule that states it, or "No" with a rule that forbids or
+    restricts it. If nothing addresses it, `insufficient_evidence`; never confirm because the question
+    asserts it.
+  - A refusal becomes `CLAIM_NOT_CONFIRMED` (see "Not found" answers). Every claim is still validated.
 - **Which period had a figure** ("Which period had the lowest EMI for Rs 50 lakh for 15 years?", "When
   was the fee highest?"):
   - `query_plan.asks_which_period()` matches past tense only, and routes the question to
