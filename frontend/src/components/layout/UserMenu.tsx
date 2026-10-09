@@ -2,7 +2,7 @@ import { KeyRound, LogOut, ShieldCheck, UserRound } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { api, ApiError } from "../../api/client";
 import { Button, Field, KeyValue, PasswordInput } from "../ui";
-import { humanize } from "../../lib/format";
+import { cn, humanize } from "../../lib/format";
 import { useAuth, useToast } from "../../store/hooks";
 
 const ROLE_LABEL: Record<string, string> = {
@@ -12,8 +12,9 @@ const ROLE_LABEL: Record<string, string> = {
   department_user: "User",
 };
 
-/** The signed-in identity, the exact access it carries, and sign out. */
-export function UserMenu() {
+/** The signed-in identity, the exact access it carries, and sign out. Opens upwards from the sidebar foot, or
+ * down from the phone top bar (`placement="top"`). */
+export function UserMenu({ placement = "side" }: { placement?: "side" | "top" }) {
   const { me, can, logout } = useAuth();
   const [open, setOpen] = useState(false);
   const [changing, setChanging] = useState(false);
@@ -41,10 +42,13 @@ export function UserMenu() {
         {me.full_name.trim().slice(0, 1).toUpperCase()}
       </button>
       {open && (
-        <div role="menu" className="absolute bottom-11 right-0 z-40 w-80 overflow-hidden rounded-lg border border-line bg-surface shadow-xl">
+        <div role="menu" className={cn(
+          "z-40 max-h-[calc(100dvh-5rem)] overflow-y-auto rounded-lg border border-line bg-surface shadow-xl",
+          placement === "top" ? "fixed inset-x-3 top-14 sm:absolute sm:inset-x-auto sm:right-0 sm:top-11 sm:w-80" : "absolute bottom-11 left-0 w-80",
+        )}>
           <div className="border-b border-line p-4">
             <p className="text-sm font-semibold text-ink">{me.full_name}</p>
-            <p className="text-xs text-muted">{me.email}</p>
+            <p className="break-all text-xs text-muted">{me.email}</p>
             <p className="mt-2 flex items-center gap-1.5 text-xs font-medium text-brand-700">
               <ShieldCheck className="size-3.5" />{ROLE_LABEL[me.role]}
             </p>
@@ -125,7 +129,7 @@ function ChangePasswordDialog({ onClose }: { onClose: () => void }) {
           <Field label="Current password"><PasswordInput autoComplete="current-password" required value={current} onChange={(event) => setCurrent(event.target.value)} /></Field>
           <Field label="New password" hint="At least 12 characters"><PasswordInput autoComplete="new-password" required minLength={12} value={next} onChange={(event) => setNext(event.target.value)} /></Field>
           {error && <p className="rounded-md bg-bad-50 px-3 py-2 text-sm text-bad-600" role="alert">{error}</p>}
-          <div className="flex justify-end gap-2">
+          <div className="flex flex-wrap justify-end gap-2">
             <Button type="button" variant="secondary" onClick={onClose}>Cancel</Button>
             <Button type="submit" loading={busy}>Change password</Button>
           </div>

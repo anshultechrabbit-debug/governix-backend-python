@@ -72,7 +72,7 @@ export function UploadBatchPage() {
           <Link to="/documents/upload"><Button>Upload more</Button></Link>
         </>}
       />
-      <Card className="mb-5 p-5">
+      <Card className="mb-5 p-4 sm:p-5">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <Badge tone={tone}>{label}</Badge>
           <p className="text-sm text-muted">
@@ -192,7 +192,7 @@ export function UploadBatchesPage() {
               {data.map((batch) => {
                 const [label, tone] = BATCH_LABELS[batch.status];
                 return (
-                  <li key={batch.id} className="flex flex-wrap items-center justify-between gap-3 px-5 py-4">
+                  <li key={batch.id} className="flex flex-wrap items-center justify-between gap-3 px-4 sm:px-5 py-4">
                     <div>
                       <Link to={`/uploads/${batch.id}`} className="font-medium text-brand-700 hover:underline">{batch.counts.total} file{batch.counts.total === 1 ? "" : "s"}</Link>
                       <p className="text-xs text-muted">{formatDateTime(batch.created_at)}</p>

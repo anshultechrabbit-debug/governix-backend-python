@@ -38,7 +38,7 @@ export function PolicyAssignments({ policy }: { policy: { id: string; name: stri
       <CardHeader
         title="Assigned users"
         subtitle="Users read and ask the AI only about policies assigned to them. Managers see policies in their scope automatically."
-        actions={<div className="flex gap-2">
+        actions={<div className="flex flex-wrap gap-2">
           <Button size="sm" variant="ghost" onClick={() => setHistory((v) => !v)}><History className="size-3.5" />{history ? "Hide history" : "History"}</Button>
           {policy.status === "active" && <Button size="sm" onClick={() => setAdding(true)}><UserPlus className="size-3.5" />Assign users</Button>}
         </div>}
@@ -51,7 +51,7 @@ export function PolicyAssignments({ policy }: { policy: { id: string; name: stri
         ) : (
           <ul className="divide-y divide-line">
             {data.map((a) => (
-              <li key={a.id} className="flex flex-wrap items-center justify-between gap-3 px-5 py-3 text-sm">
+              <li key={a.id} className="flex flex-wrap items-center justify-between gap-3 px-4 sm:px-5 py-3 text-sm">
                 <div className="min-w-0">
                   <p className="font-medium">{a.user_name} {a.removed_at && <Badge className="ml-1">Removed</Badge>}</p>
                   <p className="text-xs text-muted">
@@ -171,7 +171,7 @@ export function UserPoliciesModal({ user, onClose }: { user: User | null; onClos
   return (
     <Modal open={Boolean(user)} onClose={onClose} wide title={`Policies assigned to ${user?.full_name ?? ""}`}
       footer={<Button onClick={onClose}>Done</Button>}>
-      <div className="flex gap-2">
+      <div className="flex flex-col gap-2 sm:flex-row">
         <Select value={policyId} onChange={(e) => setPolicyId(e.target.value)} aria-label="Policy to assign">
           <option value="">Choose a policy to assign…</option>
           {policies.data?.items.filter((p) => !assigned.has(p.id)).map((p) => <option key={p.id} value={p.id}>{p.name}{p.branch_id ? "" : " (global)"}</option>)}
@@ -182,7 +182,7 @@ export function UserPoliciesModal({ user, onClose }: { user: User | null; onClos
         <ul className="mt-4 divide-y divide-line rounded-md border border-line">
           {assignments.data?.map((a) => (
             <li key={a.id} className="flex items-center justify-between gap-3 px-3 py-2 text-sm">
-              <div><p className="font-medium">{a.policy_name}</p><p className="text-xs text-muted">{a.category_name} · assigned {formatDate(a.assigned_at)}</p></div>
+              <div className="min-w-0"><p className="break-words font-medium">{a.policy_name}</p><p className="text-xs text-muted">{a.category_name} · assigned {formatDate(a.assigned_at)}</p></div>
               <Button size="sm" variant="ghost" className="text-bad-600" onClick={() => remove(a)}>Remove</Button>
             </li>
           ))}

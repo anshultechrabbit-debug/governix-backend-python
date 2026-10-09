@@ -80,7 +80,7 @@ export function AssistantPage() {
 
   return (
     <div className="mx-auto grid max-w-7xl gap-6 lg:grid-cols-[16rem_minmax(0,1fr)]">
-      <aside className="sticky top-4 hidden h-[calc(100vh-2rem)] overflow-hidden rounded-lg border border-line bg-surface lg:block">
+      <aside className="sticky top-4 hidden h-[calc(100dvh-2rem)] overflow-hidden rounded-lg border border-line bg-surface lg:block">
         <ChatHistory />
       </aside>
       {historyOpen && (
@@ -99,10 +99,10 @@ export function AssistantPage() {
     <div className="flex min-w-0 flex-col">
       <div className="mb-5 flex items-start justify-between gap-3">
         <div>
-          <h1 className="flex items-center gap-2 text-xl font-semibold tracking-tight"><Bot className="size-5 text-ai-600" />AI Assistant</h1>
+          <h1 className="flex items-center gap-2 text-lg font-semibold tracking-tight sm:text-xl"><Bot className="size-5 text-ai-600" />AI Assistant</h1>
           <p className="mt-1 text-sm text-muted">{scope} Every supported answer is cited.</p>
         </div>
-        <Button variant="secondary" size="sm" className="lg:hidden" onClick={() => setHistoryOpen(true)}><MessagesSquare className="size-4" />History</Button>
+        <Button variant="secondary" size="sm" className="shrink-0 lg:hidden" onClick={() => setHistoryOpen(true)} aria-label="Chat history"><MessagesSquare className="size-4" /><span className="hidden sm:inline">History</span></Button>
       </div>
 
       <Tabs<View> value={view} onChange={setView} tabs={[
@@ -116,7 +116,7 @@ export function AssistantPage() {
         </div>
       ) : (
         <>
-          <section className="min-h-[22rem] space-y-5 pt-5">
+          <section className="min-h-[16rem] space-y-5 pt-5 sm:min-h-[22rem]">
             {loading && <Card><SkeletonRows rows={4} /></Card>}
             {!loading && !turns.length && (
               <EmptyState
@@ -141,10 +141,11 @@ export function AssistantPage() {
             </div>
           )}
 
-          <Card className="sticky bottom-4 mt-5 overflow-hidden shadow-lg">
-            <form onSubmit={submit} className="p-3">
+          <Card className="sticky bottom-2 mt-5 overflow-visible shadow-lg sm:bottom-4">
+            <form onSubmit={submit} className="p-2.5 sm:p-3">
               <Textarea
-                rows={3}
+                rows={2}
+                className="sm:min-h-[5.25rem]"
                 value={question}
                 maxLength={2000}
                 placeholder="Ask a question about an approved policy or procedure…"
@@ -158,7 +159,7 @@ export function AssistantPage() {
                     {MODE_LABELS[options.mode]} <ChevronDown className="size-3.5" />
                   </Button>
                   {showOptions && (
-                    <div className="absolute bottom-10 left-0 z-10 w-80 rounded-lg border border-line bg-surface p-3 shadow-lg">
+                    <div className="absolute bottom-10 left-0 z-10 w-80 max-w-[calc(100vw-2.5rem)] rounded-lg border border-line bg-surface p-3 shadow-lg">
                       <div className="space-y-3">
                         <Field label="Answer using"><Select value={options.mode} onChange={(event) => updateOptions({ mode: event.target.value as AnswerMode })}>
                           {Object.entries(MODE_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
@@ -174,9 +175,9 @@ export function AssistantPage() {
                 </div>
                 {wordless
                   ? <span className="text-xs text-warn-600" role="alert">Type your question in words, e.g. the policy or topic and what you want to know.</span>
-                  : <span className="text-xs text-muted">{question.length}/2000 · Enter to ask, Shift + Enter for a new line</span>}
-                <div className="flex gap-2">
-                  {turns.length > 0 && <Button type="button" variant="secondary" size="sm" disabled={pending} onClick={() => dispatch(clearConversation())}><Plus className="size-3.5" />New chat</Button>}
+                  : <span className="text-xs text-muted">{question.length}/2000<span className="hidden sm:inline"> · Enter to ask, Shift + Enter for a new line</span></span>}
+                <div className="ml-auto flex gap-2">
+                  {turns.length > 0 && <Button type="button" variant="secondary" size="sm" disabled={pending} onClick={() => dispatch(clearConversation())} aria-label="New chat"><Plus className="size-3.5" /><span className="hidden sm:inline">New chat</span></Button>}
                   <Button type="submit" loading={pending} disabled={!question.trim()}><Send className="size-4" />Ask</Button>
                 </div>
               </div>
@@ -195,7 +196,7 @@ function Turn({ turn }: { turn: Turn }) {
   const askAgain = () => dispatch(ask({ id: newId(), question: turn.question, options: turn.options }));
   return (
     <div id={`turn-${turn.id}`} className="scroll-mt-4 space-y-3">
-      <div className="ml-auto w-fit max-w-[80%] whitespace-pre-wrap break-words rounded-lg bg-brand-600 px-4 py-3 text-sm text-white">{turn.question}</div>
+      <div className="ml-auto w-fit max-w-[90%] whitespace-pre-wrap break-words rounded-lg bg-brand-600 px-3.5 py-2.5 text-sm text-white sm:max-w-[80%] sm:px-4 sm:py-3">{turn.question}</div>
       {turn.status === "pending" && <Streaming turn={turn} />}
       {turn.status === "error" && <ErrorState error={new Error(turn.error)} />}
       {turn.status === "done" && answer && (
@@ -222,7 +223,7 @@ function Streaming({ turn }: { turn: Turn }) {
     : STAGE_LABELS[turn.stage ?? "searching"];
   return (
     <Card className="overflow-hidden">
-      <div className="p-5">
+      <div className="p-4 sm:p-5">
         <p className="inline-flex items-center gap-2 text-sm text-muted" aria-live="polite">
           <Sparkles className="size-4 animate-pulse text-ai-600" />{claims.length ? "Writing a grounded answer…" : label}
         </p>
@@ -266,7 +267,7 @@ function Answered({ answer }: { answer: Answer }) {
   ));
 
   return (
-    <div className="p-5">
+    <div className="p-4 sm:p-5">
       <p className="text-sm font-medium text-ai-600">Grounded answer</p>
       {!!older.length && (
         <p className="mt-2 flex items-start gap-1.5 text-xs text-warn-600">
@@ -275,7 +276,7 @@ function Answered({ answer }: { answer: Answer }) {
         </p>
       )}
 
-      <div className="mt-2 space-y-2 text-[15px] leading-7 text-ink">
+      <div className="mt-2 space-y-2 break-words text-[15px] leading-7 text-ink">
         {answer.summary
           ? <p>{answer.summary}</p>
           : lead?.map((claim, index) => <p key={`${claim.text}-${index}`}>{claim.text} {citations(claim.citations)}</p>)}
@@ -405,7 +406,7 @@ function NoAnswer({ reason, onRetry }: { reason: Answer["no_answer"]; onRetry: (
   if (!reason) return null;
   if (TEMPORARY.includes(reason.reason)) {
     return (
-      <div className="p-5">
+      <div className="p-4 sm:p-5">
         <p className="font-medium text-ink">{reason.reason === "DEADLINE_EXCEEDED" ? "This took too long to answer" : "The AI service didn’t respond"}</p>
         <p className="mt-1 text-sm text-ink-soft">{reason.message}</p>
         <Button className="mt-3" size="sm" variant="secondary" onClick={onRetry}>Ask again</Button>
@@ -414,7 +415,7 @@ function NoAnswer({ reason, onRetry }: { reason: Answer["no_answer"]; onRetry: (
   }
   if (NEEDS_DETAIL.includes(reason.reason)) {
     return (
-      <div className="p-5">
+      <div className="p-4 sm:p-5">
         <p className="font-medium text-ink">I need a little more detail</p>
         <p className="mt-1 text-sm text-ink-soft">{reason.message}</p>
       </div>
@@ -422,7 +423,7 @@ function NoAnswer({ reason, onRetry }: { reason: Answer["no_answer"]; onRetry: (
   }
   if (CONVERSATIONAL.includes(reason.reason)) {
     return (
-      <div className="p-5">
+      <div className="p-4 sm:p-5">
         <p className="flex items-start gap-2 text-[15px] leading-7 text-ink"><Sparkles className="mt-1.5 size-4 shrink-0 text-ai-600" />{reason.message}</p>
       </div>
     );
@@ -430,7 +431,7 @@ function NoAnswer({ reason, onRetry }: { reason: Answer["no_answer"]; onRetry: (
   if (reason.reason === "AMBIGUOUS") {
     // Found, but several rules match with different values: ask which one, never pick.
     return (
-      <div className="p-5">
+      <div className="p-4 sm:p-5">
         <p className="font-medium text-ink">Which one do you mean?</p>
         <p className="mt-1 text-sm text-ink-soft">{reason.message}</p>
         {!!reason.suggestions.length && (
@@ -443,7 +444,7 @@ function NoAnswer({ reason, onRetry }: { reason: Answer["no_answer"]; onRetry: (
     );
   }
   return (
-    <div className="p-5">
+    <div className="p-4 sm:p-5">
       <p className="font-medium text-ink">{NOT_FOUND_HEADINGS[reason.reason] ?? "Not covered in your documents"}</p>
       <p className="mt-1 text-sm text-ink-soft">{reason.message}</p>
       {reason.missing_terms.length > 0 && (

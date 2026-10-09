@@ -55,7 +55,7 @@ export function DocumentDetailPage() {
       <DeleteDocumentDialog document={document} open={deleting} onClose={() => setDeleting(false)} onDeleted={() => navigate("/documents")} />
       {justReady && <ReadyDialog document={document} category={categoryName(document.category_id)} onStay={() => setJustReady(false)} />}
       <PageHeader
-        title={<span className="flex items-center gap-3">{document.title ?? document.original_filename}<StatusBadge status={document.filed_by_batch ? "processing" : document.status} /></span>}
+        title={<span className="flex flex-wrap items-center gap-x-3 gap-y-1"><span className="min-w-0 [overflow-wrap:anywhere]">{document.title ?? document.original_filename}</span><StatusBadge status={document.filed_by_batch ? "processing" : document.status} /></span>}
         subtitle={document.title ? document.original_filename : "Name pending confirmation"}
         actions={<>
           {document.page_count && <Link to={`/documents/${document.id}/view`}><Button variant="secondary"><BookOpen className="size-4" />Open viewer</Button></Link>}
@@ -89,7 +89,7 @@ export function DocumentDetailPage() {
           {document.status === "awaiting_confirmation" && !document.filed_by_batch && analysis.data && <AnalysisReview document={document} analysis={analysis.data} />}
           <Card>
             <CardHeader title="Details" />
-            <div className="p-5">
+            <div className="p-4 sm:p-5">
               <KeyValue items={[
                 ["Category", categoryName(document.category_id)],
                 ["Policy", document.policy_id ? <Link className="text-brand-700 hover:underline" to={`/policies/${document.policy_id}`}>Open policy</Link> : "Not yet confirmed"],
@@ -105,7 +105,7 @@ export function DocumentDetailPage() {
         </div>
         <Card className="h-fit">
           <CardHeader title="Processing" subtitle="Live status from the ingestion pipeline" />
-          <div className="p-5">{document.progress && <StageList progress={document.progress} />}</div>
+          <div className="p-4 sm:p-5">{document.progress && <StageList progress={document.progress} />}</div>
         </Card>
       </div>
     </>
@@ -116,7 +116,7 @@ export function DocumentDetailPage() {
 function FiledByBatch({ batchId }: { batchId: string | null }) {
   return (
     <Card>
-      <div className="flex items-start gap-3 p-5 text-sm">
+      <div className="flex items-start gap-3 p-4 sm:p-5 text-sm">
         <Loader2 className="mt-0.5 size-4 shrink-0 animate-spin text-brand-500" />
         <div>
           <p className="font-medium">Filing with its bulk upload</p>

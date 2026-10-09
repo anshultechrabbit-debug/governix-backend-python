@@ -31,7 +31,7 @@ export function LoginPage() {
           <ShieldCheck className="size-7 text-brand-100" />
           <span className="text-lg font-semibold tracking-wide">Governix</span>
         </div>
-        <form onSubmit={submit} className="space-y-4 rounded-lg bg-surface p-6 shadow-xl">
+        <form onSubmit={submit} className="space-y-4 rounded-lg bg-surface p-5 shadow-xl sm:p-6">
           <div>
             <h1 className="text-base font-semibold">Sign in</h1>
             <p className="text-sm text-muted">Policy intelligence for your organization</p>

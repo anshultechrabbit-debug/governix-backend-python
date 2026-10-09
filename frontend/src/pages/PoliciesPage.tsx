@@ -70,13 +70,13 @@ export function PoliciesPage() {
               action={!isUser && can("documents:upload") && <Link to="/documents/upload"><Button>Upload policy</Button></Link>} />
           ) : (
             <>
-              <p className="border-b border-line px-5 py-2 text-xs text-muted">{data.total} polic{data.total === 1 ? "y" : "ies"}</p>
+              <p className="border-b border-line px-4 sm:px-5 py-2 text-xs text-muted">{data.total} polic{data.total === 1 ? "y" : "ies"}</p>
               <ul className="divide-y divide-line">
                 {data.items.map((policy) => {
                   const current = policy.current_version;
                   const versions = `${policy.version_count} version${policy.version_count === 1 ? "" : "s"}`;
                   return (
-                    <li key={policy.id} className="group flex flex-col gap-3 px-5 py-4 transition-colors hover:bg-subtle/40 sm:flex-row sm:items-center">
+                    <li key={policy.id} className="group flex flex-col gap-3 px-4 sm:px-5 py-4 transition-colors hover:bg-subtle/40 sm:flex-row sm:items-center">
                       <div className="flex min-w-0 flex-1 items-start gap-3">
                         <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-brand-50 text-brand-700">
                           <ScrollText className="size-4.5" />

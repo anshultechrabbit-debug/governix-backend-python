@@ -49,13 +49,13 @@ export function PassageSearch({ initialQuery = "" }: { initialQuery?: string }) 
         <form onSubmit={submit} className="space-y-3">
           <div className="flex flex-wrap gap-3">
             <input
-              className="h-10 min-w-[16rem] flex-1 rounded-md border border-line-strong px-3 text-sm placeholder:text-muted focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-100"
+              className="h-10 min-w-0 flex-1 basis-full rounded-md sm:min-w-[16rem] sm:basis-auto border border-line-strong px-3 text-sm placeholder:text-muted focus:border-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-100"
               placeholder="Search policy text, clauses or procedures…"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
               aria-label="Search the policies you can access"
             />
-            <Select className="w-56" value={mode} onChange={(event) => setMode(event.target.value as SearchMode)} aria-label="Version scope">
+            <Select className="min-w-0 flex-1 sm:w-56 sm:flex-none" value={mode} onChange={(event) => setMode(event.target.value as SearchMode)} aria-label="Version scope">
               {MODE_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
             </Select>
             <Button type="submit" loading={search.isPending} disabled={!query.trim()}><Search className="size-4" />Search</Button>

@@ -246,10 +246,10 @@ export function BulkUploadModal({
         </p>
       )}
       {drafts.length > 0 && (
-        <div className={cn("overflow-hidden rounded-md border border-line", policy && staying.length > 1 ? "mt-2" : "mt-4")}>
+        <div className={cn("overflow-x-auto rounded-md border border-line", policy && staying.length > 1 ? "mt-2" : "mt-4")}>
           <table className="w-full text-left text-sm">
             <thead className="border-b border-line bg-subtle/60 text-xs uppercase tracking-wide text-muted">
-              <tr><th className="px-3 py-2 font-medium">Document</th><th className="px-3 py-2 font-medium">Size</th><th className="px-3 py-2 font-medium">Status</th><th className="w-10" /></tr>
+              <tr><th className="px-3 py-2 font-medium">Document</th><th className="hidden px-3 py-2 font-medium sm:table-cell">Size</th><th className="px-3 py-2 font-medium">Status</th><th className="w-10" /></tr>
             </thead>
             <tbody className="divide-y divide-line">
               {drafts.map((d, index) => {
@@ -257,7 +257,7 @@ export function BulkUploadModal({
                 const place = staying.indexOf(d);
                 return (
                   <tr key={d.key} className="align-top">
-                    <td className="px-3 py-2">
+                    <td className="min-w-[11rem] px-3 py-2">
                       <div className="flex items-center gap-2">
                         {policy && place >= 0 && (
                           <Badge tone={place === staying.length - 1 ? "brand" : "neutral"} className="w-16 shrink-0 justify-center">
@@ -278,7 +278,7 @@ export function BulkUploadModal({
                         </label>
                       )}
                     </td>
-                    <td className="whitespace-nowrap px-3 py-2 text-ink-soft">{formatBytes(d.file.size)}</td>
+                    <td className="hidden whitespace-nowrap px-3 py-2 text-ink-soft sm:table-cell">{formatBytes(d.file.size)}</td>
                     <td className="px-3 py-2"><CheckBadge state={d.state === "ready" && d.read === "reading" ? "checking" : d.state} /></td>
                     <td className="px-2 py-2">
                       <div className="flex items-center gap-0.5">
@@ -386,10 +386,12 @@ function jobCounts(job: UploadJob) {
 
 export function UploadQueue({ job }: { job: UploadJob }) {
   return (
-    <div className="overflow-hidden rounded-md border border-line">
+    <div className="overflow-x-auto rounded-md border border-line">
       <table className="w-full text-left text-sm">
         <thead className="border-b border-line bg-subtle/60 text-xs uppercase tracking-wide text-muted">
-          <tr>{["Document", "Size", "Status", "Progress", ""].map((h, i) => <th key={i} className="px-3 py-2 font-medium">{h}</th>)}</tr>
+          <tr>{["Document", "Size", "Status", "Progress", ""].map((h, i) => (
+            <th key={i} className={cn("whitespace-nowrap px-3 py-2 font-medium", h === "Size" && "hidden sm:table-cell")}>{h}</th>
+          ))}</tr>
         </thead>
         <tbody className="divide-y divide-line">
           {job.items.map((item) => {
@@ -397,16 +399,16 @@ export function UploadQueue({ job }: { job: UploadJob }) {
             const cancellable = item.state === "pending" || item.state === "uploading";
             return (
               <tr key={item.key} className="align-top">
-                <td className="px-3 py-2">
+                <td className="min-w-[11rem] px-3 py-2">
                   <div className="flex items-center gap-2"><StateIcon state={item.state} /><span className="break-all">{item.name}</span></div>
                   {item.message && <p className={cn("mt-0.5 pl-6 text-xs", item.state === "failed" ? "text-bad-600" : "text-ink-soft")}>{item.message}</p>}
                   {item.state === "review" && item.documentId && (
                     <Link to={`/documents/${item.documentId}`} className="pl-6 text-xs font-medium text-brand-700 hover:underline">Review</Link>
                   )}
                 </td>
-                <td className="whitespace-nowrap px-3 py-2 text-ink-soft">{formatBytes(item.size)}</td>
+                <td className="hidden whitespace-nowrap px-3 py-2 text-ink-soft sm:table-cell">{formatBytes(item.size)}</td>
                 <td className="px-3 py-2"><Badge tone={tone}>{label}</Badge></td>
-                <td className="w-56 px-3 py-2">
+                <td className="min-w-[9rem] px-3 py-2 sm:w-56">
                   {item.state === "uploading" ? (
                     <div className="flex items-center gap-2"><ProgressBar value={item.progress * 100} /><span className="w-9 text-right text-xs tabular-nums text-muted">{Math.round(item.progress * 100)}%</span></div>
                   ) : item.stages?.length ? <StageTrail stages={item.stages} />

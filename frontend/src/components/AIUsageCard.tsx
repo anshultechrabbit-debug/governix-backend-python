@@ -60,7 +60,7 @@ export function AIUsageCard() {
       {error ? <div className="p-4"><ErrorState error={error} onRetry={refetch} /></div>
         : isLoading || !data ? <SkeletonRows rows={3} />
         : (
-          <div className="space-y-5 p-5">
+          <div className="space-y-5 p-4 sm:p-5">
             {status === "out_of_credit" && (
               <div className="flex gap-2 rounded-md border border-bad-600/20 bg-bad-50 p-3 text-sm text-bad-600">
                 <AlertTriangle className="mt-0.5 size-4 shrink-0" />

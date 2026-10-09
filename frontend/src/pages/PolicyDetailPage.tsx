@@ -78,7 +78,7 @@ export function PolicyDetailPage() {
         {tab === "overview" && (
           <Card>
             <CardHeader title="Overview" />
-            <div className="space-y-6 p-5">
+            <div className="space-y-6 p-4 sm:p-5">
               <KeyValue items={[
                 ["Description", policy.description],
                 ["Issuing department", policy.issuing_department ?? policy.issuer],
@@ -145,7 +145,7 @@ function VersionsTab({ policy, onAdd }: { policy: PolicyDetail; onAdd?: () => vo
   });
   return (
     <div className="space-y-6">
-      {policy.versions.some((v) => v.status === "active") && <Card className="p-5"><Timeline versions={policy.versions} /></Card>}
+      {policy.versions.some((v) => v.status === "active") && <Card className="p-4 sm:p-5"><Timeline versions={policy.versions} /></Card>}
       <Card className="overflow-hidden">
         <CardHeader title="Versions" subtitle="Newest first. Withdraw a version to keep it in the history, or delete it permanently from its menu."
           actions={onAdd && <Button size="sm" onClick={onAdd}><UploadCloud className="size-3.5" />Add Version</Button>} />
@@ -198,16 +198,16 @@ function SummaryTab({ policy }: { policy: PolicyDetail }) {
   return (
     <Card>
       <CardHeader
-        title={<span className="flex items-center gap-2">AI Summary <SuggestedBadge label="AI-generated" /></span>}
+        title={<span className="flex flex-wrap items-center gap-2">AI Summary <SuggestedBadge label="AI-generated" /></span>}
         subtitle="Generated from this version's text only. Dates, the version and the list of changes come from the records, not the AI."
-        actions={<div className="flex items-center gap-2">
+        actions={<div className="flex flex-wrap items-center gap-2">
           <Select className="h-8 w-44" value={selected} onChange={(e) => setSelected(e.target.value)} aria-label="Version">
             {choices.map((v) => <option key={v.id} value={v.id}>v{v.version_label}{v.timeline_state === "current" ? " (latest)" : ""}</option>)}
           </Select>
           {can("policies:manage") && <Button size="sm" variant="ghost" onClick={regenerate}><RefreshCw className="size-3.5" />Regenerate</Button>}
         </div>}
       />
-      <div className="space-y-6 p-5">
+      <div className="space-y-6 p-4 sm:p-5">
         {error ? <ErrorState error={error} onRetry={refetch} />
           : isLoading || !data ? <SkeletonRows rows={4} />
           : (
@@ -268,7 +268,7 @@ function ChangesTab({ policy }: { policy: PolicyDetail }) {
           {withChanges.map((v) => <option key={v.id} value={v.id}>Changes in v{v.version_label}</option>)}
         </select>}
       />
-      <div className="p-5">
+      <div className="p-4 sm:p-5">
         {isLoading || !summary ? <SkeletonRows rows={3} /> : (
           <>
             <p className="mb-3 text-sm font-medium">Version {summary.from_version.label} → Version {summary.to_version.label}</p>
@@ -301,8 +301,8 @@ function RelatedTab({ policy }: { policy: PolicyDetail }) {
     <Card>
       <ul className="divide-y divide-line">
         {rows.map((r) => (
-          <li key={r.id} className="flex items-start justify-between gap-4 px-5 py-3 text-sm">
-            <div>
+          <li key={r.id} className="flex flex-wrap items-start justify-between gap-x-4 gap-y-1 px-4 sm:px-5 py-3 text-sm">
+            <div className="min-w-0 break-words">
               {r.direction === "incoming" ? (
                 <p><Link className="font-medium text-brand-700 hover:underline" to={`/documents/${r.source_document_id}`}>{r.source_title}</Link>{" "}
                   <Badge tone="brand">{r.relation_type}</Badge> this policy{r.clauses.length ? ` (clause ${r.clauses.join(", ")})` : ""}</p>
@@ -338,8 +338,8 @@ function PolicyAudit({ policy }: { policy: PolicyDetail }) {
       {!events.length ? <EmptyState title="No audit events" /> : (
         <ul className="divide-y divide-line">
           {events.map((e) => (
-            <li key={e.id} className="flex justify-between gap-4 px-5 py-3 text-sm">
-              <span>{humanize(e.action)}{e.details?.label ? ` · v${e.details.label}` : ""}{e.details?.reason ? ` — ${e.details.reason}` : ""}</span>
+            <li key={e.id} className="flex flex-wrap justify-between gap-x-4 gap-y-1 px-4 sm:px-5 py-3 text-sm">
+              <span className="min-w-0 break-words">{humanize(e.action)}{e.details?.label ? ` · v${e.details.label}` : ""}{e.details?.reason ? ` — ${e.details.reason}` : ""}</span>
               <span className="text-xs text-muted">{formatDateTime(e.created_at)}</span>
             </li>
           ))}

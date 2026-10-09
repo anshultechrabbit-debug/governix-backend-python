@@ -188,7 +188,7 @@ export function AnalysisReview({ document, analysis }: { document: DocumentRead;
         subtitle="Governix has already read the document. Check what it found and confirm it in one click."
         actions={<Badge tone={decisionTone}>{DECISION_TITLES[analysis.decision]}</Badge>}
       />
-      <div className="grid gap-6 p-5 lg:grid-cols-2">
+      <div className="grid gap-6 p-4 sm:p-5 lg:grid-cols-2">
         <div className="space-y-4">
           <ul className="space-y-1 text-sm text-ink-soft">
             {["File validated", "Text extracted", "Document classified", "Existing documents checked"].map((step) => (

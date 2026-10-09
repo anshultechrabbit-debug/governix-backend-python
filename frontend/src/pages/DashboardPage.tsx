@@ -30,7 +30,7 @@ export function DashboardPage() {
         </>}
       />
       {error && <ErrorState error={error} onRetry={refetch} />}
-      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 sm:gap-4 lg:grid-cols-4">
         <Stat label="Documents" value={data?.counts.documents ?? "—"} hint={data ? `${data.counts.ready_documents} searchable` : undefined} />
         <Stat label="Active policies" value={data?.counts.active_policies ?? "—"} />
         <Stat label="Processing" value={data?.counts.processing ?? "—"} />
@@ -40,7 +40,7 @@ export function DashboardPage() {
       </div>
 
       {/* Role-aware entry points into the spec's flows. */}
-      <div className="mt-6 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+      <div className="mt-5 grid gap-3 sm:mt-6 sm:grid-cols-2 sm:gap-4 xl:grid-cols-4">
         {can("policies:read") && (
           <Link to="/policies" className="rounded-lg border border-line bg-surface p-4 transition-colors hover:border-brand-500/40">
             <ScrollText className="size-5 text-brand-600" />
@@ -72,7 +72,7 @@ export function DashboardPage() {
       {/* OpenAI usage card: hidden for now. */}
       {/* {me?.role === "org_admin" && <div className="mt-6"><AIUsageCard /></div>} */}
 
-      <div className="mt-6 grid gap-6 xl:grid-cols-3">
+      <div className="mt-5 grid gap-5 sm:mt-6 sm:gap-6 xl:grid-cols-3">
         <Card className="xl:col-span-2">
           <CardHeader title={isUser ? "Policies updated for you" : "Recent policy changes"} subtitle="Latest confirmed versions" />
           {isLoading ? <SkeletonRows rows={4} /> : !data?.recent_changes.length ? (
@@ -83,9 +83,9 @@ export function DashboardPage() {
           ) : (
             <ul className="divide-y divide-line">
               {data.recent_changes.map((change) => (
-                <li key={change.version_id} className="flex items-center justify-between px-5 py-3 text-sm">
-                  <Link to={`/policies/${change.policy_id}`} className="font-medium text-brand-700 hover:underline">{change.policy_name}</Link>
-                  <span className="flex items-center gap-4 text-muted">
+                <li key={change.version_id} className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 px-4 py-3 text-sm sm:px-5">
+                  <Link to={`/policies/${change.policy_id}`} className="min-w-0 break-words font-medium text-brand-700 hover:underline">{change.policy_name}</Link>
+                  <span className="flex flex-wrap items-center gap-x-4 gap-y-1 text-muted">
                     <span className="font-medium text-ink">v{change.version_label}</span>
                     {hasRealEffectiveDate(change) && <span>Effective {formatDate(change.effective_from)}</span>}
                   </span>
@@ -103,9 +103,9 @@ export function DashboardPage() {
             ) : (
               <ul className="divide-y divide-line">
                 {data.attention.map((item) => (
-                  <li key={item.id} className="px-5 py-3 text-sm">
+                  <li key={item.id} className="px-4 py-3 text-sm sm:px-5">
                     <div className="flex items-center justify-between gap-2">
-                      <Link to={`/documents/${item.id}`} className="truncate font-medium text-brand-700 hover:underline">{item.title}</Link>
+                      <Link to={`/documents/${item.id}`} className="min-w-0 truncate font-medium text-brand-700 hover:underline">{item.title}</Link>
                       <StatusBadge status={item.status} />
                     </div>
                     {item.status === "failed" && <p className="mt-1 flex gap-1 text-xs text-bad-600"><AlertTriangle className="size-3.5 shrink-0" />{item.reason}</p>}
@@ -123,8 +123,8 @@ export function DashboardPage() {
           ) : (
             <ul className="divide-y divide-line">
               {data.recent_queries.map((query) => (
-                <li key={query.id} className="flex items-center justify-between gap-4 px-5 py-2.5 text-sm">
-                  <span className="truncate">{query.question}</span>
+                <li key={query.id} className="flex flex-col gap-1 px-4 py-2.5 text-sm sm:flex-row sm:items-center sm:justify-between sm:gap-4 sm:px-5">
+                  <span className="min-w-0 line-clamp-2 sm:truncate">{query.question}</span>
                   <span className="flex shrink-0 items-center gap-3 text-xs text-muted">
                     {query.status === "no_answer" ? <StatusBadge status="rejected" /> : null}
                     {formatDateTime(query.created_at)}

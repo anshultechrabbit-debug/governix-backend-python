@@ -64,19 +64,19 @@ export function TicketPage() {
     <>
       <nav className="mb-3 text-sm text-muted"><Link to="/support" className="flex items-center gap-1 hover:text-ink"><ArrowLeft className="size-4" />Support</Link></nav>
       <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h1 className="text-xl font-semibold tracking-tight">{ticket.subject}</h1>
+        <div className="min-w-0">
+          <h1 className="break-words text-lg font-semibold tracking-tight sm:text-xl">{ticket.subject}</h1>
           <p className="mt-1 text-sm text-muted">{ticket.kind === "complaint" ? "Complaint" : "Support request"}{ticket.category ? ` · ${ticket.category}` : ""} · raised {formatDateTime(ticket.created_at)} by {ticket.created_by_name ?? "—"}</p>
         </div>
-        <div className="flex gap-2"><Badge tone={PRIORITY_TONE[ticket.priority]}>{humanize(ticket.priority)} priority</Badge><Badge tone={tone}>{label}</Badge></div>
+        <div className="flex flex-wrap gap-2"><Badge tone={PRIORITY_TONE[ticket.priority]}>{humanize(ticket.priority)} priority</Badge><Badge tone={tone}>{label}</Badge></div>
       </div>
 
       <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_20rem]">
         <div className="min-w-0 space-y-4">
-          <Card className="p-5"><p className="whitespace-pre-wrap text-sm leading-relaxed">{ticket.description}</p></Card>
+          <Card className="p-4 sm:p-5"><p className="whitespace-pre-wrap text-sm leading-relaxed">{ticket.description}</p></Card>
           <Card>
             <CardHeader title="Conversation" />
-            <ol className="space-y-3 p-5">
+            <ol className="space-y-3 p-4 sm:p-5">
               {ticket.messages.map((m) => m.status_change && !m.body ? (
                 <li key={m.id} className="text-center text-xs text-muted">{m.author_name ?? "Someone"} set the status to <span className="font-medium">{TICKET_STATUS[m.status_change][0]}</span> · {formatDateTime(m.created_at)}</li>
               ) : (
@@ -97,7 +97,7 @@ export function TicketPage() {
                   }}><Send className="size-4" />Send</Button>
                 </div>
               </div>
-            ) : <p className="border-t border-line px-5 py-3 text-sm text-muted">This ticket is closed.{mine && " Reopen it to reply."}</p>}
+            ) : <p className="border-t border-line px-4 sm:px-5 py-3 text-sm text-muted">This ticket is closed.{mine && " Reopen it to reply."}</p>}
           </Card>
         </div>
 

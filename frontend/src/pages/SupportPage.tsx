@@ -80,7 +80,7 @@ export function SupportPage() {
                 const [label, tone] = TICKET_STATUS[t.status];
                 return (
                   <li key={t.id}>
-                    <Link to={`/support/${t.id}`} className="flex flex-wrap items-center gap-3 px-5 py-3 hover:bg-subtle/50">
+                    <Link to={`/support/${t.id}`} className="flex flex-wrap items-center gap-3 px-4 sm:px-5 py-3 hover:bg-subtle/50">
                       <div className="min-w-0 flex-1">
                         <p className="truncate font-medium">{t.subject}</p>
                         <p className="text-xs text-muted">

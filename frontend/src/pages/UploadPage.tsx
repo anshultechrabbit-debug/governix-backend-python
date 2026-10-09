@@ -419,9 +419,9 @@ export function UploadPage() {
               <ul className="divide-y divide-line">
                 {files.map((item) => (
                   <li key={item.key} className="flex items-center gap-3 px-4 py-3 text-sm">
-                    <FileText className="size-4 text-brand-500" />
+                    <FileText className="size-4 shrink-0 text-brand-500" />
                     <span className="min-w-0 flex-1 truncate">{item.file.name}</span>
-                    <span className="text-xs text-muted">{formatBytes(item.file.size)}</span>
+                    <span className="hidden text-xs text-muted sm:inline">{formatBytes(item.file.size)}</span>
                     <SendBadge state={sending[item.key]} />
                     {!busy && <button className="rounded p-1 text-muted hover:bg-subtle" aria-label={`Remove ${item.file.name}`} onClick={() => removeItem(item.key)}><X className="size-4" /></button>}
                   </li>

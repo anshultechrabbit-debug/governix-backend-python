@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { ArrowLeft, ChevronLeft, ChevronRight, Quote, ZoomIn, ZoomOut } from "lucide-react";
+import { ArrowLeft, ChevronLeft, ChevronRight, Info, ListTree, Quote, ZoomIn, ZoomOut } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router";
 import { api } from "../api/client";
@@ -41,6 +41,8 @@ export function DocumentViewerPage() {
   const page = Math.max(1, Number(params.get("page") ?? 1));
   const chunkId = params.get("chunk");
   const [zoom, setZoom] = useState(1.4);
+  // Below the widths where they fit beside the page, the outline and the details open over it.
+  const [panel, setPanel] = useState<"outline" | "info" | null>(null);
   const audited = useRef(false);
   const categoryName = useCategoryName();
 
@@ -74,31 +76,41 @@ export function DocumentViewerPage() {
   if (error) return <ErrorState error={error} />;
 
   return (
-    <div className="-mx-8 -my-7 flex h-screen flex-col">
-      <div className="flex items-center justify-between border-b border-line bg-surface px-5 py-2.5">
-        <div className="flex min-w-0 items-center gap-3">
+    <div className="-mx-4 -my-5 flex h-[calc(100dvh-3.5rem)] flex-col sm:-mx-6 lg:-mx-8 lg:-my-7 lg:h-screen">
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5 border-b border-line bg-surface px-3 py-2 sm:px-5 sm:py-2.5">
+        <div className="flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
           <Link to={`/documents/${id}`} className="rounded p-1 text-muted hover:bg-subtle" aria-label="Back"><ArrowLeft className="size-4" /></Link>
           <p className="truncate text-sm font-semibold">{document?.title ?? document?.original_filename}</p>
           {version && <Badge tone="brand">v{version.version_label}</Badge>}
         </div>
-        <div className="flex items-center gap-1">
-          <Button variant="ghost" size="sm" onClick={() => setZoom((z) => Math.max(0.6, +(z - 0.2).toFixed(1)))} aria-label="Zoom out"><ZoomOut className="size-4" /></Button>
-          <span className="w-12 text-center text-xs tabular-nums text-muted">{Math.round(zoom * 100)}%</span>
-          <Button variant="ghost" size="sm" onClick={() => setZoom((z) => Math.min(2.6, +(z + 0.2).toFixed(1)))} aria-label="Zoom in"><ZoomIn className="size-4" /></Button>
-          <span className="mx-2 h-5 w-px bg-line" />
-          <Button variant="ghost" size="sm" disabled={page <= 1} onClick={() => goTo(page - 1)} aria-label="Previous page"><ChevronLeft className="size-4" /></Button>
-          <span className="text-sm tabular-nums">Page {page} of {pageCount.toLocaleString()}</span>
-          <Button variant="ghost" size="sm" disabled={page >= pageCount} onClick={() => goTo(page + 1)} aria-label="Next page"><ChevronRight className="size-4" /></Button>
+        <div className="flex flex-wrap items-center gap-1">
+          <Button variant="ghost" size="sm" className="px-2 md:hidden" onClick={() => setPanel("outline")} aria-label="Sections and pages"><ListTree className="size-4" /></Button>
+          <Button variant={chunkId ? "secondary" : "ghost"} size="sm" className="px-2 xl:hidden" onClick={() => setPanel("info")}
+            aria-label={chunkId ? "Cited evidence and details" : "Document details"}>
+            {chunkId ? <Quote className="size-4" /> : <Info className="size-4" />}<span className="hidden sm:inline">{chunkId ? "Evidence" : "Details"}</span>
+          </Button>
+          <span className="mx-1 h-5 w-px bg-line xl:hidden" />
+          <Button variant="ghost" size="sm" className="px-2" onClick={() => setZoom((z) => Math.max(0.6, +(z - 0.2).toFixed(1)))} aria-label="Zoom out"><ZoomOut className="size-4" /></Button>
+          <span className="w-10 text-center text-xs tabular-nums text-muted sm:w-12">{Math.round(zoom * 100)}%</span>
+          <Button variant="ghost" size="sm" className="px-2" onClick={() => setZoom((z) => Math.min(2.6, +(z + 0.2).toFixed(1)))} aria-label="Zoom in"><ZoomIn className="size-4" /></Button>
+          <span className="mx-1 h-5 w-px bg-line sm:mx-2" />
+          <Button variant="ghost" size="sm" className="px-2" disabled={page <= 1} onClick={() => goTo(page - 1)} aria-label="Previous page"><ChevronLeft className="size-4" /></Button>
+          <span className="text-sm tabular-nums"><span className="hidden sm:inline">Page </span>{page}<span className="hidden sm:inline"> of</span><span className="sm:hidden">/</span>{" "}{pageCount.toLocaleString()}</span>
+          <Button variant="ghost" size="sm" className="px-2" disabled={page >= pageCount} onClick={() => goTo(page + 1)} aria-label="Next page"><ChevronRight className="size-4" /></Button>
         </div>
       </div>
 
       <div className="flex min-h-0 flex-1">
+        {panel && <div className={cn("fixed inset-0 z-40 bg-ink/40", panel === "outline" ? "md:hidden" : "xl:hidden")} onClick={() => setPanel(null)} />}
         {/* Left: pages and outline */}
-        <aside className="w-60 shrink-0 overflow-y-auto border-r border-line bg-surface p-3">
+        <aside className={cn(
+          "w-60 shrink-0 overflow-y-auto border-r border-line bg-surface p-3",
+          panel === "outline" ? "fixed inset-y-0 left-0 z-50 w-72 max-w-[85vw] shadow-xl md:static md:z-auto md:w-60 md:shadow-none" : "hidden md:block",
+        )}>
           <p className="px-1 pb-2 text-xs font-medium uppercase tracking-wide text-muted">Go to page</p>
           <input
             type="number" min={1} max={pageCount} defaultValue={page} key={page}
-            onKeyDown={(e) => e.key === "Enter" && goTo(Number((e.target as HTMLInputElement).value))}
+            onKeyDown={(e) => { if (e.key === "Enter") { goTo(Number((e.target as HTMLInputElement).value)); setPanel(null); } }}
             className="mb-4 h-8 w-full rounded-md border border-line-strong px-2 text-sm"
           />
           <p className="px-1 pb-2 text-xs font-medium uppercase tracking-wide text-muted">Sections</p>
@@ -107,7 +119,7 @@ export function DocumentViewerPage() {
               {outline.data.map((s) => (
                 <li key={s.id}>
                   <button
-                    onClick={() => goTo(s.page_start)}
+                    onClick={() => { goTo(s.page_start); setPanel(null); }}
                     className={cn("w-full truncate rounded px-2 py-1 text-left text-xs hover:bg-subtle", s.page_start === page && "bg-brand-50 text-brand-700")}
                     style={{ paddingLeft: `${0.5 + (s.level - 1) * 0.75}rem` }}
                     title={`${s.number ?? ""} ${s.title}`}
@@ -121,16 +133,20 @@ export function DocumentViewerPage() {
         </aside>
 
         {/* Center: rendered page */}
-        <section className="flex-1 overflow-auto bg-subtle p-6">
-          <div className="mx-auto w-fit">
+        <section className="min-w-0 flex-1 overflow-auto bg-subtle p-3 sm:p-6">
+          {/* On a phone the page fits the screen width until zoomed in past the default. */}
+          <div className={cn("mx-auto w-fit", zoom <= 1.4 && "max-sm:max-w-full")}>
             {image.error ? <ErrorState error={image.error} /> : image.url ? (
-              <img src={image.url} alt={`Page ${page}`} className="rounded bg-white shadow-md" />
-            ) : <div className="flex h-96 w-96 items-center justify-center"><Spinner /></div>}
+              <img src={image.url} alt={`Page ${page}`} className={cn("rounded bg-white shadow-md", zoom <= 1.4 && "max-sm:h-auto max-sm:max-w-full")} />
+            ) : <div className="flex h-96 w-72 max-w-full items-center justify-center sm:w-96"><Spinner /></div>}
           </div>
         </section>
 
         {/* Right: document and evidence information */}
-        <aside className="w-80 shrink-0 space-y-4 overflow-y-auto border-l border-line bg-surface p-4">
+        <aside className={cn(
+          "w-80 shrink-0 space-y-4 overflow-y-auto border-l border-line bg-surface p-4",
+          panel === "info" ? "fixed inset-y-0 right-0 z-50 max-w-[90vw] shadow-xl xl:static xl:z-auto xl:shadow-none" : "hidden xl:block",
+        )}>
           {chunkId && chunk.data && (
             <Card className="border-warn-600/30 bg-warn-50 p-3">
               <p className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-warn-600"><Quote className="size-3.5" />Cited evidence</p>
@@ -142,7 +158,7 @@ export function DocumentViewerPage() {
                 </p>
               )}
               {(page < chunk.data.page_start || page > chunk.data.page_end) && (
-                <Button size="sm" variant="secondary" className="mt-2" onClick={() => goTo(chunk.data!.page_start)}>Go to evidence</Button>
+                <Button size="sm" variant="secondary" className="mt-2" onClick={() => { goTo(chunk.data!.page_start); setPanel(null); }}>Go to evidence</Button>
               )}
             </Card>
           )}

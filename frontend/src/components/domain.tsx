@@ -82,7 +82,7 @@ export function StageList({ progress }: { progress: Progress }) {
         })}
       </ul>
       {(extraction?.total_units ?? 0) > 200 && (
-        <div className="grid grid-cols-3 gap-3 rounded-md bg-subtle p-3 text-xs">
+        <div className="grid grid-cols-1 gap-3 rounded-md bg-subtle p-3 text-xs min-[420px]:grid-cols-3">
           <div><p className="text-muted">Pages processed</p><p className="font-medium tabular-nums">{extraction!.done_units.toLocaleString()} / {extraction!.total_units!.toLocaleString()}</p></div>
           <div><p className="text-muted">Chunks</p><p className="font-medium tabular-nums">{(chunking?.detail?.chunks ?? chunking?.total_units ?? 0).toLocaleString()}</p></div>
           <div><p className="text-muted">Embeddings</p><p className="font-medium tabular-nums">{embedding?.done_units.toLocaleString()} / {(embedding?.total_units ?? 0).toLocaleString()}</p></div>

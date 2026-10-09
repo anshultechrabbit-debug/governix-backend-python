@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft } from "lucide-react";
+import type { ReactNode } from "react";
 import { Link, useParams, useSearchParams } from "react-router";
 import { api } from "../api/client";
 import type { Comparison, DiffOp, PolicyDetail, SectionRef } from "../api/types";
@@ -51,15 +52,15 @@ export function ComparePage() {
       <PageHeader
         title={<span className="flex items-center gap-3"><Link to={`/policies/${id}`} className="text-muted hover:text-ink"><ArrowLeft className="size-5" /></Link>Compare versions</span>}
         subtitle={policy.data?.name}
-        actions={<>
-          <Select value={base ?? ""} onChange={(e) => choose("base", e.target.value)}>
+        actions={<div className="flex w-full items-center gap-2 sm:w-auto">
+          <Select className="min-w-0 flex-1 sm:w-48 sm:flex-none" value={base ?? ""} onChange={(e) => choose("base", e.target.value)} aria-label="Earlier version">
             {active.map((v) => <option key={v.id} value={v.id}>v{v.version_label}{hasRealEffectiveDate(v) ? ` (${formatDate(v.effective_from)})` : ""}</option>)}
           </Select>
-          <span className="text-sm text-muted">vs</span>
-          <Select value={target ?? ""} onChange={(e) => choose("target", e.target.value)}>
+          <span className="shrink-0 text-sm text-muted">vs</span>
+          <Select className="min-w-0 flex-1 sm:w-48 sm:flex-none" value={target ?? ""} onChange={(e) => choose("target", e.target.value)} aria-label="Later version">
             {active.map((v) => <option key={v.id} value={v.id}>v{v.version_label}{hasRealEffectiveDate(v) ? ` (${formatDate(v.effective_from)})` : ""}</option>)}
           </Select>
-        </>}
+        </div>}
       />
       {active.length < 2 && policy.data && <Card><EmptyState title="Only one version" description="Comparison needs at least two versions." /></Card>}
       {comparison.error && <ErrorState error={comparison.error} />}
@@ -83,15 +84,15 @@ export function ComparePage() {
                 actions={<Badge tone="warn">Modified</Badge>}
               />
               {m.numeric_changes.changed.length > 0 && (
-                <div className="flex flex-wrap gap-2 border-b border-line bg-warn-50/50 px-5 py-2.5 text-sm">
+                <div className="flex flex-wrap gap-2 border-b border-line bg-warn-50/50 px-4 py-2.5 text-sm sm:px-5">
                   {m.numeric_changes.changed.map((c, i) => (
                     <span key={i} className="rounded bg-surface px-2 py-0.5 ring-1 ring-line"><span className="diff-del">{c.old}</span> → <span className="diff-ins">{c.new}</span></span>
                   ))}
                 </div>
               )}
-              <div className="grid divide-x divide-line md:grid-cols-2">
-                <div className="p-5"><SectionTitle section={m.old} />{m.diff ? <DiffText ops={m.diff} side="old" /> : <p className="text-sm">{m.old.content}</p>}</div>
-                <div className="p-5"><SectionTitle section={m.new} />{m.diff ? <DiffText ops={m.diff} side="new" /> : <p className="text-sm">{m.new.content}</p>}</div>
+              <div className="grid divide-y divide-line md:grid-cols-2 md:divide-x md:divide-y-0">
+                <div className="p-4 sm:p-5"><SideLabel>Version {data.from_version.label}</SideLabel><SectionTitle section={m.old} />{m.diff ? <DiffText ops={m.diff} side="old" /> : <p className="text-sm">{m.old.content}</p>}</div>
+                <div className="p-4 sm:p-5"><SideLabel>Version {data.to_version.label}</SideLabel><SectionTitle section={m.new} />{m.diff ? <DiffText ops={m.diff} side="new" /> : <p className="text-sm">{m.new.content}</p>}</div>
               </div>
             </Card>
           ))}
@@ -99,18 +100,18 @@ export function ComparePage() {
           {data.added.map((s) => (
             <Card key={`added-${s.label}`}>
               <CardHeader title={s.label} actions={<Badge tone="ok">Added</Badge>} />
-              <div className="grid divide-x divide-line md:grid-cols-2">
-                <div className="p-5 text-sm italic text-muted">Not present in version {data.from_version.label}</div>
-                <div className="p-5"><SectionTitle section={s} /><p className="diff-ins whitespace-pre-wrap text-sm">{s.content}</p></div>
+              <div className="grid divide-y divide-line md:grid-cols-2 md:divide-x md:divide-y-0">
+                <div className="p-4 text-sm italic text-muted sm:p-5">Not present in version {data.from_version.label}</div>
+                <div className="p-4 sm:p-5"><SectionTitle section={s} /><p className="diff-ins whitespace-pre-wrap text-sm">{s.content}</p></div>
               </div>
             </Card>
           ))}
           {data.removed.map((s) => (
             <Card key={`removed-${s.label}`}>
               <CardHeader title={s.label} actions={<Badge tone="bad">Removed</Badge>} />
-              <div className="grid divide-x divide-line md:grid-cols-2">
-                <div className="p-5"><SectionTitle section={s} /><p className="diff-del whitespace-pre-wrap text-sm">{s.content}</p></div>
-                <div className="p-5 text-sm italic text-muted">Not present in version {data.to_version.label}</div>
+              <div className="grid divide-y divide-line md:grid-cols-2 md:divide-x md:divide-y-0">
+                <div className="p-4 sm:p-5"><SectionTitle section={s} /><p className="diff-del whitespace-pre-wrap text-sm">{s.content}</p></div>
+                <div className="p-4 text-sm italic text-muted sm:p-5">Not present in version {data.to_version.label}</div>
               </div>
             </Card>
           ))}
@@ -119,4 +120,9 @@ export function ComparePage() {
       )}
     </>
   );
+}
+
+/** Which version a side is, when the two sides are stacked on a narrow screen. */
+function SideLabel({ children }: { children: ReactNode }) {
+  return <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted md:hidden">{children}</p>;
 }

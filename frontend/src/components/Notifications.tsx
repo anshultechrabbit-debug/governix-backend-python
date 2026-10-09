@@ -36,8 +36,9 @@ export function NotificationItem({ item, onOpen }: { item: AppNotification; onOp
   );
 }
 
-/** The bell in the sidebar: unread count and the latest few, opening the linked page. */
-export function NotificationBell() {
+/** The bell: unread count and the latest few, opening the linked page. In the sidebar (`placement="side"`, at the
+ * foot of the screen) the list opens upwards; in the phone top bar it drops down from the right edge. */
+export function NotificationBell({ placement = "side" }: { placement?: "side" | "top" }) {
   const [open, setOpen] = useState(false);
   const root = useRef<HTMLDivElement>(null);
   const navigate = useNavigate();
@@ -68,12 +69,15 @@ export function NotificationBell() {
         )}
       </button>
       {open && (
-        <div className="absolute left-0 top-9 z-40 w-80 overflow-hidden rounded-lg border border-line bg-surface text-ink shadow-xl">
+        <div className={cn(
+          "z-40 overflow-hidden rounded-lg border border-line bg-surface text-ink shadow-xl",
+          placement === "top" ? "fixed inset-x-3 top-14 sm:absolute sm:inset-x-auto sm:right-0 sm:top-11 sm:w-80" : "absolute bottom-10 left-0 w-80",
+        )}>
           <div className="flex items-center justify-between border-b border-line px-4 py-2.5">
             <p className="text-sm font-semibold">Notifications</p>
             {unread > 0 && <button type="button" onClick={() => void markRead()} className="flex items-center gap-1 text-xs font-medium text-brand-700 hover:underline"><CheckCheck className="size-3.5" />Mark all read</button>}
           </div>
-          <div className="max-h-96 divide-y divide-line overflow-y-auto">
+          <div className="max-h-[min(24rem,60dvh)] divide-y divide-line overflow-y-auto">
             {data?.items.length ? data.items.map((item) => <NotificationItem key={item.id} item={item} onOpen={openItem} />)
               : <p className="px-4 py-8 text-center text-sm text-muted">You're all caught up.</p>}
           </div>

@@ -99,8 +99,8 @@ export function Card({ className, children }: { className?: string; children: Re
 
 export function CardHeader({ title, subtitle, actions }: { title: ReactNode; subtitle?: ReactNode; actions?: ReactNode }) {
   return (
-    <div className="flex items-start justify-between gap-4 border-b border-line px-5 py-3.5">
-      <div>
+    <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2 border-b border-line px-4 py-3.5 sm:px-5">
+      <div className="min-w-0">
         <h2 className="text-sm font-semibold text-ink">{title}</h2>
         {subtitle && <p className="mt-0.5 text-xs text-muted">{subtitle}</p>}
       </div>
@@ -111,12 +111,12 @@ export function CardHeader({ title, subtitle, actions }: { title: ReactNode; sub
 
 export function PageHeader({ title, subtitle, actions }: { title: ReactNode; subtitle?: ReactNode; actions?: ReactNode }) {
   return (
-    <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
-      <div>
-        <h1 className="text-xl font-semibold tracking-tight text-ink">{title}</h1>
+    <div className="mb-5 flex flex-wrap items-end justify-between gap-x-4 gap-y-3 sm:mb-6">
+      <div className="min-w-0">
+        <h1 className="break-words text-lg font-semibold tracking-tight text-ink sm:text-xl">{title}</h1>
         {subtitle && <p className="mt-1 text-sm text-muted">{subtitle}</p>}
       </div>
-      {actions && <div className="flex items-center gap-2">{actions}</div>}
+      {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
     </div>
   );
 }
@@ -213,7 +213,7 @@ export function ProgressBar({ value, tone = "brand" }: { value: number; tone?: "
 
 export function EmptyState({ title, description, action, icon }: { title: string; description?: ReactNode; action?: ReactNode; icon?: ReactNode }) {
   return (
-    <div className="flex flex-col items-center justify-center px-6 py-14 text-center">
+    <div className="flex flex-col items-center justify-center px-4 py-10 text-center sm:px-6 sm:py-14">
       <div className="mb-3 rounded-full bg-subtle p-3 text-muted">{icon ?? <Inbox className="size-6" />}</div>
       <h3 className="text-sm font-semibold text-ink">{title}</h3>
       {description && <p className="mt-1 max-w-md text-sm text-muted">{description}</p>}
@@ -249,19 +249,19 @@ export function Modal({ open, onClose, title, children, footer, wide }: {
   }, [open, onClose]);
   if (!open) return null;
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 p-4" onMouseDown={onClose}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 p-3 sm:p-4" onMouseDown={onClose}>
       <div
         role="dialog"
         aria-modal="true"
-        className={cn("max-h-[90vh] w-full overflow-auto rounded-lg bg-surface shadow-xl", wide ? "max-w-3xl" : "max-w-lg")}
+        className={cn("max-h-[92dvh] w-full overflow-auto rounded-lg bg-surface shadow-xl", wide ? "max-w-3xl" : "max-w-lg")}
         onMouseDown={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center justify-between border-b border-line px-5 py-3.5">
-          <h2 className="text-base font-semibold">{title}</h2>
+        <div className="flex items-center justify-between gap-3 border-b border-line px-4 py-3.5 sm:px-5">
+          <h2 className="min-w-0 text-base font-semibold">{title}</h2>
           <button onClick={onClose} className="rounded p-1 text-muted hover:bg-subtle" aria-label="Close"><X className="size-4" /></button>
         </div>
-        <div className="px-5 py-4">{children}</div>
-        {footer && <div className="flex justify-end gap-2 border-t border-line px-5 py-3">{footer}</div>}
+        <div className="px-4 py-4 sm:px-5">{children}</div>
+        {footer && <div className="flex flex-wrap justify-end gap-2 border-t border-line px-4 py-3 sm:px-5">{footer}</div>}
       </div>
     </div>
   );
@@ -270,7 +270,7 @@ export function Modal({ open, onClose, title, children, footer, wide }: {
 /* ---------- Tabs ---------- */
 export function Tabs<T extends string>({ tabs, value, onChange }: { tabs: { id: T; label: string; count?: number }[]; value: T; onChange: (id: T) => void }) {
   return (
-    <div className="flex gap-1 border-b border-line" role="tablist">
+    <div className="flex gap-1 overflow-x-auto border-b border-line [scrollbar-width:none]" role="tablist">
       {tabs.map((tab) => (
         <button
           key={tab.id}
@@ -278,7 +278,7 @@ export function Tabs<T extends string>({ tabs, value, onChange }: { tabs: { id: 
           aria-selected={value === tab.id}
           onClick={() => onChange(tab.id)}
           className={cn(
-            "-mb-px border-b-2 px-3 py-2 text-sm font-medium transition-colors",
+            "-mb-px shrink-0 whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors",
             value === tab.id ? "border-brand-600 text-brand-700" : "border-transparent text-muted hover:text-ink",
           )}
         >
@@ -296,7 +296,7 @@ export function Table({ head, children }: { head: ReactNode[]; children: ReactNo
     <div className="overflow-x-auto">
       <table className="w-full text-left text-sm">
         <thead className="border-b border-line bg-subtle/60 text-xs uppercase tracking-wide text-muted">
-          <tr>{head.map((h, i) => <th key={i} className="px-4 py-2.5 font-medium">{h}</th>)}</tr>
+          <tr>{head.map((h, i) => <th key={i} className="whitespace-nowrap px-4 py-2.5 font-medium">{h}</th>)}</tr>
         </thead>
         <tbody className="divide-y divide-line">{children}</tbody>
       </table>
@@ -309,7 +309,7 @@ export function Toaster() {
   const toasts = useAppSelector((state) => state.toasts);
   const dispatch = useAppDispatch();
   return (
-    <div className="fixed bottom-4 right-4 z-[60] flex w-80 flex-col gap-2" aria-live="polite">
+    <div className="fixed inset-x-3 bottom-3 z-[60] flex flex-col gap-2 sm:inset-x-auto sm:bottom-4 sm:right-4 sm:w-80" aria-live="polite">
       {toasts.map((toast) => (
         <div key={toast.id} className={cn(
           "flex items-start justify-between gap-3 rounded-md border px-4 py-3 text-sm shadow-lg",
@@ -317,7 +317,7 @@ export function Toaster() {
           toast.tone === "bad" && "border-bad-600/20 bg-bad-50 text-bad-600",
           toast.tone === "info" && "border-info-600/20 bg-info-50 text-info-600",
         )}>
-          <span>{toast.message}</span>
+          <span className="min-w-0 break-words">{toast.message}</span>
           <button onClick={() => dispatch(dismissToast(toast.id))} aria-label="Dismiss"><X className="size-4" /></button>
         </div>
       ))}
@@ -327,9 +327,9 @@ export function Toaster() {
 
 export function Stat({ label, value, tone, hint }: { label: string; value: ReactNode; tone?: "warn" | "bad"; hint?: string }) {
   return (
-    <Card className="px-5 py-4">
+    <Card className="px-4 py-3.5 sm:px-5 sm:py-4">
       <p className="text-xs font-medium uppercase tracking-wide text-muted">{label}</p>
-      <p className={cn("mt-1 text-2xl font-semibold tabular-nums", tone === "warn" && "text-warn-600", tone === "bad" && "text-bad-600")}>{value}</p>
+      <p className={cn("mt-1 break-words text-xl font-semibold tabular-nums sm:text-2xl", tone === "warn" && "text-warn-600", tone === "bad" && "text-bad-600")}>{value}</p>
       {hint && <p className="mt-0.5 text-xs text-muted">{hint}</p>}
     </Card>
   );
@@ -341,7 +341,7 @@ export function KeyValue({ items }: { items: [string, ReactNode][] }) {
       {items.map(([k, v]) => (
         <div key={k}>
           <dt className="text-xs font-medium uppercase tracking-wide text-muted">{k}</dt>
-          <dd className="mt-0.5 text-sm text-ink">{v ?? "—"}</dd>
+          <dd className="mt-0.5 break-words text-sm text-ink">{v ?? "—"}</dd>
         </div>
       ))}
     </dl>
