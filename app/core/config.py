@@ -71,6 +71,10 @@ class Settings(BaseSettings):
     WORKER_MODE: WorkerMode = WorkerMode.IN_PROCESS
     WORKER_CONCURRENCY: int = 1
     WORKER_POLL_INTERVAL_SECONDS: float = 1.0
+    # CPU priority (nice, 0-19) of `python -m app.workers` and its extraction processes. Under
+    # contention the API, the database and other programs run first; the worker uses what they
+    # leave, so answers stay fast while a large PDF is processed. 0 leaves the priority as started.
+    WORKER_NICE: int = 10
     JOB_LEASE_SECONDS: int = 300
     JOB_DEFAULT_MAX_ATTEMPTS: int = 3
     REDIS_URL: str | None = None
@@ -312,6 +316,21 @@ class Settings(BaseSettings):
             missing += [name for name in ("CLOUD_OCR_URL", "CLOUD_OCR_API_KEY") if getattr(self, name) is None]
         if missing:
             raise ValueError(f"Missing required settings: {', '.join(sorted(set(missing)))}")
+
+        # A worker thread inside the API holds the interpreter lock while it extracts a PDF, so
+        # every request waits for it (measured: a request-like task took 10x as long).
+        if (
+            self.APP_ENV is AppEnv.PRODUCTION
+            and self.QUEUE_BACKEND is QueueBackend.LOCAL
+            and self.WORKER_MODE is WorkerMode.IN_PROCESS
+        ):
+            warnings.warn(
+                "WORKER_MODE=in_process in production: documents are processed inside the API "
+                "process, and requests slow down while a large PDF is extracted. Set "
+                "WORKER_MODE=distributed and run `python -m app.workers` as its own service.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
             # A process-local cache cannot be shared between workers, so a
         # production deployment must use Redis to keep the hit rate.

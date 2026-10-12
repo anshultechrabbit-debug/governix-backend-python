@@ -44,6 +44,20 @@ def test_cloud_ocr_requires_an_endpoint_and_credential():
         Settings(DATABASE_URL=DB, OCR_BACKEND="cloud", _env_file=None)
 
 
+def _production(**overrides):
+    return Settings(DATABASE_URL=DB, APP_ENV="production", JWT_SECRET="x" * 32, _env_file=None, **overrides)
+
+
+def test_production_warns_when_documents_are_processed_inside_the_api():
+    with pytest.warns(RuntimeWarning, match="WORKER_MODE=in_process"):
+        _production()
+
+
+def test_a_separate_worker_in_production_is_not_warned_about(recwarn):
+    _production(WORKER_MODE="distributed")
+    assert not [w for w in recwarn if "WORKER_MODE" in str(w.message)]
+
+
 def test_secrets_are_not_exposed_in_repr():
     settings = Settings(DATABASE_URL=DB, OPENAI_API_KEY="sk-supersecretvalue123456", _env_file=None)
     assert "supersecret" not in repr(settings)

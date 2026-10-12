@@ -5,6 +5,8 @@
 Run as many as needed (WORKER_MODE=distributed); SKIP LOCKED prevents double-claims.
 """
 
+import logging
+import os
 import signal
 import threading
 
@@ -18,6 +20,23 @@ from app.infrastructure.storage.factory import create_storage
 from app.workers import load_tasks
 from app.workers.runtime import Runtime, configure_runtime
 
+logger = logging.getLogger("app.workers")
+
+
+def lower_priority(nice: int) -> int | None:
+    """Lower this process's CPU priority to `nice` (never raise it); extraction processes it
+    starts inherit it. Returns the priority now in effect, or None where it cannot be read."""
+    if not hasattr(os, "getpriority"):
+        return None
+    current = os.getpriority(os.PRIO_PROCESS, 0)
+    target = min(max(nice, 0), 19)
+    if target > current:
+        try:
+            os.setpriority(os.PRIO_PROCESS, 0, target)
+        except OSError as exc:
+            logger.warning("Could not lower the worker's CPU priority to %s: %s", target, exc)
+    return os.getpriority(os.PRIO_PROCESS, 0)
+
 
 def main() -> None:
     settings = get_settings()
@@ -25,6 +44,8 @@ def main() -> None:
     if settings.QUEUE_BACKEND is not QueueBackend.LOCAL:
         raise SystemExit("For QUEUE_BACKEND=celery run: celery -A app.workers.celery_app worker")
 
+    nice = lower_priority(settings.WORKER_NICE)
+    logger.info("Worker started: CPU priority (nice) %s, %s CPUs", nice, os.cpu_count())
     load_tasks()
     stop_event = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop_event.set())

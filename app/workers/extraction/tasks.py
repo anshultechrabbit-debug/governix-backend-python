@@ -101,6 +101,9 @@ def extract_range(payload: dict, ctx: JobContext) -> None:
                 )
             ))
             session.rollback()
+            # A first rate sample as extraction starts: the time-left estimate then measures pages
+            # per second from here, not from upload (which counts time spent waiting in the queue).
+            _persist_pages(session, document_id, [])
             with rt.storage.local_path(storage_key) as path:
                 open_pdf(path).close()  # a clear error for a corrupt or protected file
                 pending_pages = [n for n in range(start, end + 1) if n not in done]

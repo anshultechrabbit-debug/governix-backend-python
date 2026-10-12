@@ -38,6 +38,11 @@ def extraction_pool(settings: Settings) -> ProcessPoolExecutor | None:
             # "spawn": a fresh interpreter per worker, safe to start from a threaded server.
             _POOL = ProcessPoolExecutor(max_workers=size, mp_context=multiprocessing.get_context("spawn"))
             logger.info("Started %s extraction processes", size)
+            if size > (cpus := os.cpu_count() or 1):
+                logger.warning(
+                    "EXTRACTION_PROCESSES=%s is more than the %s CPUs here: the extra processes only take "
+                    "turns on them, and use more memory. Measure before keeping it.", size, cpus,
+                )
         return _POOL
 
 

@@ -23,3 +23,11 @@ def test_the_estimate_follows_the_recent_pace_not_the_average():
 def test_without_recent_samples_the_average_is_used():
     row, now = stage(30_000, 139_000, 10)
     assert 2100 <= _eta_seconds(row, now) <= 2250
+
+
+def test_time_waiting_in_the_queue_is_not_counted_as_slow_extraction():
+    # Queued 10 minutes ago behind other documents; extraction began a minute ago (its first
+    # sample) and has done 50 of 1,000 pages: about 19 minutes left, not over 3 hours.
+    now = datetime.now(UTC)
+    row, now = stage(50, 1_000, 10, [[(now - timedelta(seconds=60)).isoformat(), 0]])
+    assert 1100 <= _eta_seconds(row, now) <= 1180
