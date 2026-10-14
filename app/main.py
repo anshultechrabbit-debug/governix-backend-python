@@ -41,18 +41,12 @@ logger = logging.getLogger(__name__)
 
 
 def _start_in_process_workers(app: FastAPI, settings: Settings) -> None:
-    from app.infrastructure.queue.local import LocalWorker
-    from app.workers import load_tasks
+    from app.workers import load_tasks, worker_lanes
 
     load_tasks()
     stop_event = threading.Event()
     threads = []
-    for index in range(settings.WORKER_CONCURRENCY):
-        worker = LocalWorker(
-            app.state.session_factory,
-            lease_seconds=settings.JOB_LEASE_SECONDS,
-            poll_interval_seconds=settings.WORKER_POLL_INTERVAL_SECONDS,
-        )
+    for index, worker in enumerate(worker_lanes(app.state.session_factory, settings, general=settings.WORKER_CONCURRENCY)):
         thread = threading.Thread(
             target=worker.run_forever, args=(stop_event,), name=f"governix-worker-{index}", daemon=True
         )

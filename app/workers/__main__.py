@@ -15,9 +15,8 @@ from app.core.database import create_db_engine, create_session_factory
 from app.core.logging import configure_logging
 from app.infrastructure.cache.factory import create_cache
 from app.infrastructure.queue.factory import create_queue
-from app.infrastructure.queue.local import LocalWorker
 from app.infrastructure.storage.factory import create_storage
-from app.workers import load_tasks
+from app.workers import load_tasks, worker_lanes
 from app.workers.runtime import Runtime, configure_runtime
 
 logger = logging.getLogger("app.workers")
@@ -70,14 +69,21 @@ def main() -> None:
 
     schedule_daily(queue)
 
-    worker = LocalWorker(
-        session_factory,
-        lease_seconds=settings.JOB_LEASE_SECONDS,
-        poll_interval_seconds=settings.WORKER_POLL_INTERVAL_SECONDS,
-    )
+    # One CPU lane per process (run more processes on more cores), plus the network-bound lanes.
+    worker, *network = worker_lanes(session_factory, settings, general=1)
+    threads = [
+        threading.Thread(target=lane.run_forever, args=(stop_event,), name=f"governix-network-{index}", daemon=True)
+        for index, lane in enumerate(network)
+    ]
+    for thread in threads:
+        thread.start()
+    logger.info("Worker lanes: 1 general, %s network-bound", len(network))
     try:
         worker.run_forever(stop_event)
     finally:
+        stop_event.set()
+        for thread in threads:
+            thread.join(timeout=30)
         engine.dispose()
 
 

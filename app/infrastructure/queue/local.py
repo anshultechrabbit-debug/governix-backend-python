@@ -89,11 +89,15 @@ class LocalWorker:
         lease_seconds: int,
         poll_interval_seconds: float,
         worker_id: str | None = None,
+        only: frozenset[str] | None = None,
+        skip: frozenset[str] = frozenset(),
     ) -> None:
         self.session_factory = session_factory
         self.lease_seconds = lease_seconds
         self.poll_interval_seconds = poll_interval_seconds
         self.worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+        # Which tasks this worker claims: `only` these, or any but `skip` (see app.workers.worker_lanes).
+        self.only, self.skip = only, skip
 
     def recover_expired_leases(self) -> int:
         """Requeue (or fail, if out of attempts) jobs whose worker stopped heartbeating."""
@@ -182,10 +186,13 @@ class LocalWorker:
         logger.info("Worker %s stopped", self.worker_id)
 
     def _claim(self, job_id: uuid.UUID | None = None):
+        due = select(QueueJob.id).where(QueueJob.status == JobStatus.QUEUED, QueueJob.run_after <= func.now())
+        if self.only is not None:
+            due = due.where(QueueJob.task_name.in_(self.only))
+        if self.skip:
+            due = due.where(QueueJob.task_name.not_in(self.skip))
         next_job = (
-            select(QueueJob.id)
-            .where(QueueJob.status == JobStatus.QUEUED, QueueJob.run_after <= func.now())
-            .order_by(QueueJob.priority.desc(), QueueJob.run_after)
+            due.order_by(QueueJob.priority.desc(), QueueJob.run_after)
             .limit(1)
             .with_for_update(skip_locked=True)
             .scalar_subquery()

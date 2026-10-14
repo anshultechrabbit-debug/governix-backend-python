@@ -230,3 +230,23 @@ def test_enqueue_in_callers_transaction_is_rolled_back_with_it(queue, session_fa
         queue.enqueue("t", {"kept": True}, session=session)
     with session_factory() as session:
         assert [j.payload for j in session.scalars(select(QueueJob))] == [{"kept": True}]
+
+
+def test_lanes_split_network_bound_jobs_from_cpu_work(queue, session_factory):
+    seen = []
+    names = [f"test.{uuid.uuid4().hex}" for _ in range(2)]
+    cpu, network = names
+    for name in names:
+        registry.task(name)(lambda payload, ctx, name=name: seen.append(name))
+    try:
+        # The network job has the higher priority, yet the CPU lane never takes it.
+        queue.enqueue(network, {}, idempotency_key="n", priority=5)
+        queue.enqueue(cpu, {}, idempotency_key="c")
+        general = LocalWorker(session_factory, lease_seconds=60, poll_interval_seconds=0.01, skip=frozenset({network}))
+        assert general.run_once() and seen == [cpu]
+        assert not general.run_once()
+        waiting = LocalWorker(session_factory, lease_seconds=60, poll_interval_seconds=0.01, only=frozenset({network}))
+        assert waiting.run_once() and seen == [cpu, network]
+    finally:
+        for name in names:
+            registry.unregister(name)

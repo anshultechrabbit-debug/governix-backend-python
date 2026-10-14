@@ -70,6 +70,10 @@ class Settings(BaseSettings):
     QUEUE_BACKEND: QueueBackend = QueueBackend.LOCAL
     WORKER_MODE: WorkerMode = WorkerMode.IN_PROCESS
     WORKER_CONCURRENCY: int = 1
+    # Extra worker threads for jobs that mostly wait on the AI provider (embedding batches, LLM
+    # analysis, summaries), so CPU work such as reading the next PDF never queues behind those waits.
+    # 0: every worker takes any job. Applies to `python -m app.workers` and in-process workers.
+    WORKER_NETWORK_SLOTS: int = 2
     WORKER_POLL_INTERVAL_SECONDS: float = 1.0
     # CPU priority (nice, 0-19) of `python -m app.workers` and its extraction processes. Under
     # contention the API, the database and other programs run first; the worker uses what they
