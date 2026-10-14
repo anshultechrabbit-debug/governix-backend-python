@@ -42,6 +42,24 @@ Alembic migrations, Postgres 18 with pgvector 0.8, and a React + Tailwind + Redu
     KYC-AML), baseline in `docs/rag-audit.md`.
   - `run_suite.py` holds the National Electricity Plan suite.
 
+## Ingestion speed (live server: 1 shared vCPU)
+
+- Reading PDFs is nearly all the CPU work of an upload, and ruled-table search was ~80% of it.
+  `extraction._table_rows` searches only the area the column rulings span (`_rulings`), and skips pages
+  with none.
+- `ingestion/table_chars.py` replaces two PyMuPDF internals:
+  - `pymupdf.table.make_chars`, with plain float32 arithmetic;
+  - `Table.extract`, which takes each row's characters from a sorted index instead of scanning the
+    whole page.
+
+  The changes were checked identical on 3,210 Mortgage pages (13.7M characters) and on 57 other PDFs.
+- `table_chars` installs only for `CHECKED_VERSION` (PyMuPDF 1.28.2). When upgrading PyMuPDF, re-check
+  that its output is identical (`app/tests/unit/test_extraction_tables.py`) before raising that version.
+- The worker runs one CPU lane plus `WORKER_NETWORK_SLOTS` lanes for jobs that wait on OpenAI
+  (embedding, analysis, summaries), so those waits never hold up reading the next PDF.
+- A batch group is confirmed only when all its files are analysed, because the newest version names the
+  policy and older dates are inferred from newer ones. So a policy's versions become ready together.
+
 ## Answer pipeline (`app/modules/rag/service.py`, `RAGService.answer_events`)
 
 1. Standalone rewrite.

@@ -12,8 +12,11 @@ from dataclasses import dataclass, field
 import pymupdf
 
 from app.modules.documents.model import ExtractionMethod
+from app.modules.ingestion import table_chars
 
 logger = logging.getLogger(__name__)
+# Table search's character list, built about four times faster with identical results.
+table_chars.install()
 
 BOLD_FLAG = 1 << 4
 # Table rows use negative block numbers so later stages can tell them apart from
@@ -24,6 +27,12 @@ MIN_TABLE_ROWS = 2
 # rectangle segments. A page with fewer cannot hold one, so its (slow) table search is
 # skipped. On real documents table pages had 58 or more.
 MIN_RULING_SEGMENTS = 4
+# PyMuPDF's snap tolerance (the find_tables default): a segment this close to vertical can be a
+# column ruling.
+VERTICAL_TOLERANCE = 3
+# The searched area reaches this far past the column rulings: a table's top and bottom borders
+# end where its rulings do, within the snap tolerance.
+RULING_MARGIN = 6
 HEADER_BOLD_RATIO = 0.5
 # Keep ligatures/whitespace sane and drop invisible text used for tricks.
 TEXT_FLAGS = (
@@ -83,16 +92,41 @@ def render_rows(rows: list[list[str]], header: list[str] | None) -> list[str]:
     return rendered
 
 
-def _ruling_segments(page: pymupdf.Page, enough: int) -> int:
-    """Line and rectangle segments drawn on the page, counted up to `enough`."""
-    count = 0
+def _rulings(page: pymupdf.Page) -> tuple[int, pymupdf.Rect | None]:
+    """Line and rectangle segments drawn on the page, and the area its vertical ones span.
+
+    A ruled table's cells lie between its column rulings, so every table on the page lies in that
+    area. None when nothing vertical is drawn there: then no ruled table is possible.
+    """
+    segments = 0
+    xs: list[float] = []
+    ys: list[float] = []
+
+    def side(a, b) -> None:
+        if abs(a[0] - b[0]) <= VERTICAL_TOLERANCE:
+            xs.extend((a[0], b[0]))
+            ys.extend((a[1], b[1]))
+
     for drawing in page.get_cdrawings():
         for item in drawing.get("items", ()):
-            if item[0] in ("l", "re", "qu"):
-                count += 1
-                if count >= enough:
-                    return count
-    return count
+            if item[0] == "l":
+                side(item[1], item[2])
+            elif item[0] == "re":
+                rect = pymupdf.Rect(item[1])
+                side(rect.tl, rect.bl)
+                side(rect.tr, rect.br)
+            elif item[0] == "qu":
+                quad = pymupdf.Quad(item[1])
+                for a, b in ((quad.ul, quad.ll), (quad.ur, quad.lr), (quad.ul, quad.ur), (quad.ll, quad.lr)):
+                    side(a, b)
+            else:
+                continue
+            segments += 1
+    if not xs:
+        return segments, None
+    area = pymupdf.Rect(min(xs), min(ys), max(xs), max(ys)) + (-RULING_MARGIN, -RULING_MARGIN, RULING_MARGIN, RULING_MARGIN)
+    area &= page.rect
+    return segments, None if area.is_empty else area
 
 
 def _table_rows(page: pymupdf.Page, spans) -> list[tuple[pymupdf.Rect, list[tuple[float, str]]]]:
@@ -100,12 +134,17 @@ def _table_rows(page: pymupdf.Page, spans) -> list[tuple[pymupdf.Rect, list[tupl
 
     Only tables drawn with ruling lines are used ("lines_strict"), so ordinary
     multi-column prose is never mistaken for a table. Table search costs about six
-    times the rest of a page's extraction, so a page without ruling lines skips it.
+    times the rest of a page's extraction, so a page without ruling lines skips it,
+    and the search covers only the area the column rulings span: the characters of the
+    prose around the tables, which the search would otherwise convert one by one, are
+    left out. On table-heavy policies that halves the search with identical tables.
     """
     try:
-        if _ruling_segments(page, MIN_RULING_SEGMENTS) < MIN_RULING_SEGMENTS:
+        segments, area = _rulings(page)
+        if segments < MIN_RULING_SEGMENTS or area is None:
             return []
-        tables = page.find_tables(strategy="lines_strict").tables
+        # A rotated page keeps the whole-page search: its drawings and a clip use different frames.
+        tables = page.find_tables(clip=None if page.rotation else area, strategy="lines_strict").tables
     except Exception:  # table detection is an enhancement; never fail extraction on it
         logger.warning("Table detection failed on page %s", page.number + 1, exc_info=True)
         return []
