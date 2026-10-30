@@ -387,8 +387,13 @@ const SHORT_CLAIMS = 2;
 
 /** Replies to a greeting or a question with no subject: not a failed search, a prompt to ask. */
 const CONVERSATIONAL = ["GREETING", "NO_SUBJECT", "INSTRUCTIONS_IGNORED"];
-/** The answer ran out of time or the AI service did not respond: nothing was decided about the documents. */
-const TEMPORARY = ["DEADLINE_EXCEEDED", "LLM_UNAVAILABLE"];
+/** The answer ran out of time, the AI service did not respond, or its credit ran out: nothing was decided about the documents. */
+const TEMPORARY = ["DEADLINE_EXCEEDED", "LLM_UNAVAILABLE", "AI_CREDIT_EXHAUSTED"];
+const TEMPORARY_HEADINGS: Record<string, string> = {
+  DEADLINE_EXCEEDED: "This took too long to answer",
+  LLM_UNAVAILABLE: "The AI service didn’t respond",
+  AI_CREDIT_EXHAUSTED: "AI answers are paused",
+};
 /** The question needs one more detail before it can be searched. */
 const NEEDS_DETAIL = ["NEEDS_CONTEXT", "VERSION_NOT_FOUND", "COMPARISON_TARGET_UNCLEAR"];
 /** What the documents lacked: the topic is not there at all, or the closest text does not state the answer. */
@@ -407,7 +412,7 @@ function NoAnswer({ reason, onRetry }: { reason: Answer["no_answer"]; onRetry: (
   if (TEMPORARY.includes(reason.reason)) {
     return (
       <div className="p-4 sm:p-5">
-        <p className="font-medium text-ink">{reason.reason === "DEADLINE_EXCEEDED" ? "This took too long to answer" : "The AI service didn’t respond"}</p>
+        <p className="font-medium text-ink">{TEMPORARY_HEADINGS[reason.reason]}</p>
         <p className="mt-1 text-sm text-ink-soft">{reason.message}</p>
         <Button className="mt-3" size="sm" variant="secondary" onClick={onRetry}>Ask again</Button>
       </div>

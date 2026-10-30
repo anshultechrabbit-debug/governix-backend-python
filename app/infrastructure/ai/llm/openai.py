@@ -91,6 +91,11 @@ class OpenAILLM(LLMProvider):
         from app.infrastructure.ai.llm.local import LocalLLM
         return LocalLLM().generate_json(system, user, schema, context=context)
 
+    @property
+    def out_of_credit(self) -> bool:
+        """The account said "out of credit" in the last few minutes; calls meanwhile go to the local stand-in."""
+        return self._credit.active
+
     def _limit(self, budget: int) -> dict[str, Any]:
         """The output cap: OpenAI's own name for it, or the older one other servers implement."""
         return {"max_completion_tokens": budget} if self.provider == "openai" else {"max_tokens": budget}

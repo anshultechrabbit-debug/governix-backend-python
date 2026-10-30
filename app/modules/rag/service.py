@@ -105,7 +105,7 @@ NOT_FOUND_REASONS = frozenset({
     "ANSWER_FAILED_VALIDATION", "ANSWER_OFF_TOPIC",
 })
 # No-answers that say nothing about the question, only about this attempt: never cached.
-TRANSIENT_REASONS = frozenset({"DEADLINE_EXCEEDED", "LLM_UNAVAILABLE", "NEEDS_CONTEXT"})
+TRANSIENT_REASONS = frozenset({"DEADLINE_EXCEEDED", "LLM_UNAVAILABLE", "AI_CREDIT_EXHAUSTED", "NEEDS_CONTEXT"})
 # No-answers decided by checking what the model wrote against the documents.
 VALIDATION_REASONS = frozenset({"INSUFFICIENT_EVIDENCE", "ANSWER_FAILED_VALIDATION", "ANSWER_OFF_TOPIC"})
 # Characters of each earlier answer that key a follow-up's cached answer.
@@ -195,7 +195,9 @@ HISTORY_KEY_CHARS = 300
 #          "tell me (something) about the X policy" reads the named policy's opening pages, misspelt names
 #          ("morgtage policy") resolve; an answer whose every question word no document uses must be judged
 #          by meaning to answer the question (a merely "close" passage no longer passes vacuously)
-ANSWER_CACHE_VERSION = "v71"
+#   v72    an answer model out of credit gives AI_CREDIT_EXHAUSTED, never the stand-in's quotes or "did not
+#          respond in time"
+ANSWER_CACHE_VERSION = "v72"
 # No supported answer in the version in force: worth looking one version back.
 # Earlier versions answer only what the version in force does not cover. An answer it gave that the
 # checks then withheld (ANSWER_FAILED_VALIDATION, ANSWER_OFF_TOPIC) means it covers the subject:
@@ -438,7 +440,8 @@ def _combine(parts: list[tuple[str, AnswerResponse]]) -> AnswerResponse | None:
         warnings += [w for w in response.warnings if w not in warnings]
         checks += response.plan.get("checks", [])
     warnings += [
-        f'Not answered in time, please ask again: "{q}"' if r.no_answer and r.no_answer.reason in TRANSIENT_REASONS
+        f'Not answered: AI credit has run out: "{q}"' if r.no_answer and r.no_answer.reason == "AI_CREDIT_EXHAUSTED"
+        else f'Not answered in time, please ask again: "{q}"' if r.no_answer and r.no_answer.reason in TRANSIENT_REASONS
         else f'Not found in your documents: "{q}"'
         for q, r in parts if r.status != "answered"
     ]
@@ -767,6 +770,9 @@ class RAGService:
                 # "hi", "thanks", "can you explain in short?": nothing to search for. Searching
                 # anyway lets any passage pass the term checks, which have nothing to check.
                 raise _NoAnswer("GREETING" if is_greeting(request.question) else "NO_SUBJECT", suggestions=[])
+            if self._out_of_credit():
+                # Known already (a call in the last few minutes said so): say it, rather than search for nothing.
+                raise _NoAnswer("AI_CREDIT_EXHAUSTED", suggestions=[])
             referenced = request.policy_ids or self.retriever.referenced_policies(principal, request.question)
             mentions = self.retriever.policy_mentions(principal, request.question)
             self._subjects[request.question] = without_references(request.question, mentions)
@@ -921,6 +927,8 @@ class RAGService:
                 finally:
                     timings[f"{prefix}llm"] = round((time.perf_counter() - step) * 1000, 1)
             except _NoAnswer as no_answer:
+                if self._fell_back(attempt) and self._out_of_credit():
+                    raise _NoAnswer("AI_CREDIT_EXHAUSTED") from None
                 if self._fell_back(attempt) and no_answer.reason in VALIDATION_REASONS:
                     # The model did not answer (timeout, outage) and the stand-in that quotes the
                     # documents found no sentence to quote: nothing was decided about the documents.
@@ -985,6 +993,9 @@ class RAGService:
             if isinstance(part, LLMResult):
                 attempt.llm_result = part
                 continue
+            if not attempt.claims_streamed and self._out_of_credit():
+                # The account ran out as this answer began: the stand-in's quotes are not the answer asked for.
+                raise _NoAnswer("AI_CREDIT_EXHAUSTED")
             held.append(part)
             unrelated = {str(v) for v in evidence.unrelated}
             for source in part.get("sources", []):
@@ -1649,6 +1660,10 @@ class RAGService:
         if 1 - sum(weights[t] for t in missing) / total < self.settings.RAG_MIN_SALIENT_COVERAGE:
             return missing
         return None
+
+    def _out_of_credit(self) -> bool:
+        """The answer model's account is out of credit (see infrastructure/ai/credit.py)."""
+        return bool(getattr(self._llm_factory(), "out_of_credit", False))
 
     def _fell_back(self, attempt: _Attempt) -> bool:
         """The answer was written by the local stand-in because the configured model failed."""
@@ -2394,6 +2409,11 @@ class RAGService:
                 "about your policies?"
             ),
             "LLM_UNAVAILABLE": "The AI service did not respond in time, so the documents were not checked. Please ask again.",
+            "AI_CREDIT_EXHAUSTED": (
+                "AI answers are paused because your organization's AI credit has run out. Your documents and "
+                "policies are safe and can still be read. Please ask your administrator to add credit; answers "
+                "resume on their own once it is added."
+            ),
             "COMPARISON_TARGET_UNCLEAR": "Please name the policy (and versions) you want to compare.",
             "NEEDS_CONTEXT": (
                 "This question refers to an earlier part of the conversation that is not available. "
