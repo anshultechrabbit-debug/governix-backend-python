@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.core.config import QueueBackend, Settings, WorkerMode, get_settings
+from app.core.config import AppEnv, QueueBackend, Settings, WorkerMode, get_settings
 from app.core.database import create_db_engine, create_session_factory
 from app.core.error_handlers import register_error_handlers
 from app.core.logging import configure_logging
@@ -109,7 +109,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             shutdown_lane_pool()
             engine.dispose()
 
-    app = FastAPI(title=settings.APP_NAME, version=settings.APP_VERSION, lifespan=lifespan)
+    docs = settings.API_DOCS_ENABLED if settings.API_DOCS_ENABLED is not None else settings.APP_ENV is not AppEnv.PRODUCTION
+    app = FastAPI(
+        title=settings.APP_NAME, version=settings.APP_VERSION, lifespan=lifespan,
+        docs_url="/docs" if docs else None, redoc_url="/redoc" if docs else None,
+        openapi_url="/openapi.json" if docs else None,
+    )
 
     engine = create_db_engine(settings)
     app.state.settings = settings

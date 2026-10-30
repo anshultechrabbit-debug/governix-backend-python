@@ -129,6 +129,9 @@ class Settings(BaseSettings):
     LOGIN_MAX_FAILED_ATTEMPTS: int = 5
     LOGIN_LOCKOUT_MINUTES: int = 15
     CORS_ORIGINS: list[str] = ["http://localhost:5173"]
+    # The interactive API docs (/docs, /redoc, /openapi.json). None: on except in production, where they
+    # would show every route and schema to anyone who can reach the server.
+    API_DOCS_ENABLED: bool | None = None
 
     # AI providers. "openai" is the configured default; "local" providers are
     # deterministic stand-ins for development/tests without an API key; "ollama"

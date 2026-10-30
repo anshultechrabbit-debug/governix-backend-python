@@ -178,6 +178,9 @@ CLOSED_CLASS_TERMS = frozenset(
     # quantifiers, determiners
     "all any both each either every neither none other another such same own whole entire several "
     "few more most less least only also "
+    # indefinite pronouns: "tell me something about the mortgage policy", "is there anything on prepayment"
+    "something anything everything nothing someone somebody anybody everyone everybody nobody "
+    "whatever whichever whoever "
     # number words and ordinals
     "one two three four five six seven eight nine ten first second third fourth fifth last next "
     # prepositions and comparison operators. Not those that bound a figure ("above 75 lakh", "within 7
@@ -256,6 +259,37 @@ _CLAIM_TO_CONFIRM = re.compile(
 def asks_to_confirm(question: str) -> bool:
     """ "A user says the policy permits X. Can you confirm that claim?", "Is it true that ...?"."""
     return bool(_CLAIM_TO_CONFIRM.search(question))
+
+
+# "What documents have you consumed so far?", "Which policies do you have?", "List the files uploaded",
+# "What can I ask you about?": a question about the collection the assistant reads, not about what any
+# document says. It is answered from the catalogue of the caller's policies, never from passages.
+_LIBRARY_NOUN = re.compile(
+    r"\b(?:documents?|docs?|polic(?:y|ies)|files?|pdfs?|manuals?|circulars?|guidelines?|sops?|knowledge\s*base)\b", re.I)
+_LIBRARY_FRAME = re.compile(
+    r"\b(?:you|your|yours|uploaded|available|indexed|ingested|loaded|stored|consumed|so\s+far|in\s+the\s+system|"
+    r"in\s+governix|have\s+access)\b", re.I)
+_ASK_ABOUT_WHAT = re.compile(r"\bwhat\s+(?:can|could|may|should)\s+i\s+ask\b|\bwhat\s+do\s+you\s+know\s*\??\s*$", re.I)
+# What the frame itself is made of; any other subject word makes it a question about a policy
+# ("What documents are available for KYC verification?").
+LIBRARY_WORDS = frozenset(
+    "document documents doc docs policy policies file files pdf pdfs manual manuals circular circulars guideline "
+    "guidelines sop sops knowledge base system governix assistant library collection database you your yours "
+    "have has got consumed consume read uploaded upload indexed index ingested ingest loaded load stored store "
+    "learned learnt trained access accessible available far ask asked know".split()
+)
+
+
+# "what documentsyou have": a document noun typed together with the "you" that follows it.
+_GLUED_YOU = re.compile(r"\b(documents?|polic(?:y|ies)|files?|pdfs?|manuals?|circulars?|guidelines?)(you|your)\b", re.I)
+
+
+def asks_about_library(question: str) -> bool:
+    """ "What documents have you consumed so far?": a question about the assistant's own collection."""
+    question = _GLUED_YOU.sub(r"\1 \2", question)
+    framed = bool(_ASK_ABOUT_WHAT.search(question)) or bool(
+        _LIBRARY_NOUN.search(question) and _LIBRARY_FRAME.search(question))
+    return framed and all(term in LIBRARY_WORDS for term in key_terms(question))
 
 
 # "... different from now?", "... with one sanctioned today": today is one of the dates compared.
@@ -481,9 +515,12 @@ def build_evidence(
     limit: int,
     required: list[Candidate] | None = None,
     context_chars: int = 600,
+    front_matter: bool = False,
 ) -> EvidenceSet:
     """`required`: passages that must be in the evidence whatever their rank (the best passage of each
-    document or version a question compares; see RAGService._sides)."""
+    document or version a question compares; see RAGService._sides). `front_matter`: the question asks
+    about a document it names ("tell me about the mortgage policy"), so its opening pages are read, as for
+    "what is this document about?"."""
     pool = candidates[: max(rerank_top_n * 4, limit)]
     if not pool:
         return EvidenceSet([], 0.0, key_terms(question), 0.0, [])
@@ -529,7 +566,7 @@ def build_evidence(
             candidate.rerank_score = candidate.rerank_score or 0.0
             selected.append(candidate)
 
-    if is_document_question(question):
+    if front_matter or is_document_question(question):
         present = {c.chunk_id for c in selected}
         documents = list(dict.fromkeys(c.document_id for c in selected))[:2]
         cover = [c for c in retriever.front_matter(principal, documents, filters) if c.chunk_id not in present]

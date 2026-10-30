@@ -2,7 +2,7 @@
 import pytest
 
 from app.modules.rag.evidence import (
-    applies_to_reader, asks_to_confirm, coverage_of, is_document_question, key_terms, readers_situation,
+    applies_to_reader, asks_about_library, asks_to_confirm, coverage_of, is_document_question, key_terms, readers_situation,
     situation_terms,
 )
 from app.modules.rag.query_plan import QueryClass, plan_query
@@ -272,3 +272,29 @@ def test_a_claim_to_confirm_is_recognised_and_its_frame_is_not_required(question
 @pytest.mark.parametrize("question", ["Can you confirm the processing fee?", "How do I verify my income?"])
 def test_asking_for_a_figure_is_not_a_claim_to_confirm(question):
     assert not asks_to_confirm(question)
+
+
+def test_indefinite_pronouns_never_name_the_subject():
+    assert key_terms("Tell me something about the mortgage policy") == ["mortgage"]
+    assert key_terms("Is there anything on prepayment?") == ["prepayment"]
+
+
+@pytest.mark.parametrize("question", [
+    "What documents have you consumed so far?",
+    "what documentsyou have consumed so far ?",
+    "Which policies do you have?",
+    "What can I ask you about?",
+    "List all the files uploaded",
+])
+def test_questions_about_the_collection_itself(question):
+    assert asks_about_library(question)
+
+
+@pytest.mark.parametrize("question", [
+    "What documents are available for KYC verification?",  # a policy question: which KYC documents
+    "What documents are needed for a home loan?",
+    "Which policies do you have on gold loans?",
+    "Tell me something about the mortgage policy",
+])
+def test_questions_about_what_a_policy_says_are_not_about_the_collection(question):
+    assert not asks_about_library(question)

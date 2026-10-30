@@ -42,6 +42,10 @@ _DECLARED_CODE = re.compile(
     r"([A-Z][A-Z0-9]{1,9})(?=[-/_ .]|$)"
 )
 CATALOGUE_TTL_SECONDS = 600
+# A misspelt title word ("morgtage" for "mortgage") is read as the title word only this far from it, in
+# edits (a swap of two neighbouring letters is one), and only in a word at least MIN_MISSPELT long.
+MIN_MISSPELT = 5
+LONG_WORD = 8
 
 
 @dataclass(frozen=True)
@@ -109,9 +113,42 @@ def _followed_by_document_word_or_version(question: str, end: int) -> tuple[bool
     return bool(_VERSION_AFTER.match(rest)), end
 
 
+def _edits(a: str, b: str) -> int:
+    """Edits between two words: insertions, deletions, substitutions and swaps of neighbouring letters."""
+    previous2: list[int] = []
+    previous = list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        row = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            row[j] = min(previous[j] + 1, row[j - 1] + 1, previous[j - 1] + (a[i - 1] != b[j - 1]))
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                row[j] = min(row[j], previous2[j - 2] + 1)
+        previous2, previous = previous, row
+    return previous[-1]
+
+
+def _spelled(tokens: list[tuple[str, int, int]], catalogue: list[PolicyNames]) -> dict[int, str]:
+    """Tokens that are a misspelling of exactly one title word of the catalogue ("morgtage" -> "mortgage")."""
+    title_words = {w for policy in catalogue for w in policy.words}
+    corrected = {}
+    for index, (token, _start, _end) in enumerate(tokens):
+        lowered = token.lower()
+        if len(lowered) < MIN_MISSPELT or lowered in title_words or lowered in DOCUMENT_WORDS or lowered in CONNECTORS:
+            continue
+        allowed = 2 if len(lowered) >= LONG_WORD else 1
+        close = {w for w in title_words if abs(len(w) - len(lowered)) <= allowed and _edits(lowered, w) <= allowed}
+        if len(close) == 1:
+            corrected[index] = close.pop()
+    return corrected
+
+
 def find_mentions(question: str, catalogue: list[PolicyNames]) -> list[Mention]:
-    """Spans of the question that name a policy, each resolved to exactly one policy."""
+    """Spans of the question that name a policy, each resolved to exactly one policy.
+
+    A misspelt title word counts only in an explicit reference ("morgtage policy"), where the document word
+    says a policy is being named."""
     tokens = [(m.group(0), m.start(), m.end()) for m in _WORD.finditer(question)]
+    corrected = _spelled(tokens, catalogue)
     mentions: list[Mention] = []
     taken: set[int] = set()
 
@@ -141,8 +178,8 @@ def find_mentions(question: str, catalogue: list[PolicyNames]) -> list[Mention]:
         best: tuple[int, PolicyNames] | None = None
         for policy in catalogue:
             length = 0
-            for token, _start, _end in tokens[index:]:
-                lowered = token.lower()
+            for offset, (token, _start, _end) in enumerate(tokens[index:]):
+                lowered = corrected.get(index + offset, token.lower())
                 if lowered in policy.words:
                     length += 1
                 elif lowered in policy.connectors and length:
@@ -151,7 +188,7 @@ def find_mentions(question: str, catalogue: list[PolicyNames]) -> list[Mention]:
                     break
             while length and tokens[index + length - 1][0].lower() in CONNECTORS:
                 length -= 1
-            run = {t.lower() for t, _, _ in tokens[index:index + length]} - CONNECTORS
+            run = {corrected.get(i, tokens[i][0].lower()) for i in range(index, index + length)} - CONNECTORS
             if len(run) < 2 and not (run and _followed_by_document_word_or_version(question, tokens[index + length - 1][2])[0]):
                 continue
             if best is None or length > best[0]:
@@ -160,9 +197,12 @@ def find_mentions(question: str, catalogue: list[PolicyNames]) -> list[Mention]:
                 best = (length, None)  # two policies share these words: not a reference to either
         if best and best[1] is not None:
             length, policy = best
-            run = {t.lower() for t, _, _ in tokens[index:index + length]} - CONNECTORS
+            run = {corrected.get(i, tokens[i][0].lower()) for i in range(index, index + length)} - CONNECTORS
             end = tokens[index + length - 1][2]
             explicit, span_end = _followed_by_document_word_or_version(question, end)
+            if not explicit and any(i in corrected for i in range(index, index + length)):
+                index += 1
+                continue  # a misspelling is read as a title word only where a policy is named
             # The same words must not also be the whole distinctive part of another title, and a bare
             # mention must carry at least half of the title ("home loan", not "your customer").
             unique = not any(other is not policy and run <= other.words for other in catalogue)

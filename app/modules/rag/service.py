@@ -45,6 +45,7 @@ from app.modules.auth.permissions import Principal
 from app.modules.citations.numerics import extract_numeric_facts
 from app.modules.documents.model import Document, DocumentStatus
 from app.modules.policies.model import Policy, PolicyStatus, PolicyVersion, VersionStatus
+from app.modules.policies.repository import PolicyRepository
 from app.modules.rag.claim_stream import ClaimStream
 from app.modules.rag.calculate import (
     Calculation, asks_for_calculation, checked_calculations, figures_in, final_calculation, indian, restated_result,
@@ -52,7 +53,8 @@ from app.modules.rag.calculate import (
 )
 from app.modules.rag.injection import strip_instructions
 from app.modules.rag.evidence import (
-    EvidenceItem, EvidenceSet, applies_to_reader, asks_to_confirm, asks_yes_no, build_evidence, coverage_of,
+    EvidenceItem, EvidenceSet, applies_to_reader, asks_about_library, asks_to_confirm, asks_yes_no, build_evidence,
+    coverage_of,
     describes_readers_case,
     is_document_question, key_terms,
     situation_figures, situation_terms,
@@ -96,6 +98,8 @@ SUGGESTIONS = [
 ]
 NO_ANSWER_MESSAGE = "None of the documents you can access answer this, so I won't guess."
 # No-answers because the documents (as far as they were read) do not answer: explained with what was read.
+# Policies listed in answer to "what documents do you have?"; the rest are counted.
+LIBRARY_LIMIT = 50
 NOT_FOUND_REASONS = frozenset({
     "NO_RELEVANT_DOCUMENTS", "LOW_RELEVANCE", "KEY_TERMS_NOT_FOUND", "INSUFFICIENT_EVIDENCE",
     "ANSWER_FAILED_VALIDATION", "ANSWER_OFF_TOPIC",
@@ -187,7 +191,11 @@ HISTORY_KEY_CHARS = 300
 #          its stated result checked; a wrong one is reported to the retry and its claims are not reused
 #   v70    the model's arithmetic is never needed: a valid calculation whose result no claim states correctly is
 #          stated in the question's words with its working (calculate.restated_result)
-ANSWER_CACHE_VERSION = "v70"
+#   v71    questions about the collection ("what documents do you have?") are answered from the catalogue;
+#          "tell me (something) about the X policy" reads the named policy's opening pages, misspelt names
+#          ("morgtage policy") resolve; an answer whose every question word no document uses must be judged
+#          by meaning to answer the question (a merely "close" passage no longer passes vacuously)
+ANSWER_CACHE_VERSION = "v71"
 # No supported answer in the version in force: worth looking one version back.
 # Earlier versions answer only what the version in force does not cover. An answer it gave that the
 # checks then withheld (ANSWER_FAILED_VALIDATION, ANSWER_OFF_TOPIC) means it covers the subject:
@@ -519,6 +527,8 @@ class RAGService:
         self._subjects: dict[str, str] = {}
         # Each question as asked -> the policies it names, in order (see _sides).
         self._named_policies: dict[str, list[uuid.UUID]] = {}
+        # Questions that name a policy and ask nothing else about it ("tell me about the mortgage policy").
+        self._overviews: set[str] = set()
         # Instructions to the assistant found in the question and set aside (rag/injection.py).
         self._ignored_instructions: list[str] = []
         # What the reasoning check found wrong in the last attempt, for its one retry (_check_reasoning).
@@ -750,6 +760,9 @@ class RAGService:
                 raise _NoAnswer("NOT_A_QUESTION")
             if not rewrite.resolvable:
                 raise _NoAnswer("NEEDS_CONTEXT")
+            if asks_about_library(request.question):
+                # "What documents have you consumed so far?": the collection itself, from the catalogue.
+                return self._library(principal, request, plan), attempt.retrieved
             if is_greeting(request.question) or not self._has_subject(request.question, plan):
                 # "hi", "thanks", "can you explain in short?": nothing to search for. Searching
                 # anyway lets any passage pass the term checks, which have nothing to check.
@@ -758,6 +771,10 @@ class RAGService:
             mentions = self.retriever.policy_mentions(principal, request.question)
             self._subjects[request.question] = without_references(request.question, mentions)
             self._named_policies[request.question] = list(dict.fromkeys(m.policy_id for m in mentions))
+            if any(m.explicit for m in mentions) and not key_terms(self._subjects[request.question]):
+                # "Tell me about the mortgage policy", "What is the KYC policy?": the named policy itself is the
+                # subject, as in "what is this document about?": its opening pages (purpose, scope) are read.
+                self._overviews.add(request.question)
             filters = self._filters(principal, plan, request, referenced, named)
             try:
                 response = yield from self._attempt(principal, request, plan, filters, attempt, timings, deadline, started)
@@ -880,6 +897,7 @@ class RAGService:
             reranker=self.reranker, retriever=self.retriever, filters=filters,
             rerank_top_n=self.settings.RAG_RERANK_TOP_N, limit=self.settings.RAG_EVIDENCE_LIMIT,
             required=required, context_chars=self.settings.RAG_CONTEXT_CHARS,
+            front_matter=request.question in self._overviews,
         )
         if plan.diff:
             evidence.comparison = self._comparison(principal, plan)
@@ -961,7 +979,7 @@ class RAGService:
         held: list[dict] = []
         names: list[str] = []  # the policies cited so far
         passages: list[str] = []  # and their passages
-        on_topic = evidence.comparison is not None or is_document_question(request.question)
+        on_topic = evidence.comparison is not None or self._about_document(request.question)
         close = self._close_in_meaning(evidence.items)  # as the final check (_validated_answer) decides
         for part in self._generate_stream(principal, request, plan, evidence):
             if isinstance(part, LLMResult):
@@ -1154,9 +1172,14 @@ class RAGService:
             scope = VersionScope("all")
         else:
             scope = VersionScope("as_of", as_of=plan.as_of)
+        policy_ids = list(request.policy_ids)
+        if not policy_ids and request.question in self._overviews:
+            # "Tell me about the mortgage policy": only the named policy can answer it. Its words are not checked
+            # against the passages (_about_document), so no other document may be searched.
+            policy_ids = list(self._named_policies.get(request.question, []))
         return SearchFilters(
             version_scope=scope,
-            policy_ids=list(request.policy_ids),
+            policy_ids=policy_ids,
             category_ids=list(request.category_ids),
             document_ids=[d.document_id for d in named],
         )
@@ -1369,12 +1392,14 @@ class RAGService:
             return  # the deterministic diff is itself sufficient evidence
         if not evidence.items:
             raise _NoAnswer("NO_RELEVANT_DOCUMENTS")
+        if question in self._overviews:
+            return  # only the named policy was searched, and its opening pages are in the evidence
         if evidence.top_score < self.settings.RAG_MIN_EVIDENCE_SCORE:
             raise _NoAnswer("LOW_RELEVANCE")
         # Questions about the document itself ("the exact title, issuing authority
         # and legal basis") are phrased in words the cover page does not use;
         # the cover is in the evidence and the model + validator decide.
-        if is_document_question(question):
+        if self._about_document(question):
             return
         # "What does clause 1.1.6 say about the amount that needs concurrence?": the clause the
         # question names is its topic, as for the on-topic check; its words need not be repeated.
@@ -1397,6 +1422,40 @@ class RAGService:
         salient, missing = self._salient_coverage(principal, question, evidence, ignore)
         if salient < self.settings.RAG_MIN_SALIENT_COVERAGE:
             raise _NoAnswer("KEY_TERMS_NOT_FOUND", missing)
+
+    def _library(self, principal: Principal, request: AskRequest, plan: QueryPlan) -> AnswerResponse:
+        """ "What documents do you have?": the policies the caller can read, each with its version in force,
+        taken from the catalogue (the same rules as the Policies page), never from passages."""
+        repository = PolicyRepository(self.session)
+        policies, total = repository.find(principal, search=None, category_id=None, status=PolicyStatus.ACTIVE,
+                                          limit=LIBRARY_LIMIT, offset=0)
+        ids = [p.id for p in policies]
+        current = repository.current_versions(ids, date.today())
+        counts = repository.version_counts(ids)
+        claims = []
+        for policy in policies:
+            version = current.get(policy.id)
+            stated = (f"Version {version.version_label}, in force since "
+                      f"{version.effective_from.day} {version.effective_from:%B %Y}") if version else "no version in force today"
+            earlier = counts.get(policy.id, 0) - (1 if version else 0)
+            more = f" ({earlier} earlier version{'s' if earlier != 1 else ''} on file)" if earlier > 0 else ""
+            claims.append(Claim(text=f"{policy.name}: {stated}{more}.", citations=[]))
+        if total > len(policies):
+            claims.append(Claim(text=f"…and {total - len(policies)} more, listed on the Policies page.", citations=[]))
+        if total:
+            summary = f"I can answer from {total} polic{'y' if total == 1 else 'ies'} you have access to:"
+        else:
+            summary = "You have no policies to read yet. Policies uploaded to your scope, or assigned to you, appear here."
+        return AnswerResponse(
+            question=request.question, status="answered", answer=" ".join(c.text for c in claims) or summary,
+            summary=summary, claims=claims, sources=[], conflicts=[], warnings=[], plan=plan.describe(),
+            evidence_score=1.0, model="catalogue", usage={}, timings_ms={},
+        )
+
+    def _about_document(self, question: str) -> bool:
+        """The question is about a document itself: "what is this document about?", or a named policy with
+        nothing else asked ("tell me about the mortgage policy"). Its words need not be in the passages."""
+        return is_document_question(question) or question in self._overviews
 
     def _close_in_meaning(self, items) -> bool:
         """A passage the vector lane found at least RAG_SEMANTIC_MIN_SIMILARITY close to the question."""
@@ -1573,7 +1632,14 @@ class RAGService:
             # be in any answer drawn from the documents (a claim that repeated one would fail its check).
             # The words the documents do use still decide whether the answer is about what was asked.
             unseen = self.retriever.unseen_terms(principal, terms)
-            terms = [t for t in terms if t not in unseen]
+            seen = [t for t in terms if t not in unseen]
+            if terms and not seen:
+                # Every word of the question is one no document uses ("morgtage", "consumed so far"): nothing
+                # left can show the answer is about what was asked, and closeness in meaning alone is not
+                # proof (a PDF specification is "close" to almost anything). The callers then judge the claims
+                # by meaning and keep only those that answer the question; without a verdict, none.
+                return terms
+            terms = seen
         weights = self.retriever.visible_term_weights(principal, terms)
         total = sum(weights.values())
         if total <= 0:
@@ -1867,7 +1933,7 @@ class RAGService:
         # meaning, words the question uses and the documents do not ("close early" for "foreclosure")
         # are no reason to withhold them.
         verified = self.settings.RAG_ANSWER_MODE == "select" and self._close_in_meaning([items[e] for e in cited if e in items])
-        if evidence.comparison is None and not is_document_question(request.question) and not verified:
+        if evidence.comparison is None and not self._about_document(request.question) and not verified:
             named = [" ".join(filter(None, [items[e].source.policy_name, items[e].source.document_title]))
                      for e in cited if e in items and items[e].source.version_id not in evidence.unrelated]
             if (missing := self._off_topic(principal, request.question, [r.text for r in valid] + named,
@@ -2402,6 +2468,9 @@ class RAGService:
                 "warnings": response.warnings,
                 "conflicts": len(response.conflicts),
                 "model": response.model,
+                # Which answer behaviour produced it (ANSWER_CACHE_VERSION): a change in quality can be traced
+                # to the release that caused it.
+                "behaviour": ANSWER_CACHE_VERSION,
                 "usage": response.usage,
                 "latency_ms": response.timings_ms.get("total"),
                 "cache_hit": cache_hit,

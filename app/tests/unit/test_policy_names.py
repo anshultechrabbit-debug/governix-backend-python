@@ -52,3 +52,18 @@ def test_explicit_references_leave_the_subject():
     question = "When is a home loan account classified as an NPA as per the current Home Loan Policy?"
     assert without_references(question, find_mentions(question, CATALOGUE)) == (
         "When is a home loan account classified as an NPA as per the current ?")
+
+
+def test_a_misspelt_title_word_names_a_policy_only_in_an_explicit_reference():
+    # "morgtage" for "mortgage" (two letters swapped), "personl" for "personal" (one left out).
+    catalogue = CATALOGUE + [build_names(MORTGAGE, "Mortgage Loan Policy")]
+    assert [(m.policy_id, m.explicit) for m in find_mentions("tell me something about morgtage policy", catalogue)] == [
+        (MORTGAGE, True)]
+    assert without_references("tell me something about morgtage policy",
+                              find_mentions("tell me something about morgtage policy", catalogue)) == "tell me something about"
+    assert [m.policy_id for m in find_mentions("What is in the personl loan policy?", catalogue)] == [PERSONAL]
+    # Not followed by a document word, a near-spelling is just a word of the question.
+    assert find_mentions("morgtage rates for salaried borrowers", catalogue) == []
+
+
+MORTGAGE = uuid.uuid4()
